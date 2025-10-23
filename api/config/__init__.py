@@ -39,11 +39,9 @@ class Settings(BaseSettings):
     )
     postgres_ro: Optional[str] = os.getenv("POSTGRESQL_RO")
 
-    # Invocations database.
-    invocations_db_url: Optional[str] = os.getenv(
-        "INVOCATIONS_DB_URL",
-        os.getenv("POSTGRESQL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes"),
-    )
+    # New database.
+    db_rw_url: Optional[str] = os.getenv("DB_RW_URL")
+    db_ro_url: Optional[str] = os.getenv("DB_RO_URL")
 
     aws_access_key_id: str = os.getenv("AWS_ACCESS_KEY_ID", "REPLACEME")
     aws_secret_access_key: str = os.getenv("AWS_SECRET_ACCESS_KEY", "REPLACEME")

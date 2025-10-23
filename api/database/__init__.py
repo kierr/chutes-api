@@ -17,8 +17,8 @@ engine = create_async_engine(
     pool_recycle=900,
     pool_use_lifo=True,
 )
-iengine = create_async_engine(
-    settings.invocations_db_url,
+engine_v2 = create_async_engine(
+    settings.db_rw_url,
     echo=settings.debug,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_overflow,
@@ -34,8 +34,8 @@ SessionLocal = sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
-ISessionLocal = sessionmaker(
-    bind=iengine,
+SessionLocalV2 = sessionmaker(
+    bind=engine_v2,
     class_=AsyncSession,
     expire_on_commit=False,
 )
@@ -81,8 +81,8 @@ async def get_session(readonly=False) -> AsyncGenerator[AsyncSession, None]:
 
 
 @asynccontextmanager
-async def get_inv_session() -> AsyncGenerator[AsyncSession, None]:
-    async with ISessionLocal() as session:
+async def get_session_v2() -> AsyncGenerator[AsyncSession, None]:
+    async with SessionLocalV2() as session:
         try:
             yield session
             await session.commit()
@@ -96,6 +96,19 @@ async def get_inv_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def get_db_session():
     async with SessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            raise
+
+
+async def get_db_session_v2():
+    async with SessionLocalV2() as session:
         try:
             yield session
             await session.commit()

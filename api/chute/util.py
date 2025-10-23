@@ -32,7 +32,7 @@ from api.constants import (
     LLM_PRICE_MULT_PER_MILLION_OUT,
     DIFFUSION_PRICE_MULT_PER_STEP,
 )
-from api.database import get_session, get_inv_session
+from api.database import get_session, get_session_v2
 from api.fmv.fetcher import get_fetcher
 from api.exceptions import (
     InstanceRateLimit,
@@ -158,7 +158,7 @@ async def store_invocation(
     metrics: Optional[dict] = {},
     legacy: Optional[bool] = False,
 ):
-    session_method = get_session if legacy else get_inv_session
+    session_method = get_session if legacy else get_session_v2
     insert_sql = UNIFIED_INVOCATION_INSERT_LEGACY if legacy else UNIFIED_INVOCATION_INSERT
     async with session_method() as session:
         result = await session.execute(
@@ -184,13 +184,6 @@ async def store_invocation(
         )
         row = result.first()
         return row
-
-
-async def safe_store_invocation(*args, **kwargs):
-    try:
-        await store_invocation(*args, **kwargs)
-    except Exception as exc:
-        logger.error(f"SAFE_STORE_INVOCATION: failed to insert new invocation record: {str(exc)}")
 
 
 async def get_miner_session(instance: Instance) -> aiohttp.ClientSession:
@@ -995,32 +988,31 @@ async def invoke(
                 if bounty is None:
                     bounty = 0
 
-                # Store complete record in new invocations database, async.
                 # XXX this is a different started_at from global request started_at, for compute units
                 duration = time.time() - started_at
-                asyncio.create_task(
-                    safe_store_invocation(
-                        parent_invocation_id,
-                        invocation_id,
-                        chute.chute_id,
-                        chute.user_id,
-                        function,
-                        user_id,
-                        chute.image_id,
-                        chute.image.user_id,
-                        target.instance_id,
-                        target.miner_uid,
-                        target.miner_hotkey,
-                        duration,
-                        multiplier,
-                        error_message=None,
-                        bounty=bounty,
-                        metrics=metrics,
-                        legacy=False,
-                    )
+
+                # Store in new database.
+                await store_invocation(
+                    parent_invocation_id,
+                    invocation_id,
+                    chute.chute_id,
+                    chute.user_id,
+                    function,
+                    user_id,
+                    chute.image_id,
+                    chute.image.user_id,
+                    target.instance_id,
+                    target.miner_uid,
+                    target.miner_hotkey,
+                    duration,
+                    multiplier,
+                    error_message=None,
+                    bounty=bounty,
+                    metrics=metrics,
+                    legacy=False,
                 )
 
-                # Track in the legacy DB.
+                # Store in old database.
                 store_result = await store_invocation(
                     parent_invocation_id,
                     invocation_id,
@@ -1224,24 +1216,22 @@ async def invoke(
 
                 # Store complete record in new invocations database, async.
                 duration = time.time() - started_at
-                asyncio.create_task(
-                    safe_store_invocation(
-                        parent_invocation_id,
-                        invocation_id,
-                        chute.chute_id,
-                        chute.user_id,
-                        function,
-                        user_id,
-                        chute.image_id,
-                        chute.image.user_id,
-                        target.instance_id,
-                        target.miner_uid,
-                        target.miner_hotkey,
-                        duration,
-                        multiplier,
-                        error_message=error_message,
-                        legacy=False,
-                    )
+                store_invocation(
+                    parent_invocation_id,
+                    invocation_id,
+                    chute.chute_id,
+                    chute.user_id,
+                    function,
+                    user_id,
+                    chute.image_id,
+                    chute.image.user_id,
+                    target.instance_id,
+                    target.miner_uid,
+                    target.miner_hotkey,
+                    duration,
+                    multiplier,
+                    error_message=error_message,
+                    legacy=False,
                 )
 
                 # Legacy invocations table storage.
