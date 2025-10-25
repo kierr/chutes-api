@@ -46,7 +46,7 @@ async def sync_and_save_metagraph(netuid: int):
             node_dict["checksum"] = hashlib.sha256(json.dumps(node_dict).encode()).hexdigest()
             statement = insert(MetagraphNode).values(node_dict)
             statement = statement.on_conflict_do_update(
-                index_elements=["hotkey"],
+                index_elements=["netuid", "hotkey"],
                 set_={key: getattr(statement.excluded, key) for key, value in node_dict.items()},
                 where=MetagraphNode.checksum != node_dict["checksum"],
             )

@@ -5,7 +5,6 @@ ORM definitions for metagraph nodes.
 from api.database import get_session
 from loguru import logger
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
 from sqlalchemy import Column, String, DateTime, Integer, Float, text
 from metasync.constants import (
     FEATURE_WEIGHTS,
@@ -24,11 +23,11 @@ def create_metagraph_node_class(base):
     class MetagraphNode(base):
         __tablename__ = "metagraph_nodes"
         hotkey = Column(String, primary_key=True)
+        netuid = Column(Integer, primary_key=True)
         checksum = Column(String, nullable=False)
         coldkey = Column(String, nullable=False)
         node_id = Column(Integer)
         incentive = Column(Float)
-        netuid = Column(Integer)
         stake = Column(Float)
         tao_stake = Column(Float)
         alpha_stake = Column(Float)
@@ -43,12 +42,6 @@ def create_metagraph_node_class(base):
         real_port = Column(Integer)
         synced_at = Column(DateTime, server_default=func.now())
         blacklist_reason = Column(String)
-
-        nodes = relationship(
-            "Node",
-            back_populates="miner",
-            cascade="all, delete-orphan",
-        )
 
     return MetagraphNode
 

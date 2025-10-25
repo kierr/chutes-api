@@ -11,7 +11,6 @@ from sqlalchemy import (
     Integer,
     Numeric,
     Float,
-    ForeignKey,
     DateTime,
     Boolean,
     BigInteger,
@@ -64,9 +63,7 @@ class Node(Base):
     seed = Column(Numeric, nullable=False)
 
     # Meta/app fields.
-    miner_hotkey = Column(
-        String, ForeignKey("metagraph_nodes.hotkey", ondelete="CASCADE"), nullable=False
-    )
+    miner_hotkey = Column(String)
     gpu_identifier = Column(String, nullable=False)
     device_index = Column(Integer, nullable=False)
     server_id = Column(String, nullable=True)
@@ -86,8 +83,6 @@ class Node(Base):
         lazy="joined",
         uselist=False,
     )
-    miner = relationship("MetagraphNode", back_populates="nodes")
-    challenges = relationship("Challenge", back_populates="node", cascade="all, delete-orphan")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

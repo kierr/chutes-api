@@ -1,6 +1,5 @@
 import api.node.schemas  # noqa: F401
 import api.chute.schemas  # noqa: F401
-import api.challenge.schemas  # noqa: F401
 import api.api_key.schemas  # noqa: F401
 import api.image.schemas  # noqa: F401
 import api.instance.schemas  # noqa: F401

@@ -10,7 +10,7 @@ from collections import defaultdict
 from taskiq_redis.exceptions import ResultIsMissingError
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
 from fastapi_cache.decorator import cache
-from sqlalchemy import select, func, delete, text
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 from api.database import get_db_session
@@ -20,7 +20,6 @@ from api.gpu import SUPPORTED_GPUS
 from api.node.schemas import Node, MultiNodeArgs
 from api.instance.schemas import Instance
 from api.graval_worker import validate_gpus, broker
-from api.challenge.schemas import Challenge
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.constants import HOTKEY_HEADER
@@ -143,6 +142,11 @@ async def create_nodes(
     Add nodes/GPUs to inventory.
     """
     mgnode = await get_miner_by_hotkey(hotkey, db)
+    if not mgnode:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Your hotkey is not registered on {settings.netuid}",
+        )
     if mgnode.blacklist_reason:
         logger.warning(f"MINERBLACKLIST: {hotkey=} reason={mgnode.blacklist_reason}")
         raise HTTPException(
@@ -241,9 +245,6 @@ async def create_nodes(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"GPU parameter validation error: {exc}",
         )
-
-    # Purge any old challenges.
-    await db.execute(delete(Challenge).where(Challenge.uuid.in_(node_uuids)))
 
     task_id = "skip"
     if not verified_at:

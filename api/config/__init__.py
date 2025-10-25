@@ -76,31 +76,53 @@ class Settings(BaseSettings):
     validator_ss58: Optional[str] = os.getenv("VALIDATOR_SS58")
     storage_bucket: str = os.getenv("STORAGE_BUCKET", "REPLACEME")
     redis_url: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-    redis_client: redis.Redis = redis.Redis.from_url(
-        os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-    )
-    cm_redis_client: list[redis.Redis] = [
-        redis.Redis.from_url(
-            os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0").replace(
-                "@redis.chutes.svc.cluster.local", f"@cm-redis-{idx}.chutes.svc.cluster.local"
-            ),
-            socket_timeout=10.0,
-            socket_connect_timeout=3.0,
-            socket_keepalive=True,
-            health_check_interval=30,
-        )
-        for idx in range(int(os.getenv("CM_REDIS_SHARD_COUNT", "0")))
-    ]
-    quota_client: redis.Redis = redis.Redis.from_url(
-        os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0").replace(
-            "@redis.chutes.svc.cluster.local", "@quota-redis.chutes.svc.cluster.local"
-        )
-    )
-    memcache: Optional[aiomcache.Client] = (
-        aiomcache.Client(os.getenv("MEMCACHED", "memcached"), 11211, pool_size=4)
-        if os.getenv("MEMCACHED")
-        else None
-    )
+    memcached_host: str = os.getenv("MEMCACHED", "memcached")
+
+    _redis_client: Optional[redis.Redis] = None
+    _cm_redis_clients: Optional[list[redis.Redis]] = None
+    _quota_client: Optional[redis.Redis] = None
+    _memcache: Optional[aiomcache.Client] = None
+
+    @property
+    def redis_client(self) -> redis.Redis:
+        if self._redis_client is None:
+            self._redis_client = redis.Redis.from_url(self.redis_url)
+        return self._redis_client
+
+    @property
+    def cm_redis_client(self) -> list[redis.Redis]:
+        if self._cm_redis_clients is None:
+            self._cm_redis_clients = [
+                redis.Redis.from_url(
+                    self.redis_url.replace(
+                        "@redis.chutes.svc.cluster.local",
+                        f"@cm-redis-{idx}.chutes.svc.cluster.local",
+                    ),
+                    socket_timeout=10.0,
+                    socket_connect_timeout=3.0,
+                    socket_keepalive=True,
+                    health_check_interval=30,
+                )
+                for idx in range(self.cm_redis_shard_count)
+            ]
+        return self._cm_redis_clients
+
+    @property
+    def quota_client(self) -> redis.Redis:
+        if self._quota_client is None:
+            self._quota_client = redis.Redis.from_url(
+                self.redis_url.replace(
+                    "@redis.chutes.svc.cluster.local", "@quota-redis.chutes.svc.cluster.local"
+                )
+            )
+        return self._quota_client
+
+    @property
+    def memcache(self) -> Optional[aiomcache.Client]:
+        if self._memcache is None and self.memcached_host:
+            self._memcache = aiomcache.Client(self.memcached_host, 11211, pool_size=4)
+        return self._memcache
+
     registry_host: str = os.getenv("REGISTRY_HOST", "registry:5000")
     registry_external_host: str = os.getenv("REGISTRY_EXTERNAL_HOST", "registry.chutes.ai")
     registry_password: str = os.getenv("REGISTRY_PASSWORD", "registrypassword")

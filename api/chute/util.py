@@ -734,6 +734,15 @@ async def _invoke_one(
                             f"Estimated the prompt tokens: {prompt_tokens} for {chute.name}"
                         )
 
+                    # Make sure model name response is valid/matches chute name.
+                    if "model" not in json_data or json_data.get("model") != chute.name:
+                        logger.warning(
+                            f"NOSTREAM_BADMODEL: {chute.name=} {chute.chute_id=} response had invalid/missing model: {target.instance_id=}: json_data['model']={json_data.get('model')}"
+                        )
+                        raise EmptyLLMResponse(
+                            f"BAD_RESPONSE {target.instance_id=} {chute.name} returned invalid chunk (model name)"
+                        )
+
                     # New verification hash.
                     if (
                         image_supports_cllmv(chute.image)
@@ -772,6 +781,10 @@ async def _invoke_one(
                             )
                             raise InvalidCLLMV(
                                 f"BAD_RESPONSE {target.instance_id=} {chute.name=} returned invalid chunk (failed cllmv check)"
+                            )
+                        elif "affine" in chute.name.lower():
+                            logger.success(
+                                f"CLLMV success {target.instance_id=} {target.miner_hotkey=} {chute.name=} {chute.chute_id=}"
                             )
 
                     output_text = None

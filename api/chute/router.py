@@ -872,10 +872,11 @@ async def _deploy_chute(
         chute_args.node_selector = {"gpu_count": 1}
     if isinstance(chute_args.node_selector, dict):
         chute_args.node_selector = NodeSelector(**chute_args.node_selector)
-    if set(chute_args.node_selector.supported_gpus) == set(["5090"]):
+    allowed_gpus = set(chute_args.node_selector.supported_gpus)
+    if not allowed_gpus - set(["5090", "3090", "4090"]):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not allowed to require 5090s",
+            detail="You are not allowed to require consumer GPUs exclusively.",
         )
 
     # Fee estimate, as an error, if the user hasn't used the confirmed param.
