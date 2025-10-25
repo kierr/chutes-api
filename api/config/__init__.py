@@ -35,8 +35,8 @@ class Settings(BaseSettings):
         return self._validator_keypair
 
     # XXX Legacy DB, delete after migration.
-    sqlalchemy: str = os.getenv(
-        "POSTGRESQL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes"
+    legacy_db_url: str = os.getenv(
+        "LEGACY_DB_URL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes"
     )
 
     # Postgres configuration (read-write and read-only replica).

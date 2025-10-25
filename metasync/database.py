@@ -5,8 +5,15 @@ from metasync.config import settings
 
 
 engine = create_async_engine(
-    settings.sqlalchemy,
+    settings.db_rw_url,
     echo=settings.debug,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_overflow,
+    pool_pre_ping=True,
+    pool_reset_on_return="rollback",
+    pool_timeout=30,
+    pool_recycle=900,
+    pool_use_lifo=True,
 )
 
 SessionLocal = sessionmaker(

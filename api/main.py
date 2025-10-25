@@ -7,9 +7,7 @@ import re
 import asyncio
 import fickling
 import hashlib
-from urllib.parse import quote
 from contextlib import asynccontextmanager
-from loguru import logger
 from fastapi import FastAPI, Request, APIRouter, HTTPException, status, Response
 from fastapi.responses import ORJSONResponse
 from fastapi_cache import FastAPICache
@@ -45,79 +43,55 @@ async def lifespan(_: FastAPI):
     """
     Execute all initialization/startup code, e.g. ensuring tables exist and such.
     """
+    from api.metrics.util import keep_gauges_fresh
+
+    # Initialize the cache (via memcached).
     FastAPICache.init(MemcachedBackend(settings.memcache), prefix="chutes-api-cache")
 
-    # Prom multi-proc dir.
+    # Prom multi-proc dir (XXX not necessary anymore with single process API pods?)
     os.makedirs("/tmp/prometheus_multiproc", exist_ok=True)
 
-    # Normal table creation stuff.
+    # Loop to keep utilization gauges fresh in prometheus.
+    asyncio.create_task(keep_gauges_fresh())
+
+    # Initialize schema.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # NOTE: Could we use dbmate container in docker compose to do this instead?
-    # Manual DB migrations.
-    db_url = quote(settings.sqlalchemy.replace("+asyncpg", ""), safe=":/@")
-    if "127.0.0.1" in db_url or "@postgres:" in db_url:
-        db_url += "?sslmode=disable"
-
-    # dbmate migrations, make sure we only run them in a single process since we use workers > 1
-    worker_pid_file = "/tmp/api.pid"
-    is_migration_process = False
-    try:
-        if not os.path.exists(worker_pid_file):
-            with open(worker_pid_file, "x") as outfile:
-                outfile.write(str(os.getpid()))
-            is_migration_process = True
-        else:
-            with open(worker_pid_file, "r") as infile:
-                designated_pid = int(infile.read().strip())
-            is_migration_process = os.getpid() == designated_pid
-    except FileExistsError:
-        with open(worker_pid_file, "r") as infile:
-            designated_pid = int(infile.read().strip())
-        is_migration_process = os.getpid() == designated_pid
-    if not is_migration_process:
-        yield
-        return
-
-    # Run the migrations.
-    process = await asyncio.create_subprocess_exec(
-        "dbmate",
-        "--url",
-        db_url,
-        "--migrations-dir",
-        "api/migrations",
-        "migrate",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    async def log_migrations(stream, name):
-        log_method = logger.info if name == "stdout" else logger.warning
-        while True:
-            line = await stream.readline()
-            if line:
-                decoded_line = line.decode().strip()
-                log_method(decoded_line)
-            else:
-                break
-
-    await asyncio.gather(
-        log_migrations(process.stdout, "stdout"),
-        log_migrations(process.stderr, "stderr"),
-        process.wait(),
-    )
-    if process.returncode == 0:
-        logger.success("successfull applied all DB migrations")
-    else:
-        logger.error(f"failed to run db migrations returncode={process.returncode}")
-
-    # Start a background task to keep the prom gauges updated.
-    from api.metrics.util import keep_gauges_fresh
-
-    asyncio.create_task(keep_gauges_fresh())
-
     yield
+
+    # XXX Database migrations are no longer automated!!! Run manually as needed.
+    # db_url = quote(settings.legacy_db_url.replace("+asyncpg", ""), safe=":/@")
+    # if "127.0.0.1" in db_url or "@postgres:" in db_url:
+    #     db_url += "?sslmode=disable"
+    # process = await asyncio.create_subprocess_exec(
+    #     "dbmate",
+    #     "--url",
+    #     db_url,
+    #     "--migrations-dir",
+    #     "api/migrations",
+    #     "migrate",
+    #     stdout=asyncio.subprocess.PIPE,
+    #     stderr=asyncio.subprocess.PIPE,
+    # )
+    # async def log_migrations(stream, name):
+    #     log_method = logger.info if name == "stdout" else logger.warning
+    #     while True:
+    #         line = await stream.readline()
+    #         if line:
+    #             decoded_line = line.decode().strip()
+    #             log_method(decoded_line)
+    #         else:
+    #             break
+    # await asyncio.gather(
+    #     log_migrations(process.stdout, "stdout"),
+    #     log_migrations(process.stderr, "stderr"),
+    #     process.wait(),
+    # )
+    # if process.returncode == 0:
+    #     logger.success("successfull applied all DB migrations")
+    # else:
+    #     logger.error(f"failed to run db migrations returncode={process.returncode}")
 
 
 app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)

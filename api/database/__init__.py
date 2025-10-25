@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 # XXX Legacy database, delete after migration.
 legacy_engine = create_async_engine(
-    settings.sqlalchemy,
+    settings.legacy_db_url,
     echo=settings.debug,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_overflow,
