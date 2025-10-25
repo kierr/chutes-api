@@ -1096,7 +1096,7 @@ async def generate_confirmed_reports(chute_id, reason):
                 SELECT 1 FROM reports r
                 WHERE r.invocation_id = i.parent_invocation_id
             )
-            ON CONFLICT (invocation_id) DO NOTHING
+            ON CONFLICT (invocation_id, timestamp) DO NOTHING
             RETURNING invocation_id
         )
         SELECT COUNT(*) AS report_count FROM inserted;

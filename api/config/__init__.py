@@ -34,14 +34,14 @@ class Settings(BaseSettings):
             self._validator_keypair = Keypair.create_from_seed(os.environ["VALIDATOR_SEED"])
         return self._validator_keypair
 
+    # XXX Legacy DB, delete after migration.
     sqlalchemy: str = os.getenv(
         "POSTGRESQL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes"
     )
-    postgres_ro: Optional[str] = os.getenv("POSTGRESQL_RO")
 
-    # New database.
-    db_rw_url: Optional[str] = os.getenv("DB_RW_URL")
-    db_ro_url: Optional[str] = os.getenv("DB_RO_URL")
+    # Postgres configuration (read-write and read-only replica).
+    db_rw_url: str = os.getenv("DB_RW_URL")
+    db_ro_url: str = os.getenv("DB_RO_URL")
 
     aws_access_key_id: str = os.getenv("AWS_ACCESS_KEY_ID", "REPLACEME")
     aws_secret_access_key: str = os.getenv("AWS_SECRET_ACCESS_KEY", "REPLACEME")

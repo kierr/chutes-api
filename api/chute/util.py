@@ -32,7 +32,7 @@ from api.constants import (
     LLM_PRICE_MULT_PER_MILLION_OUT,
     DIFFUSION_PRICE_MULT_PER_STEP,
 )
-from api.database import get_session, get_session_v2
+from api.database import get_session
 from api.fmv.fetcher import get_fetcher
 from api.exceptions import (
     InstanceRateLimit,
@@ -158,9 +158,8 @@ async def store_invocation(
     metrics: Optional[dict] = {},
     legacy: Optional[bool] = False,
 ):
-    session_method = get_session if legacy else get_session_v2
     insert_sql = UNIFIED_INVOCATION_INSERT_LEGACY if legacy else UNIFIED_INVOCATION_INSERT
-    async with session_method() as session:
+    async with get_session(legacy=legacy) as session:
         result = await session.execute(
             insert_sql,
             {
