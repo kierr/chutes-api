@@ -328,8 +328,7 @@ async def perform_autoscale(dry_run: bool = False):
                     COALESCE(c.max_instances, 1) AS max_instances,
                     c.scaling_threshold,
                     NOW() - c.created_at <= INTERVAL '3 hours' AS new_chute,
-                    COUNT(DISTINCT i.instance_id) AS instance_count,
-                    COUNT(DISTINCT CASE WHEN i.active = true AND i.verified = true THEN i.instance_id END) AS active_count,
+                    COUNT(DISTINCT CASE WHEN i.active = true AND i.verified = true THEN i.instance_id END) AS instance_count,
                     EXISTS(SELECT 1 FROM rolling_updates ru WHERE ru.chute_id = c.chute_id) AS has_rolling_update,
                     NOW() AS db_now
                 FROM chutes c
@@ -459,11 +458,10 @@ async def perform_autoscale(dry_run: bool = False):
         rate_limit_5m = metrics["rate_limit_ratio"].get("5m", 0)
         rate_limit_15m = metrics["rate_limit_ratio"].get("15m", 0)
         rate_limit_1h = metrics["rate_limit_ratio"].get("1h", 0)
-        utilization_1h = metrics["utilization"].get("1h", 0)
         utilization_15m = metrics["utilization"].get("15m", 0)
         utilization_5m = metrics["utilization"].get("5m", 0)
-        rate_limit_basis = max(rate_limit_1h, rate_limit_15m, rate_limit_5m)
-        utilization_basis = max(utilization_1h, utilization_15m, utilization_5m)
+        rate_limit_basis = max(rate_limit_15m, rate_limit_5m)
+        utilization_basis = max(utilization_15m, utilization_5m)
 
         # Scale up candidate: high utilization
         threshold = info.scaling_threshold or UTILIZATION_SCALE_UP

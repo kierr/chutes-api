@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     _cm_redis_clients: Optional[list[redis.Redis]] = None
     _quota_client: Optional[redis.Redis] = None
     _memcache: Optional[aiomcache.Client] = None
+    cm_redis_shard_count: int = int(os.getenv("CM_REDIS_SHARD_COUNT", "1"))
 
     @property
     def redis_client(self) -> redis.Redis:
