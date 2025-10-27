@@ -963,12 +963,12 @@ async def _deploy_chute(
     # Only allow newer SGLang versions for affine.
     if "/affine" in chute_args.name.lower():
         if (
-            not image_supports_cllmv(image, min_version=2025101900)
+            not image_supports_cllmv(image, min_version=2025102603)
             or image.user_id != await chutes_user_id()
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Must use image="chutes/sglang:nightly-2025101900" (or later dated versions) for affine deployments.',
+                detail='Must use image="chutes/sglang:2025102603" (or more recent dated versions) for affine deployments.',
             )
 
     # Require min chutes version for turbovision.

@@ -328,7 +328,7 @@ async def perform_autoscale(dry_run: bool = False):
                     COALESCE(c.max_instances, 1) AS max_instances,
                     c.scaling_threshold,
                     NOW() - c.created_at <= INTERVAL '3 hours' AS new_chute,
-                    COUNT(DISTINCT CASE WHEN i.active = true AND i.verified = true THEN i.instance_id END) AS instance_count,
+                    COUNT(DISTINCT i.instance_id) AS instance_count,
                     EXISTS(SELECT 1 FROM rolling_updates ru WHERE ru.chute_id = c.chute_id) AS has_rolling_update,
                     NOW() AS db_now
                 FROM chutes c
