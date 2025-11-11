@@ -278,6 +278,26 @@ async def unshare_chute(
     }
 
 
+@router.get("/boosted")
+async def list_boosted_chutes():
+    """
+    Get a list of chutes that have a boost.
+    """
+    async with get_session() as session:
+        query = (
+            select(Chute.chute_id, Chute.name, Chute.boost)
+            .where(Chute.boost.isnot(None))
+            .where(Chute.boost >= 1)
+            .where(Chute.boost <= 20)
+        )
+        result = await session.execute(query)
+        chutes = [
+            {"chute_id": str(cid), "name": name, "boost": boost}
+            for cid, name, boost in result.all()
+        ]
+        return chutes
+
+
 @router.get("/affine_available")
 async def list_available_affine_chutes():
     """
@@ -860,13 +880,19 @@ async def _deploy_chute(
         )
 
     # Default for external egress.
-    allow_egress = True
+    allow_egress = chute_args.allow_external_egress
     if (
-        chute_args.allow_external_egress is None
+        allow_egress is None
         and chute_args.standard_template in ("vllm", "embedding")
         and semcomp(image.chutes_version, "0.3.45") >= 0
     ):
         allow_egress = False
+    elif allow_egress is None:
+        allow_egress = False
+    if "affine" in chute_args.name.lower() or "turbovision" in chute_args.name.lower():
+        allow_egress = False
+    if chute_args.encrypted_fs is None:
+        chute_args.encrypted_fs = False
 
     if not chute_args.node_selector:
         chute_args.node_selector = {"gpu_count": 1}
@@ -950,33 +976,25 @@ async def _deploy_chute(
             detail="Missing required revision parameter for vllm template.",
         )
 
-    # Prevent deploying images with old chutes SDK versions.
-    if not image.chutes_version or semcomp(image.chutes_version, "0.3.31") < 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Unable to deploy chutes with legacy images (chutes SDK < 0.3.31.rc1), please upgrade "
-                f"(or ask chutes team to upgrade) {image.name=} {image.image_id=} currently {image.chutes_version}"
-            ),
-        )
-
     # Only allow newer SGLang versions for affine.
     if "/affine" in chute_args.name.lower():
         if (
-            not image_supports_cllmv(image, min_version=2025102603)
+            not image_supports_cllmv(image, min_version=2025110402)
             or image.user_id != await chutes_user_id()
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Must use image="chutes/sglang:2025102603" (or more recent dated versions) for affine deployments.',
+                detail='Must use image="chutes/sglang:nightly-2025110402" (or more recent dated versions) for affine deployments.',
             )
 
-    # Require min chutes version for turbovision.
-    if "turbovision" in chute_args.name.lower() and semcomp(image.chutes_version, "0.3.47") < 0:
+    # Prevent deploying images with old chutes SDK versions.
+    if current_user.user_id != await chutes_user_id() and (
+        not image.chutes_version or semcomp(image.chutes_version, "0.3.56") < 0
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "Unable to deploy turbovision chutes with chutes version < 0.3.47, please upgrade "
+                "Unable to deploy chutes with chutes version < 0.3.56, please upgrade "
                 f"(or ask chutes team to upgrade) {image.name=} {image.image_id=} currently {image.chutes_version=}"
             ),
         )
@@ -1044,6 +1062,7 @@ async def _deploy_chute(
             else (chute_args.scaling_threshold or 0.75)
         )
         chute.allow_external_egress = allow_egress
+        chute.encrypted_fs = chute.encrypted_fs and chute_args.encrypted_fs  # XX prevent changing
     else:
         try:
             is_public = (
@@ -1086,6 +1105,7 @@ async def _deploy_chute(
                 if is_public or current_user.user_id == await chutes_user_id()
                 else (chute_args.shutdown_after_seconds or 300),
                 allow_external_egress=allow_egress,
+                encrypted_fs=chute_args.encrypted_fs,
             )
         except ValueError as exc:
             raise HTTPException(

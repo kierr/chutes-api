@@ -113,7 +113,7 @@ ADD --chown=chutes watchtower.py /forge/watchtower.py
 ENV BUILDAH_ISOLATION=chroot
 ENV STORAGE_DRIVER=overlay
 
-ENTRYPOINT ["poetry", "run", "taskiq", "worker", "api.image.forge:broker", "--workers", "1", "--max-async-tasks", "1"]
+ENTRYPOINT ["poetry", "run", "python", "-m", "api.image.forge"]
 
 
 ###
@@ -165,6 +165,7 @@ ADD --chown=chutes chute_autoscaler.py /app/chute_autoscaler.py
 ADD --chown=chutes balance_refresher.py /app/balance_refresher.py
 ADD --chown=chutes data/cache_hit_cluster_params.json /app/cache_hit_cluster_params.json
 ADD --chown=chutes log_prober.py /app/log_prober.py
+ADD --chown=chutes conn_prober.py /app/conn_prober.py
 ADD --chown=chutes scripts /app/scripts
 
 USER root

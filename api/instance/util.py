@@ -5,6 +5,7 @@ Helper functions for instances.
 import jwt
 import time
 import uuid
+import base64
 import asyncio
 import random
 import pickle
@@ -26,6 +27,8 @@ from api.bounty.util import create_bounty_if_not_exists, get_bounty_amount, send
 from sqlalchemy.future import select
 from sqlalchemy import text, func
 from sqlalchemy.orm import aliased, joinedload
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 
 # Define an alias for the Instance model to use in a subquery
 InstanceAlias = aliased(Instance)
@@ -120,9 +123,9 @@ class LeastConnManager:
     ):
         self.concurrency = concurrency or 1
         self.chute_id = chute_id
-        self.redis_client = settings.cm_redis_client[
-            uuid.UUID(self.chute_id).int % len(settings.cm_redis_client)
-        ]
+        _u_idx = uuid.UUID(self.chute_id).int % len(settings.cm_redis_client)
+        self.redis_client = settings.cm_redis_client[_u_idx]
+        self.redis_client_index = _u_idx
         self.instances = {instance.instance_id: instance for instance in instances}
         self.connection_expiry = connection_expiry
         self.cleanup_interval = cleanup_interval
@@ -348,13 +351,13 @@ class LeastConnManager:
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"Timeout adding connection to {instance.instance_id}, proceeding anyway"
+                    f"Timeout adding connection to {self.redis_client_index=} {instance.instance_id}, proceeding anyway"
                 )
             except Exception as e:
                 logger.error(f"Error tracking connection: {e}")
             yield instance, None
         except asyncio.TimeoutError:
-            logger.error("Timeout getting targets")
+            logger.error(f"Timeout getting targets on {self.redis_client_index=}")
             # Fallback to random instance
             available = [inst for iid, inst in self.instances.items() if iid not in avoid]
             if available:
@@ -384,7 +387,9 @@ class LeastConnManager:
                         )
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(f"Timeout cleaning up connection {conn_id}")
+                    logger.warning(
+                        f"Timeout cleaning up connection {conn_id} on {self.redis_client_index=}"
+                    )
                 except Exception as e:
                     logger.error(f"Error cleaning up connection {conn_id}: {e}")
 
@@ -468,6 +473,82 @@ async def get_instance_by_chute_and_id(db, instance_id, chute_id, hotkey):
     return result.unique().scalar_one_or_none()
 
 
+def _get_es256_verify_key():
+    if getattr(settings, "launch_config_public_key_bytes", None):
+        return settings.launch_config_public_key_bytes
+    if getattr(settings, "launch_config_private_key", None):
+        try:
+            return settings.launch_config_private_key.public_key()
+        except Exception:
+            pass
+    if getattr(settings, "launch_config_private_key_bytes", None):
+        return settings.launch_config_private_key_bytes
+    raise RuntimeError("No ES256 verification key configured")
+
+
+def _decode_chutes_jwt(token: str, *, require_exp: bool) -> dict:
+    """
+    Decode either the legacy or new asymmetric JWT.
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        raise jwt.InvalidTokenError("Malformed JWT header")
+    alg = header.get("alg")
+    if alg not in ("HS256", "ES256"):
+        raise jwt.InvalidTokenError("Unsupported JWT alg")
+    if alg == "HS256":
+        key = settings.launch_config_key
+    else:  # ES256
+        key = _get_es256_verify_key()
+    options = {
+        "verify_signature": True,
+        "verify_exp": require_exp,
+        "verify_iat": True,
+        "verify_iss": True,
+        "require": ["iat", "iss"] + (["exp"] if require_exp else []),
+    }
+    return jwt.decode(
+        token,
+        key,
+        algorithms=[alg],
+        issuer="chutes",
+        options=options,
+    )
+
+
+def create_launch_jwt_v2(launch_config, disk_gb: int = None, egress: bool = False) -> str:
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=2)
+    payload = {
+        "exp": int(expires_at.timestamp()),
+        "sub": launch_config.config_id,
+        "chute_id": launch_config.chute_id,
+        "iat": int(now.timestamp()),
+        "url": f"https://api.{settings.base_domain}/instances/launch_config/{launch_config.config_id}",
+        "env_key": launch_config.env_key,
+        "iss": "chutes",
+        "egress": egress,
+    }
+    if launch_config.job_id:
+        payload["job_id"] = launch_config.job_id
+    if disk_gb:
+        payload["disk_gb"] = disk_gb
+    encoded_jwt = jwt.encode(payload, settings.launch_config_private_key_bytes, algorithm="ES256")
+    return encoded_jwt
+
+
+def generate_fs_key(launch_config) -> str:
+    """
+    Generate a chutes secure FS code to unlock encrypted files.
+    """
+    timestamp = int(time.time())
+    message = f"{timestamp}:{launch_config.chute_id}:{launch_config.config_id}".encode()
+    signature = settings.launch_config_private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+    return f"{timestamp}:{encoded_signature}"
+
+
 def create_launch_jwt(launch_config, disk_gb: int = None) -> str:
     """
     Create JWT for a given launch config (updated chutes lib with new graval etc).
@@ -477,6 +558,7 @@ def create_launch_jwt(launch_config, disk_gb: int = None) -> str:
     payload = {
         "exp": int(expires_at.timestamp()),
         "sub": launch_config.config_id,
+        "chute_id": launch_config.chute_id,
         "iat": int(now.timestamp()),
         "url": f"https://api.{settings.base_domain}/instances/launch_config/{launch_config.config_id}",
         "env_key": launch_config.env_key,
@@ -511,19 +593,7 @@ async def load_launch_config_from_jwt(
 ) -> str:
     detail = "Missing or invalid launch config JWT"
     try:
-        payload = jwt.decode(
-            token,
-            settings.launch_config_key,
-            options={
-                "verify_signature": True,
-                "verify_exp": True,
-                "verify_iat": True,
-                "verify_iss": True,
-                "require": ["exp", "iat", "iss"],
-            },
-            issuer="chutes",
-            algorithms=["HS256"],
-        )
+        payload = _decode_chutes_jwt(token, require_exp=True)
         if config_id == payload["sub"]:
             config = (
                 (await db.execute(select(LaunchConfig).where(LaunchConfig.config_id == config_id)))
@@ -560,19 +630,7 @@ async def load_job_from_jwt(db, job_id: str, token: str, filename: str = None) -
     """
     detail = "Missing or invalid JWT"
     try:
-        payload = jwt.decode(
-            token,
-            settings.launch_config_key,
-            options={
-                "verify_signature": True,
-                "verify_exp": False,
-                "verify_iat": True,
-                "verify_iss": True,
-                "require": ["iat", "iss"],
-            },
-            issuer="chutes",
-            algorithms=["HS256"],
-        )
+        payload = _decode_chutes_jwt(token, require_exp=False)
         assert job_id == payload["sub"], "Job ID in JWT does not match!"
         if filename:
             assert filename == payload["filename"], "Filename mismatch!"

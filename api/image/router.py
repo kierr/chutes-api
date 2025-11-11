@@ -286,7 +286,8 @@ async def create_image(
         [
             f"RUN pip install chutes=={settings.chutes_version}",
             "RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), \"chutes-netnanny.so\"))') /usr/local/lib/chutes-netnanny.so",
-            "ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so",
+            "RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), \"chutes-logintercept.so\"))') /usr/local/lib/chutes-logintercept.so",
+            "ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-logintercept.so",
         ]
     )
 

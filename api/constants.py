@@ -44,10 +44,10 @@ LLM_MIN_PRICE_OUT = 0.01
 DIFFUSION_PRICE_MULT_PER_STEP = 0.005
 
 # Minimum utilization of a chute before additional instances can be added.
-UTILIZATION_SCALE_UP = 0.3
+UTILIZATION_SCALE_UP = 0.6
 
 # Cap on number of instances for an underutilized chute.
-UNDERUTILIZED_CAP = 5
+UNDERUTILIZED_CAP = 3
 
 # Percentage of requests being rate limited to allow scaling up.
 RATE_LIMIT_SCALE_UP = 0.02
@@ -55,9 +55,8 @@ RATE_LIMIT_SCALE_UP = 0.02
 # Maximum size of VLM asset (video/image).
 VLM_MAX_SIZE = 100 * 1024 * 1024
 
-# Private instance multiplier, which we treat as the average concurrency
-# for any given chute at 100% utilization.
-PRIVATE_INSTANCE_MULTIPLIER = 16
+# Private instance compute multiplier bonus.
+PRIVATE_INSTANCE_BONUS = 16
 
 # Subnet integrations.
 INTEGRATED_SUBNETS = {
