@@ -54,16 +54,20 @@ class LaunchConfigArgs(BaseModel):
     gpus: list[dict]
     host: str
     port_mappings: list[PortMap]
-    env: str
-    code: Optional[str] = None
     fsv: Optional[str] = None
-    inspecto: Optional[str] = None
     egress: Optional[bool] = None
     netnanny_hash: Optional[str] = None
-    run_code: Optional[str] = None
     run_path: Optional[str] = None
     py_dirs: Optional[list[str]] = None
 
+class GravalLaunchConfigArgs(LaunchConfigArgs):
+    env: str
+    code: Optional[str] = None
+    run_code: Optional[str] = None
+    inspecto: Optional[str] = None
+
+class TeeLaunchConfigArgs(LaunchConfigArgs):
+    gpu_evidence: list[dict]
 
 class Instance(Base):
     __tablename__ = "instances"
@@ -139,6 +143,7 @@ class LaunchConfig(Base):
     )
     host = Column(String, nullable=True)
     port = Column(Integer, nullable=True)
+    env_type = Column(String, nullable=False)
     miner_uid = Column(Integer, nullable=False)
     miner_hotkey = Column(String, nullable=False)
     miner_coldkey = Column(String, nullable=False)
