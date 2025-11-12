@@ -563,7 +563,7 @@ def create_launch_jwt(launch_config: LaunchConfig, disk_gb: int = None) -> str:
         "url": f"https://api.{settings.base_domain}/instances/launch_config/{launch_config.config_id}",
         "env_key": launch_config.env_key,
         "iss": "chutes",
-        "env_type": launch_config.env_type
+        "env_type": launch_config.env_type if launch_config.env_type else "graval"
     }
     if launch_config.job_id:
         payload["job_id"] = launch_config.job_id

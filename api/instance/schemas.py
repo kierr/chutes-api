@@ -143,7 +143,7 @@ class LaunchConfig(Base):
     )
     host = Column(String, nullable=True)
     port = Column(Integer, nullable=True)
-    env_type = Column(String, nullable=False)
+    env_type = Column(String, nullable=True)
     miner_uid = Column(Integer, nullable=False)
     miner_hotkey = Column(String, nullable=False)
     miner_coldkey = Column(String, nullable=False)
