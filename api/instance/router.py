@@ -57,7 +57,7 @@ from api.instance.util import (
     load_launch_config_from_jwt,
     invalidate_instance_cache,
 )
-from api.server.service import check_server_ownership, validate_and_consume_nonce, validate_request_nonce, verify_gpu_evidence, verify_server
+from api.server.service import check_server_ownership, validate_and_consume_nonce, validate_request_nonce, verify_gpu_evidence
 from api.user.schemas import User
 from api.user.service import get_current_user, chutes_user_id, subnet_role_accessible
 from api.metasync import get_miner_by_hotkey

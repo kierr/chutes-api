@@ -3,6 +3,7 @@ Core server management and TDX attestation logic.
 """
 
 import asyncio
+import base64
 from datetime import datetime, timezone, timedelta
 import json
 import tempfile
@@ -214,16 +215,13 @@ async def process_boot_attestation(
     # Parse and verify quote
     try:  # Verify quote signature
         quote = BootTdxQuote.from_base64(args.quote)
-        result = await verify_quote(quote, nonce, expected_cert_hash)
+        await verify_quote(quote, nonce, expected_cert_hash)
 
         # Create boot attestation record
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
-            mrtd=quote.mrtd,
-            verification_result=result.to_dict(),
-            verified=True,
-            nonce_used=nonce,
+            created_at=func.now(),
             verified_at=func.now(),
         )
 
@@ -244,9 +242,8 @@ async def process_boot_attestation(
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
-            verified=False,
             verification_error=str(e.detail),
-            nonce_used=nonce,
+            created_at=func.now()
         )
 
         db.add(boot_attestation)
@@ -267,12 +264,11 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
                 setattr(gpu, key, gpu_info.get(key))
 
         # Start verification process
-        await verify_server(server, miner_hotkey)
+        await verify_server(db, server, miner_hotkey)
 
         # Track nodes once verified
         await _track_nodes(db, miner_hotkey, server.server_id, args.gpus, "0", func.now())
 
-        # return task_id
     except AttestationError as e:
         logger.error(f"Attestation failed for server {args.host}")
         raise ServerRegistrationError("Server registration failed - attestation failed.")
@@ -287,7 +283,7 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
     
 
 async def verify_server(
-    server: Server, miner_hotkey: str
+    db: AsyncSession, server: Server, miner_hotkey: str
 ) -> None:
     """
     Register a new server.
@@ -303,6 +299,7 @@ async def verify_server(
     Raises:
         ServerRegistrationError: If registration fails
     """
+    failure_reason = ""
     try:
             
         client = TeeServerClient(server)
@@ -317,26 +314,51 @@ async def verify_server(
 
         logger.success(f"Verified server {server.server_id} for miner: {miner_hotkey}")
 
-        # return True, None
+        # Create attestation record
+        server_attestation = ServerAttestation(
+            quote_data=base64.b64encode(quote.raw_bytes),
+            server_id=server.server_id,
+            created_at=func.now(),
+            verified_at=func.now(),
+        )
+
+        db.add(server_attestation)
+        await db.commit()
+        await db.refresh(server_attestation)
+
     except GetEvidenceError as e:
+        failure_reason = "Failed to get attestation evidence."
         raise e
-        return False, f"Failed to get attestation evidence."
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         logger.error(f"Server verification failed for {server.ip}:\n{e}")
+        failure_reason = f"Server verification failed: invalid quote"
         raise e
-        return False, "Server verification failed: invalid quote"
     except InvalidGpuEvidenceError as e:
         logger.error(f"Failed to verify GPU evidence for {server.ip}.  Invalid GPU evidence.")
+        failure_reason = f"Server verification failed: invalid GPU evidence"
         raise e
-        return False, "Server verification failed: invalid GPU evidence"
     except GpuEvidenceError as e:
         logger.error(f"Failed to verify GPU evidence for {server.ip}")
+        failure_reason = f"Server verification failed: Failed to verify GPU evidence"
         raise e
-        return False, "Server verification failed: Failed to verify GPU evidence"
     except Exception as e:
         logger.error(f"Unexpected error during server verification for {server.ip}: {str(e)}")
+        failure_reason = f"Unexpected error during server verification."
         raise e
-        return False, "Unexpected error during server verification"
+    finally:
+        if failure_reason:
+            # Create attestation record
+            server_attestation = ServerAttestation(
+                quote_data=base64.b64encode(quote.raw_bytes) if quote else None,
+                server_id=server.server_id,
+                verification_error=failure_reason,
+                created_at=func.now()
+            )
+
+            db.add(server_attestation)
+            await db.commit()
+            await db.refresh(server_attestation)
+
 
 
 async def check_server_ownership(db: AsyncSession, server_id: str, miner_hotkey: str) -> Server:

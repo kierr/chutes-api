@@ -81,11 +81,7 @@ class BootAttestation(Base):
     attestation_id = Column(String, primary_key=True, default=generate_uuid)
     quote_data = Column(Text, nullable=False)  # Base64 encoded quote
     server_ip = Column(String, nullable=True)  # For later linking to server
-    mrtd = Column(String, nullable=True)  # Extracted MRTD from quote
-    verification_result = Column(JSONB, nullable=True)  # Detailed verification results
-    verified = Column(Boolean, default=False)
     verification_error = Column(String, nullable=True)
-    nonce_used = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     verified_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -132,13 +128,8 @@ class ServerAttestation(Base):
 
     attestation_id = Column(String, primary_key=True, default=generate_uuid)
     server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
-    quote_data = Column(Text, nullable=False)  # Base64 encoded quote
-    mrtd = Column(String, nullable=True)  # Extracted MRTD
-    rtmrs = Column(JSONB, nullable=True)  # Extracted RTMRs
-    verification_result = Column(JSONB, nullable=True)  # Detailed verification results
-    verified = Column(Boolean, default=False)
+    quote_data = Column(Text, nullable=True)  # Base64 encoded quote
     verification_error = Column(String, nullable=True)
-    nonce_used = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     verified_at = Column(DateTime(timezone=True), nullable=True)
 
