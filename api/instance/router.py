@@ -853,6 +853,12 @@ async def get_launch_config(
         # Fallback to graval for backwards compatability
         env_type = "graval"
 
+    if chute.tee and env_type != "tee":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Can not deploy TEE chute to non TEE node."
+        )
+
 
     # Create the launch config and JWT.
     try:
@@ -1277,7 +1283,7 @@ async def _build_launch_config_verified_response(
     if semcomp(instance.chutes_version or "0.0.0", "0.3.61") >= 0:
         return_value["code"] = instance.chute.code
         return_value["fs_key"] = generate_fs_key(launch_config),
-        if not instance.chute.encrypted_fs:
+        if instance.chute.encrypted_fs:
             return_value["efs"] = True
     if instance.job:
         job_token = create_job_jwt(instance.job.job_id)

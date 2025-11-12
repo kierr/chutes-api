@@ -227,6 +227,7 @@ class Chute(Base):
     shutdown_after_seconds = Column(Integer, nullable=True)
     allow_external_egress = Column(Boolean, default=False)
     encrypted_fs = Column(Boolean, default=False)
+    tee = Column(Boolean, default=False)
 
     # Stats for sorting.
     invocation_count = Column(BigInteger, default=0)
