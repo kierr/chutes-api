@@ -88,7 +88,7 @@ class BootAttestation(Base):
     __table_args__ = (
         Index("idx_boot_server_id", "server_ip"),
         Index("idx_boot_created", "created_at"),
-        Index("idx_boot_verified", "verified"),
+        Index("idx_boot_verified", "verified_at"),
     )
 
 
@@ -138,5 +138,5 @@ class ServerAttestation(Base):
     __table_args__ = (
         Index("idx_attestation_server", "server_id"),
         Index("idx_attestation_created", "created_at"),
-        Index("idx_attestation_verified", "verified"),
+        Index("idx_attestation_verified", "verified_at"),
     )
