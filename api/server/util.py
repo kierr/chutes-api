@@ -200,23 +200,30 @@ def verify_result(quote: TdxQuote, result: TdxVerificationResult) -> bool:
 
 def _verify_measurements(quote: TdxQuote, expected_rtmrs: Dict[str, str]) -> bool:
     try:
+        mismatches = []
+        
         # Verify MRTD
         expected_mrtd = settings.expected_mrtd
         if quote.mrtd.upper() != expected_mrtd.upper():
-            logger.error(f"MRTD mismatch: expected {expected_mrtd}, got {quote.mrtd}")
-            raise MeasurementMismatchError("MRTD verification failed")
+            error_msg = f"MRTD mismatch: expected {expected_mrtd}, got {quote.mrtd}"
+            logger.error(error_msg)
+            mismatches.append(error_msg)
 
         # Verify RTMRs
         for rtmr_name, expected_value in expected_rtmrs.items():
             actual_value = quote.rtmrs.get(rtmr_name)
             if not actual_value:
-                raise MeasurementMismatchError(f"Quote missing excepted RTMR[{rtmr_name}]")
+                error_msg = f"Quote missing expected RTMR[{rtmr_name}]"
+                logger.error(error_msg)
+                mismatches.append(error_msg)
+            elif actual_value.upper() != expected_value.upper():
+                error_msg = f"RTMR {rtmr_name} mismatch: expected {expected_value}, got {actual_value}"
+                logger.error(error_msg)
+                mismatches.append(error_msg)
 
-            if actual_value.upper() != expected_value.upper():
-                logger.error(
-                    f"RTMR {rtmr_name} mismatch: expected {expected_value}, got {actual_value}"
-                )
-                raise MeasurementMismatchError(f"RTMR {rtmr_name} verification failed")
+        # If any mismatches found, raise with all details
+        if mismatches:
+            raise MeasurementMismatchError(f"Measurement verification failed: {'; '.join(mismatches)}")
 
         logger.info("Measurements verified successfully")
         return True
