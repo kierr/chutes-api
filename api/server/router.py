@@ -32,8 +32,7 @@ from api.server.service import (
     get_server_attestation_status,
     list_servers,
     delete_server,
-    validate_request_nonce,
-    broker
+    validate_request_nonce
 )
 from api.server.util import extract_client_cert_hash, get_luks_passphrase
 from api.server.exceptions import (
@@ -155,39 +154,6 @@ async def create_server(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server registration failed"
         )
-
-@router.get("/verification_status")
-async def check_verification_status(
-    task_id: str,
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(raise_not_found=False, registered_to=settings.netuid, purpose="tee")
-    ),
-):
-    """
-    Check taskiq task status, to see if the validator has finished GPU verification.
-    """
-    task_parts = task_id.split("::")
-    if len(task_parts) != 2 or task_parts[0] != hotkey:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="go away",
-        )
-    task_id = task_parts[1]
-    if task_id == "skip":
-        return {"status": "verified"}
-    if not await broker.result_backend.is_result_ready(task_id):
-        return {"status": "pending"}
-    try:
-        result = await broker.result_backend.get_result(task_id)
-    except ResultIsMissingError:
-        return {"status": "pending"}
-    if result.is_err:
-        return {"status": "error", "error": result.error}
-    success, error_message = result.return_value
-    if not success:
-        return {"status": "failed", "detail": error_message}
-    return {"status": "verified"}
 
 # ToDo: Maybe don't need to expose this
 @router.get("/", response_model=List[Dict[str, Any]])

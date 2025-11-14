@@ -54,10 +54,6 @@ from api.server.util import (
 )
 from api.util import extract_ip
 
-broker = ListQueueBroker(url=settings.redis_url, queue_name="tee").with_result_backend(
-    RedisAsyncResultBackend(redis_url=settings.redis_url, result_ex_time=3600)
-)
-
 async def create_nonce(server_ip: str) -> Dict[str, str]:
     """
     Create a new attestation nonce using Redis.
