@@ -194,7 +194,7 @@ async def verify_gpu_evidence(evidence: list[Dict[str, str]], expected_nonce: st
 
 async def process_boot_attestation(
     db: AsyncSession, server_ip: str, args: BootAttestationArgs, nonce: str, expected_cert_hash: str
-) -> Dict[str, str]:
+) -> None:
     """
     Process a boot attestation request.
 
@@ -230,12 +230,6 @@ async def process_boot_attestation(
         await db.refresh(boot_attestation)
 
         logger.success(f"Boot attestation successful: {boot_attestation.attestation_id}")
-
-        return {
-            "luks_passphrase": get_luks_passphrase(),
-            "attestation_id": boot_attestation.attestation_id,
-            "verified_at": boot_attestation.verified_at.isoformat(),
-        }
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         # Create failed attestation record

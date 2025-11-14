@@ -36,9 +36,7 @@ class BootAttestationArgs(BaseModel):
 class BootAttestationResponse(BaseModel):
     """Response model for successful boot attestation."""
 
-    luks_passphrase: str
-    attestation_id: str
-    verified_at: str
+    key: str
 
 
 class RuntimeAttestationArgs(BaseModel):

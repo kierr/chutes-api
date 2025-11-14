@@ -35,7 +35,7 @@ from api.server.service import (
     validate_request_nonce,
     broker
 )
-from api.server.util import extract_client_cert_hash
+from api.server.util import extract_client_cert_hash, get_luks_passphrase
 from api.server.exceptions import (
     AttestationError,
     NonceError,
@@ -87,12 +87,10 @@ async def verify_boot_attestation(
     """
     try:
         server_ip = extract_ip(request)
-        result = await process_boot_attestation(db, server_ip, args, nonce, expected_cert_hash)
+        await process_boot_attestation(db, server_ip, args, nonce, expected_cert_hash)
 
         return BootAttestationResponse(
-            luks_passphrase=result["luks_passphrase"],
-            attestation_id=result["attestation_id"],
-            verified_at=result["verified_at"],
+            key=get_luks_passphrase()
         )
     except NonceError as e:
         logger.warning(f"Boot attestation nonce error: {str(e)}")
