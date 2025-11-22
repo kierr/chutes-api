@@ -2,20 +2,25 @@
 Routes for instances.
 """
 
+import csv
+from io import StringIO
 import os
 import uuid
 import base64
+import ctypes
 import traceback
 import random
 import socket
 import secrets
 import asyncio
+import orjson as json  # noqa
+from api.image.util import get_inspecto_hash
 import api.miner_client as miner_client
 from loguru import logger
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
-from sqlalchemy import select, text, func, update
+from fastapi import APIRouter, Depends, HTTPException, Response, status, Header, Request
+from sqlalchemy import select, text, func, update, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
@@ -26,13 +31,19 @@ from api.config import settings
 from api.constants import (
     HOTKEY_HEADER,
     AUTHORIZATION_HEADER,
-    PRIVATE_INSTANCE_MULTIPLIER,
+    PRIVATE_INSTANCE_BONUS,
+    INTEGRATED_SUBNETS,
+    INTEGRATED_SUBNET_BONUS,
 )
+from api.node.schemas import Node
 from api.payment.util import decrypt_secret
 from api.node.util import get_node_by_id
 from api.chute.schemas import Chute, NodeSelector
 from api.secret.schemas import Secret
+from api.image.schemas import Image  # noqa
 from api.instance.schemas import (
+    GravalLaunchConfigArgs,
+    TeeLaunchConfigArgs,
     Instance,
     instance_nodes,
     LaunchConfig,
@@ -40,11 +51,17 @@ from api.instance.schemas import (
 )
 from api.job.schemas import Job
 from api.instance.util import (
+    create_launch_jwt_v2,
+    generate_fs_key,
     get_instance_by_chute_and_id,
     create_launch_jwt,
     create_job_jwt,
     load_launch_config_from_jwt,
     invalidate_instance_cache,
+)
+from api.server.service import (
+    validate_request_nonce,
+    verify_gpu_evidence,
 )
 from api.user.schemas import User
 from api.user.service import get_current_user, chutes_user_id, subnet_role_accessible
@@ -58,18 +75,26 @@ from api.util import (
     notify_deleted,
     notify_verified,
     notify_activated,
+    load_shared_object,
     has_legacy_private_billing,
 )
-from api.bounty.util import check_bounty_exists, delete_bounty
+from api.bounty.util import check_bounty_exists, delete_bounty, claim_bounty
 from starlette.responses import StreamingResponse
 from api.graval_worker import graval_encrypt, verify_proof, generate_fs_hash
 from watchtower import is_kubernetes_env, verify_expected_command
-from log_prober import check_instance_logging_server
 
 router = APIRouter()
 
+INSPECTO = load_shared_object("chutes", "chutes-inspecto.so")
+INSPECTO.verify_hash.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+INSPECTO.verify_hash.restype = ctypes.c_char_p
 
-async def _load_chute(db, chute_id: str):
+NETNANNY = load_shared_object("chutes", "chutes-netnanny.so")
+NETNANNY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
+NETNANNY.verify.restype = ctypes.c_int
+
+
+async def _load_chute(db, chute_id: str) -> Chute:
     chute = (
         (await db.execute(select(Chute).where(Chute.chute_id == chute_id)))
         .unique()
@@ -152,19 +177,6 @@ async def _check_scalable(db, chute, hotkey):
             detail=f"Chute {chute_id} has reached its target capacity of {target_count} instances.",
         )
 
-    # Prevent monopolizing capped chutes.
-    remaining_slots = target_count - active_count
-    if remaining_slots <= 2 and hotkey_count == active_count:
-        logger.warning(
-            f"SCALELOCK: chute {chute_id=} {chute.name} - miner {hotkey} already has {hotkey_count} instances, "
-            f"only {remaining_slots} slots remaining"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_423_LOCKED,
-            detail=f"Chute {chute_id} is near capacity with only {remaining_slots} slots remaining. "
-            f"You already have {hotkey_count} instance(s).",
-        )
-
 
 async def _check_scalable_private(db, chute, miner):
     """
@@ -194,30 +206,8 @@ async def _check_scalable_private(db, chute, miner):
             detail=f"Private chute {chute_id} has reached its target capacity of {target_count} instances.",
         )
 
-    # Require miners to have public chutes deployed to deploy any private chutes.
-    public_chute_query = text("""
-        SELECT COUNT(DISTINCT i.instance_id) AS public_instance_count, COUNT(DISTINCT nn.node_id) AS public_instance_gpu_count
-        FROM instances i
-        JOIN instance_nodes nn ON i.instance_id = nn.instance_id
-        JOIN chutes c ON i.chute_id = c.chute_id
-        WHERE i.miner_hotkey = :miner_hotkey
-        AND i.activated_at IS NOT NULL
-        AND (c.public IS true OR c.chute_id = '561e4875-254d-588f-a36f-57c9cdef8961')
-    """)
-    public_result = (
-        (await db.execute(public_chute_query, {"miner_hotkey": miner.hotkey})).mappings().first()
-    )
-    if (
-        public_result["public_instance_count"] < 4
-        or public_result["public_instance_gpu_count"] < 32
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Miner {miner.hotkey} insufficient public chutes/GPUs to deploy private chutes.",
-        )
 
-
-async def _validate_node(db, chute, node_id: str, hotkey: str):
+async def _validate_node(db, chute, node_id: str, hotkey: str) -> Node:
     node = await get_node_by_id(node_id, db, hotkey)
     if not node:
         raise HTTPException(
@@ -255,7 +245,9 @@ async def _validate_node(db, chute, node_id: str, hotkey: str):
     return node
 
 
-async def _validate_nodes(db, chute, node_ids: list[str], hotkey: str, instance: Instance):
+async def _validate_nodes(
+    db, chute, node_ids: list[str], hotkey: str, instance: Instance
+) -> list[Node]:
     host = instance.host
     gpu_count = chute.node_selector.get("gpu_count", 1)
     if len(set(node_ids)) != gpu_count:
@@ -321,9 +313,490 @@ async def _validate_host_port(db, host, port):
         )
 
 
+@router.get("/reconciliation_csv")
+async def get_instance_reconciliation_csv(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Get all instance audit instance_id, deleted_at records to help reconcile audit data.
+    """
+    query = """
+        SELECT
+            instance_id,
+            deleted_at
+        FROM instance_audit
+        WHERE deleted_at IS NOT NULL
+        AND activated_at IS NOT NULL
+    """
+    output = StringIO()
+    writer = csv.writer(output)
+    result = await db.execute(text(query))
+    writer.writerow([col for col in result.keys()])
+    writer.writerows(result)
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="audit-reconciliation.csv"'},
+    )
+
+
+async def _validate_launch_config_env(
+    db: AsyncSession,
+    launch_config: LaunchConfig,
+    chute: Chute,
+    args: GravalLaunchConfigArgs,
+    log_prefix: str,
+):
+    from chutes.envdump import DUMPER
+
+    # Verify, decrypt, parse the envdump payload.
+    if "ENVDUMP_UNLOCK" in os.environ:
+        code = None
+        try:
+            dump = DUMPER.decrypt(launch_config.env_key, args.env)
+            if semcomp(chute.chutes_version or "0.0.0", "0.3.61") < 0:
+                code_data = DUMPER.decrypt(launch_config.env_key, args.code)
+                code = base64.b64decode(code_data["content"]).decode()
+        except Exception as exc:
+            logger.error(
+                f"Attempt to claim {launch_config.config_id=} failed, invalid envdump payload received: {exc}"
+            )
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = f"Unable to verify: {exc=} {args=}"
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=launch_config.verification_error,
+            )
+
+        # Check the environment.
+        try:
+            await verify_expected_command(
+                dump,
+                chute,
+                miner_hotkey=launch_config.miner_hotkey,
+            )
+            if semcomp(chute.chutes_version or "0.0.0", "0.3.61") < 0:
+                assert code == chute.code, f"Incorrect code:\n{code=}\n{chute.code=}"
+        except AssertionError as exc:
+            logger.error(
+                f"Attempt to claim {launch_config.config_id=} failed, invalid command: {exc}"
+            )
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = f"Invalid command: {exc}"
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"You are not running the correct command, sneaky devil: {exc}",
+            )
+
+        # K8S check.
+        if not is_kubernetes_env(
+            chute, dump, log_prefix=log_prefix, standard_template=chute.standard_template
+        ):
+            logger.error(f"{log_prefix} is not running a valid kubernetes environment")
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "Failed kubernetes environment check."
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=launch_config.verification_error,
+            )
+    else:
+        logger.warning("Unable to perform extended validation, skipping...")
+
+
+async def _validate_launch_config_inspecto(
+    db: AsyncSession,
+    launch_config: LaunchConfig,
+    chute: Chute,
+    args: GravalLaunchConfigArgs,
+    log_prefix: str,
+):
+    if semcomp(chute.chutes_version, "0.3.50") >= 0:
+        # Inspecto
+        if not args.inspecto:
+            logger.error(f"{log_prefix} no inspecto hash provided")
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "Failed inspecto environment/lib verification."
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=launch_config.verification_error,
+            )
+
+        enforce_inspecto = "PS_OP" in os.environ
+        inspecto_valid = True
+        fail_reason = None
+        if enforce_inspecto:
+            inspecto_hash = await get_inspecto_hash(chute.image_id)
+            if not inspecto_hash:
+                logger.info(f"INSPECTO: image_id={chute.image_id} has no inspecto hash; allowing.")
+                inspecto_valid = True
+            else:
+                if not args.inspecto:
+                    inspecto_valid = False
+                    fail_reason = "missing args.inspecto hash!"
+                else:
+                    raw = INSPECTO.verify_hash(
+                        inspecto_hash.encode("utf-8"),
+                        launch_config.config_id.encode("utf-8"),
+                        args.inspecto.encode("utf-8"),
+                    )
+                    logger.info(
+                        f"INSPECTO: verify_hash({inspecto_hash=}, {launch_config.config_id=}, {args.inspecto=}) -> {raw=}",
+                    )
+                    if not raw:
+                        inspecto_valid = False
+                        fail_reason = "inspecto returned NULL"
+                    else:
+                        try:
+                            payload = json.loads(raw.decode("utf-8"))
+                        except Exception as e:
+                            inspecto_valid = False
+                            fail_reason = f"inspecto returned non-JSON: {e}"
+                        else:
+                            if not payload.get("verified"):
+                                inspecto_valid = False
+                                fail_reason = f"inspecto verification failed: {payload}"
+        if not inspecto_valid:
+            logger.error(f"{log_prefix} has invalid inspecto verification: {fail_reason}")
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "Failed inspecto environment/lib verification."
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=launch_config.verification_error,
+            )
+
+
+async def _validate_launch_config_filesystem(
+    db: AsyncSession, launch_config: LaunchConfig, chute: Chute, args: GravalLaunchConfigArgs
+):
+    # Valid filesystem/integrity?
+    if semcomp(chute.chutes_version, "0.3.1") >= 0:
+        image_id = chute.image_id
+        patch_version = chute.image.patch_version
+        if "CFSV_OP" in os.environ:
+            task = await generate_fs_hash.kiq(
+                image_id,
+                patch_version,
+                launch_config.config_id,
+                sparse=False,
+                exclude_path=f"/app/{chute.filename}",
+            )
+            result = await task.wait_result()
+            expected_hash = result.return_value
+            if expected_hash != args.fsv:
+                logger.error(
+                    f"Filesystem challenge failed for {launch_config.config_id=} {launch_config.miner_hotkey=}, "
+                    f"{expected_hash=} for {chute.image_id=} {patch_version=} but received {args.fsv}"
+                )
+                launch_config.failed_at = func.now()
+                launch_config.verification_error = (
+                    "File system verification failure, mismatched hash"
+                )
+                await db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=launch_config.verification_error,
+                )
+        else:
+            logger.warning("Extended filesystem verification disabled, skipping...")
+
+
+async def _validate_launch_config_instance(
+    db: AsyncSession,
+    request: Request,
+    args: LaunchConfigArgs,
+    launch_config: LaunchConfig,
+    chute: Chute,
+    log_prefix: str,
+) -> Tuple[LaunchConfig, list[Node], Instance]:
+    miner = await _check_blacklisted(db, launch_config.miner_hotkey)
+
+    config_id = launch_config.config_id
+
+    # Generate a tentative instance ID.
+    new_instance_id = generate_uuid()
+
+    # Re-check scalable...
+    if not launch_config.job_id:
+        if (
+            not chute.public
+            and not has_legacy_private_billing(chute)
+            and chute.user_id != await chutes_user_id()
+        ):
+            await _check_scalable_private(db, chute, miner)
+        else:
+            await _check_scalable(db, chute, launch_config.miner_hotkey)
+
+    # IP matches?
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    actual_ip = x_forwarded_for.split(",")[0] if x_forwarded_for else request.client.host
+    if actual_ip != args.host:
+        logger.warning(
+            f"Instance with {launch_config.config_id=} {launch_config.miner_hotkey=} EGRESS INGRESS mismatch!: {actual_ip=} {args.host=}"
+        )
+        if launch_config.job_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Egress and ingress IPs much match for jobs: {actual_ip} vs {args.host}",
+            )
+
+    # Uniqueness of host/miner_hotkey.
+    result = await db.scalar(
+        select(Instance).where(
+            and_(
+                Instance.host == launch_config.host,
+                Instance.miner_hotkey != launch_config.miner_hotkey,
+            )
+        )
+    )
+    if result:
+        logger.warning(
+            f"{launch_config.config_id=} {launch_config.miner_hotkey=} attempted to use host already used by another miner!"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Host {launch_config.host} is already assigned to at least one other miner_hotkey.",
+        )
+
+    if semcomp(chute.chutes_version, "0.3.50") >= 0:
+        if not args.run_path or (
+            chute.standard_template == "vllm"
+            and os.path.dirname(args.run_path)
+            != "/usr/local/lib/python3.12/dist-packages/chutes/entrypoint"
+        ):
+            logger.error(f"{log_prefix} has tampered with paths!")
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "Env tampering detected!"
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=launch_config.verification_error,
+            )
+
+        # NetNanny (match egress config and hash).
+        nn_valid = True
+        if chute.allow_external_egress != args.egress or not args.netnanny_hash:
+            nn_valid = False
+        else:
+            if not NETNANNY.verify(
+                launch_config.config_id.encode(),
+                args.netnanny_hash.encode(),
+                1,
+            ):
+                logger.error(
+                    f"{log_prefix} netnanny hash mismatch for {launch_config.config_id=} and {chute.allow_external_egress=}"
+                )
+                nn_valid = False
+            else:
+                logger.success(
+                    f"{log_prefix} netnanny hash challenge success: for {launch_config.config_id=} and {chute.allow_external_egress=} {args.netnanny_hash=}"
+                )
+        if not nn_valid:
+            logger.error(
+                f"{log_prefix} has tampered with netnanny? {args.netnanny_hash=} {args.egress=} {chute.allow_external_egress=}"
+            )
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "Failed netnanny validation."
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=launch_config.verification_error,
+            )
+
+    await _validate_launch_config_filesystem(db, launch_config, chute, args)
+
+    # Assign the job to this launch config.
+    if launch_config.job_id:
+        stmt = (
+            update(Job)
+            .where(
+                Job.job_id == launch_config.job_id,
+                Job.miner_hotkey.is_(None),
+            )
+            .values(
+                miner_uid=launch_config.miner_uid,
+                miner_hotkey=launch_config.miner_hotkey,
+                miner_coldkey=launch_config.miner_coldkey,
+            )
+        )
+        result = await db.execute(stmt)
+        if result.rowcount == 0:
+            # Job was already claimed by another miner
+            logger.warning(
+                f"Job {launch_config.job_id=} via {launch_config.config_id=} was already "
+                f"claimed when miner {launch_config.miner_hotkey=} tried to claim it."
+            )
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "Job was already claimed by another miner"
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Job {launch_config.job_id} has already been claimed by another miner!",
+            )
+
+    # Create the instance now that we've verified the envdump/k8s env.
+    node_selector = NodeSelector(**chute.node_selector)
+    instance = Instance(
+        instance_id=new_instance_id,
+        host=args.host,
+        port=args.port_mappings[0].external_port,
+        chute_id=launch_config.chute_id,
+        version=chute.version,
+        miner_uid=launch_config.miner_uid,
+        miner_hotkey=launch_config.miner_hotkey,
+        miner_coldkey=launch_config.miner_coldkey,
+        region="n/a",
+        active=False,
+        verified=False,
+        chutes_version=chute.chutes_version,
+        symmetric_key=secrets.token_bytes(16).hex(),
+        config_id=launch_config.config_id,
+        port_mappings=[item.model_dump() for item in args.port_mappings],
+        compute_multiplier=node_selector.compute_multiplier,
+        billed_to=None,
+        hourly_rate=(await node_selector.current_estimated_price())["usd"]["hour"],
+        inspecto=args.inspecto,
+        env_creation=args.model_dump(),
+    )
+    if launch_config.job_id or (
+        not chute.public
+        and not has_legacy_private_billing(chute)
+        and chute.user_id != await chutes_user_id()
+    ):
+        # Integrated subnet?
+        integrated = False
+        for config in INTEGRATED_SUBNETS.values():
+            if config["model_substring"] in chute.name.lower():
+                integrated = True
+                break
+        bonus = PRIVATE_INSTANCE_BONUS if not integrated else INTEGRATED_SUBNET_BONUS
+        instance.compute_multiplier *= bonus
+        logger.info(
+            f"Adding private instance bonus value {bonus=} to {instance.instance_id} "
+            f"for total {instance.compute_multiplier=} for {chute.name=} {chute.chute_id=} {integrated=}"
+        )
+        instance.billed_to = chute.user_id
+
+    # Add chute boost.
+    if chute.boost is not None and chute.boost > 0 and chute.boost <= 20:
+        instance.compute_multiplier *= chute.boost
+
+    db.add(instance)
+
+    # Mark the job as associated with this instance.
+    if launch_config.job_id:
+        job = (
+            (await db.execute(select(Job).where(Job.job_id == launch_config.job_id)))
+            .unique()
+            .scalar_one_or_none()
+        )
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job {launch_config.job_id} no longer exists!",
+            )
+        job.instance_id = instance.instance_id
+        job.port_mappings = [item.model_dump() for item in args.port_mappings]
+
+        # Verify port mappings are correct.
+        job_obj = next(j for j in chute.jobs if j["name"] == job.method)
+        expected = set([f"{p['proto']}:{p['port']}".lower() for p in job_obj["ports"]])
+        received = set(
+            [
+                f"{p.proto}:{p.internal_port}".lower()
+                for p in args.port_mappings
+                if p.internal_port not in [8000, 8001]
+            ]
+        )
+        if expected != received:
+            logger.error(
+                f"{instance.instance_id=} from {config_id=} posted invalid ports: {expected=} vs {received=}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Invalid port mappings provided: {expected=} {received=}",
+            )
+
+    # Verify the GPUs are suitable.
+    if len(set([node["uuid"] for node in args.gpus])) != len(args.gpus):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Duplicate GPUs in request!",
+        )
+    node_ids = [node["uuid"] for node in args.gpus]
+    try:
+        nodes = await _validate_nodes(
+            db,
+            chute,
+            node_ids,
+            launch_config.miner_hotkey,
+            instance,
+        )
+    except Exception:
+        await db.rollback()
+        async with get_session() as error_session:
+            await error_session.execute(
+                text(
+                    "UPDATE launch_configs SET failed_at = NOW(), "
+                    "verification_error = 'invalid GPU/nodes configuration provided' "
+                    "WHERE config_id = :config_id"
+                ),
+                {"config_id": config_id},
+            )
+            await error_session.commit()
+        raise
+
+    return launch_config, nodes, instance
+
+
+async def _validate_graval_launch_config_instance(
+    config_id: str,
+    args: GravalLaunchConfigArgs,
+    request: Request,
+    db: AsyncSession,
+    authorization: str,
+) -> Tuple[LaunchConfig, list[Node], Instance]:
+    token = authorization.strip().split(" ")[-1]
+    launch_config = await load_launch_config_from_jwt(db, config_id, token)
+    chute = await _load_chute(db, launch_config.chute_id)
+    log_prefix = f"ENVDUMP: {launch_config.config_id=} {chute.chute_id=}"
+
+    # This does change order from previous graval only implementation
+    # If want to preserve order need to split up final shared config check
+    await _validate_launch_config_env(db, launch_config, chute, args, log_prefix)
+
+    await _validate_launch_config_inspecto(db, launch_config, chute, args, log_prefix)
+
+    return await _validate_launch_config_instance(
+        db, request, args, launch_config, chute, log_prefix
+    )
+
+
+async def _validate_tee_launch_config_instance(
+    config_id: str,
+    args: TeeLaunchConfigArgs,
+    request: Request,
+    db: AsyncSession,
+    authorization: str,
+) -> Tuple[LaunchConfig, list[Node], Instance]:
+    token = authorization.strip().split(" ")[-1]
+    launch_config = await load_launch_config_from_jwt(db, config_id, token)
+    chute = await _load_chute(db, launch_config.chute_id)
+    log_prefix = f"ENVDUMP: {launch_config.config_id=} {chute.chute_id=}"
+
+    return await _validate_launch_config_instance(
+        db, request, args, launch_config, chute, log_prefix
+    )
+
+
 @router.get("/launch_config")
 async def get_launch_config(
     chute_id: str,
+    server_id: Optional[str] = None,
     job_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
@@ -393,6 +866,7 @@ async def get_launch_config(
             miner_hotkey=hotkey,
             miner_uid=miner.node_id,
             miner_coldkey=miner.coldkey,
+            env_type="tee" if chute.tee else "graval",
             seed=0,
         )
         db.add(launch_config)
@@ -405,272 +879,93 @@ async def get_launch_config(
         )
 
     # Generate the JWT.
+    token = None
+    if semcomp(chute.chutes_version or "0.0.0", "0.3.61") >= 0:
+        token = create_launch_jwt_v2(
+            launch_config, egress=chute.allow_external_egress, disk_gb=disk_gb
+        )
+    else:
+        token = create_launch_jwt(launch_config, disk_gb=disk_gb)
+
     return {
-        "token": create_launch_jwt(launch_config, disk_gb=disk_gb),
+        "token": token,
         "config_id": launch_config.config_id,
     }
+
+
+@router.post("/launch_config/{config_id}/attest")
+async def validate_tee_launch_config_instance(
+    config_id: str,
+    args: TeeLaunchConfigArgs,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
+    expected_nonce: str = Depends(validate_request_nonce()),
+):
+    launch_config, nodes, instance = await _validate_tee_launch_config_instance(
+        config_id, args, request, db, authorization
+    )
+
+    _validate_launch_config_not_expired(launch_config)
+
+    # Store the launch config
+    await db.commit()
+    await db.refresh(launch_config)
+
+    async with get_session() as session:
+        await session.execute(
+            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
+            {"config_id": config_id},
+        )
+
+    # Send event.
+    await db.refresh(instance)
+    gpu_count = len(nodes)
+    gpu_type = nodes[0].gpu_identifier
+    asyncio.create_task(notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type))
+
+    await verify_gpu_evidence(args.gpu_evidence, expected_nonce)
+
+    request_body = await request.json()
+
+    # Reload instance with chute relationship for filesystem validation
+    # Lazy load fails
+    stmt = (
+        select(Instance)
+        .where(Instance.instance_id == instance.instance_id)
+        .options(
+            joinedload(Instance.chute).joinedload(Chute.image),
+            joinedload(Instance.job),
+        )
+    )
+    instance = (await db.execute(stmt)).scalar_one()
+
+    # Filesystem integrity checks for < 0.3.1
+    await _validate_legacy_filesystem(db, instance, launch_config, request_body)
+
+    # Everything checks out.
+    launch_config.verified_at = func.now()
+    await _verify_job_ports(db, instance)
+    await _mark_instance_verified(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
+    return_value["symmetric_key"] = instance.symmetric_key
+
+    await db.refresh(instance)
+    asyncio.create_task(notify_verified(instance))
+    return return_value
 
 
 @router.post("/launch_config/{config_id}")
 async def claim_launch_config(
     config_id: str,
-    args: LaunchConfigArgs,
+    args: GravalLaunchConfigArgs,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
 ):
-    from chutes.envdump import DUMPER
-
-    # Load the launch config, verifying the token.
-    token = authorization.strip().split(" ")[-1]
-    launch_config = await load_launch_config_from_jwt(db, config_id, token)
-    chute = await _load_chute(db, launch_config.chute_id)
-    miner = await _check_blacklisted(db, launch_config.miner_hotkey)
-
-    # Generate a tentative instance ID.
-    new_instance_id = generate_uuid()
-
-    # Re-check scalable...
-    if not launch_config.job_id:
-        if (
-            not chute.public
-            and not has_legacy_private_billing(chute)
-            and chute.user_id != await chutes_user_id()
-        ):
-            await _check_scalable_private(db, chute, miner)
-        else:
-            await _check_scalable(db, chute, launch_config.miner_hotkey)
-
-    # IP matches?
-    x_forwarded_for = request.headers.get("X-Forwarded-For")
-    actual_ip = x_forwarded_for.split(",")[0] if x_forwarded_for else request.client.host
-    if launch_config.job_id and actual_ip != args.host:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Egress and ingress IPs much match for jobs: {actual_ip} vs {args.host}",
-        )
-
-    # Verify, decrypt, parse the envdump payload.
-    if "ENVDUMP_UNLOCK" in os.environ:
-        code = None
-        try:
-            dump = DUMPER.decrypt(launch_config.env_key, args.env)
-            code_data = DUMPER.decrypt(launch_config.env_key, args.code)
-            code = base64.b64decode(code_data["content"]).decode()
-        except Exception as exc:
-            logger.error(
-                f"Attempt to claim {config_id=} failed, invalid envdump payload received: {exc}"
-            )
-            launch_config.failed_at = func.now()
-            launch_config.verification_error = f"Unable to verify: {exc=} {args=}"
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=launch_config.verification_error,
-            )
-
-        # Check the environment.
-        try:
-            await verify_expected_command(
-                dump,
-                chute,
-                miner_hotkey=launch_config.miner_hotkey,
-            )
-            assert code == chute.code, f"Incorrect code:\n{code=}\n{chute.code=}"
-        except AssertionError as exc:
-            logger.error(f"Attempt to claim {config_id=} failed, invalid command: {exc}")
-            launch_config.failed_at = func.now()
-            launch_config.verification_error = f"Invalid command: {exc}"
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"You are not running the correct command, sneaky devil: {exc}",
-            )
-
-        # K8S check.
-        log_prefix = f"ENVDUMP: {config_id=} {chute.chute_id=}"
-        if not is_kubernetes_env(
-            chute, dump, log_prefix=log_prefix, standard_template=chute.standard_template
-        ):
-            logger.error(f"{log_prefix} is not running a valid kubernetes environment")
-            launch_config.failed_at = func.now()
-            launch_config.verification_error = "Failed kubernetes environment check."
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=launch_config.verification_error,
-            )
-
-    else:
-        logger.warning("Unable to perform extended validation, skipping...")
-
-    # Valid filesystem/integrity?
-    if semcomp(chute.chutes_version, "0.3.1") >= 0:
-        image_id = chute.image_id
-        patch_version = chute.image.patch_version
-        if "CFSV_OP" in os.environ:
-            task = await generate_fs_hash.kiq(
-                image_id,
-                patch_version,
-                launch_config.config_id,
-                sparse=False,
-                exclude_path=f"/app/{chute.filename}",
-            )
-            result = await task.wait_result()
-            expected_hash = result.return_value
-            if expected_hash != args.fsv:
-                logger.error(
-                    f"Filesystem challenge failed for {launch_config.config_id=} {launch_config.miner_hotkey=}, "
-                    f"{expected_hash=} for {chute.image_id=} {patch_version=} but received {args.fsv}"
-                )
-                launch_config.failed_at = func.now()
-                launch_config.verification_error = (
-                    "File system verification failure, mismatched hash"
-                )
-                await db.commit()
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=launch_config.verification_error,
-                )
-        else:
-            logger.warning("Extended filesystem verification disabled, skipping...")
-
-    # Assign the job to this launch config.
-    if launch_config.job_id:
-        stmt = (
-            update(Job)
-            .where(
-                Job.job_id == launch_config.job_id,
-                Job.miner_hotkey.is_(None),
-            )
-            .values(
-                miner_uid=launch_config.miner_uid,
-                miner_hotkey=launch_config.miner_hotkey,
-                miner_coldkey=launch_config.miner_coldkey,
-            )
-        )
-        result = await db.execute(stmt)
-        if result.rowcount == 0:
-            # Job was already claimed by another miner
-            logger.warning(
-                f"Job {launch_config.job_id=} via {launch_config.config_id=} was already "
-                f"claimed when miner {launch_config.miner_hotkey=} tried to claim it."
-            )
-            launch_config.failed_at = func.now()
-            launch_config.verification_error = "Job was already claimed by another miner"
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Job {launch_config.job_id} has already been claimed by another miner!",
-            )
-
-    # Create the instance now that we've verified the envdump/k8s env.
-    node_selector = NodeSelector(**chute.node_selector)
-    instance = Instance(
-        instance_id=new_instance_id,
-        host=args.host,
-        port=args.port_mappings[0].external_port,
-        chute_id=launch_config.chute_id,
-        version=chute.version,
-        miner_uid=launch_config.miner_uid,
-        miner_hotkey=launch_config.miner_hotkey,
-        miner_coldkey=launch_config.miner_coldkey,
-        region="n/a",
-        active=False,
-        verified=False,
-        chutes_version=chute.chutes_version,
-        symmetric_key=secrets.token_bytes(16).hex(),
-        config_id=launch_config.config_id,
-        port_mappings=[item.model_dump() for item in args.port_mappings],
-        compute_multiplier=node_selector.compute_multiplier,
-        billed_to=None,
-        hourly_rate=(await node_selector.current_estimated_price())["usd"]["hour"],
+    launch_config, nodes, instance = await _validate_graval_launch_config_instance(
+        config_id, args, request, db, authorization
     )
-    if launch_config.job_id or (
-        not chute.public
-        and not has_legacy_private_billing(chute)
-        and chute.user_id != await chutes_user_id()
-    ):
-        instance.compute_multiplier *= PRIVATE_INSTANCE_MULTIPLIER
-        instance.billed_to = chute.user_id
-
-    # Verify the logging server is running.
-    if not await check_instance_logging_server(instance):
-        logger.error(
-            f"Instance failed logging server probe: {instance.instance_id=} {instance.miner_hotkey=}"
-        )
-        # raise HTTPException(
-        #     status_code=status.HTTP_403_FORBIDDEN,
-        #     detail=(
-        #         "Failed logging server scan! Be sure to expose ALL services for all chutes, "
-        #         "particularly port 8000 (standard chute port) and 8001 (logging port)"
-        #     ),
-        # )
-
-    db.add(instance)
-
-    # Mark the job as associated with this instance.
-    if launch_config.job_id:
-        job = (
-            (await db.execute(select(Job).where(Job.job_id == launch_config.job_id)))
-            .unique()
-            .scalar_one_or_none()
-        )
-        if not job:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Job {launch_config.job_id} no longer exists!",
-            )
-        job.instance_id = instance.instance_id
-        job.port_mappings = [item.model_dump() for item in args.port_mappings]
-
-        # Verify port mappings are correct.
-        job_obj = next(j for j in chute.jobs if j["name"] == job.method)
-        expected = set([f"{p['proto']}:{p['port']}".lower() for p in job_obj["ports"]])
-        received = set(
-            [
-                f"{p.proto}:{p.internal_port}".lower()
-                for p in args.port_mappings
-                if p.internal_port not in [8000, 8001]
-            ]
-        )
-        if expected != received:
-            logger.error(
-                f"{instance.instance_id=} from {config_id=} posted invalid ports: {expected=} vs {received=}"
-            )
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Invalid port mappings provided: {expected=} {received=}",
-            )
-
-    # Verify the GPUs are suitable.
-    if len(set([node["uuid"] for node in args.gpus])) != len(args.gpus):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Duplicate GPUs in request!",
-        )
-    node_ids = [node["uuid"] for node in args.gpus]
-    try:
-        nodes = await _validate_nodes(
-            db,
-            chute,
-            node_ids,
-            launch_config.miner_hotkey,
-            instance,
-        )
-    except Exception:
-        await db.rollback()
-        async with get_session() as error_session:
-            await error_session.execute(
-                text(
-                    "UPDATE launch_configs SET failed_at = NOW(), "
-                    "verification_error = 'invalid GPU/nodes configuration provided' "
-                    "WHERE config_id = :config_id"
-                ),
-                {"config_id": config_id},
-            )
-            await error_session.commit()
-        raise
 
     # Generate a ciphertext for this instance to decrypt.
     node = random.choice(nodes)
@@ -789,6 +1084,36 @@ async def activate_launch_config_instance(
 
     # Activate the instance (and trigger tentative billing stop time).
     if not instance.active:
+        # If a bounty exists for this chute, claim it.
+        bounty = await claim_bounty(instance.chute_id)
+        if bounty is None:
+            bounty = 0
+        if bounty:
+            instance.bounty = True
+
+        # Verify egress.
+        # net_success = True
+        # if semcomp(chute.chutes_version, "0.3.56") >= 0:
+        #    from conn_prober import check_instance_connectivity
+
+        #    _, net_success = await check_instance_connectivity(instance, delete_on_failure=False)
+        # if not net_success:
+        #    reason = "Instance has failed network connectivity probes, based on allow_external_egress flag"
+        #    logger.warning(reason)
+        # XXX TODO
+        # await db.delete(instance)
+        # await asyncio.create_task(notify_deleted(instance))
+        # await db.execute(
+        #    text(
+        #        "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = :instance_id"
+        #    ),
+        #    {"instance_id": instance.instance_id, "reason": reason},
+        # )
+        # raise HTTPException(
+        #    status_code=status.HTTP_403_FORBIDDEN,
+        #    detail=reason,
+        # )
+
         instance.active = True
         instance.activated_at = func.now()
         if launch_config.job_id or (
@@ -799,12 +1124,9 @@ async def activate_launch_config_instance(
             instance.stop_billing_at = func.now() + timedelta(
                 seconds=chute.shutdown_after_seconds or 300
             )
-            # For private instances, we need to delete the bounty to prevent scaling back up
-            # if this instance is terminated before a request is made. The miner will still a
-            # bounty, however, since each private instance automatically counts as a bounty (see metasync/shared.py)
-            await delete_bounty(chute.chute_id)
         await db.commit()
         await invalidate_instance_cache(instance.chute_id, instance_id=instance.instance_id)
+        await delete_bounty(chute.chute_id)
         asyncio.create_task(notify_activated(instance))
     return {"ok": True}
 
@@ -847,17 +1169,9 @@ async def verify_port_map(instance, port_map):
         return False
 
 
-@router.put("/launch_config/{config_id}")
-async def verify_launch_config_instance(
-    config_id: str,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
-):
-    token = authorization.strip().split(" ")[-1]
-    launch_config = await load_launch_config_from_jwt(db, config_id, token, allow_retrieved=True)
-
+def _validate_launch_config_not_expired(launch_config):
     # Validate the launch config.
+    config_id = launch_config.config_id
     if launch_config.verified_at:
         logger.warning(f"Launch config {config_id} has already been verified!")
         raise HTTPException(
@@ -872,6 +1186,148 @@ async def verify_launch_config_instance(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Launch config failed verification: {launch_config.failed_at=} {launch_config.verification_error=}",
         )
+
+
+async def _validate_legacy_filesystem(
+    db: AsyncSession, instance: Instance, launch_config: LaunchConfig, response_body
+):
+    config_id = launch_config.config_id
+    # Valid filesystem/integrity?
+    if semcomp(instance.chute.chutes_version, "0.3.1") < 0:
+        image_id = instance.chute.image_id
+        patch_version = instance.chute.image.patch_version
+        if "CFSV_OP" in os.environ:
+            task = await generate_fs_hash.kiq(
+                image_id,
+                patch_version,
+                launch_config.seed,
+                sparse=False,
+                exclude_path=f"/app/{instance.chute.filename}",
+            )
+            result = await task.wait_result()
+            expected_hash = result.return_value
+            if expected_hash != response_body["fsv"]:
+                reason = (
+                    f"Filesystem challenge failed for {config_id=} and {instance.instance_id=} {instance.miner_hotkey=}, "
+                    f"{expected_hash=} for {image_id=} {patch_version=} but received {response_body['fsv']}"
+                )
+                logger.error(reason)
+                launch_config.failed_at = func.now()
+                launch_config.verification_error = reason
+                await db.delete(instance)
+                await db.execute(
+                    text(
+                        "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = :instance_id"
+                    ),
+                    {"instance_id": instance.instance_id, "reason": reason},
+                )
+                await db.commit()
+                asyncio.create_task(notify_deleted(instance))
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=launch_config.verification_error,
+                )
+        else:
+            logger.warning("Extended filesystem verification disabled, skipping...")
+
+
+async def _verify_job_ports(db: AsyncSession, instance: Instance):
+    job = instance.job
+    if job:
+        # Test the ports are open.
+        for port_map in instance.port_mappings:
+            if port_map["internal_port"] in (8000, 8001):
+                continue
+            if not await verify_port_map(instance, port_map):
+                reason = f"Failed port verification on {port_map=} for {instance.instance_id=} {instance.miner_hotkey=}"
+                logger.error(reason)
+                await db.execute(
+                    text(
+                        "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = :instance_id"
+                    ),
+                    {"instance_id": instance.instance_id, "reason": reason},
+                )
+                asyncio.create_task(notify_deleted(instance))
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Failed port verification on {port_map=}",
+                )
+
+        # All good!
+        job.started_at = func.now()
+        await db.refresh(job)
+
+
+async def _mark_instance_verified(
+    db: AsyncSession, instance: Instance, launch_config: LaunchConfig
+):
+    # Can't do this via the instance attrs directly, circular dependency :/
+    await db.execute(
+        text(
+            "UPDATE instances SET verified = true, verification_error = null, last_verified_at = now() WHERE instance_id = :instance_id"
+        ),
+        {"instance_id": instance.instance_id},
+    )
+
+    await db.commit()
+    await db.refresh(launch_config)
+
+
+async def _build_launch_config_verified_response(
+    db: AsyncSession, instance: Instance, launch_config: LaunchConfig
+):
+    return_value = {
+        "chute_id": launch_config.chute_id,
+        "instance_id": instance.instance_id,
+        "verified_at": launch_config.verified_at.isoformat(),
+    }
+    if semcomp(instance.chutes_version or "0.0.0", "0.3.61") >= 0:
+        return_value["code"] = instance.chute.code
+        return_value["fs_key"] = generate_fs_key(launch_config)
+        if instance.chute.encrypted_fs:
+            return_value["efs"] = True
+    if instance.job:
+        job_token = create_job_jwt(instance.job.job_id)
+        return_value.update(
+            {
+                "job_id": instance.job.job_id,
+                "job_method": instance.job.method,
+                "job_data": instance.job.job_args,
+                "job_status_url": f"https://api.{settings.base_domain}/jobs/{instance.job.job_id}?token={job_token}",
+            }
+        )
+
+    # Secrets, e.g. private HF tokens etc.
+    secrets = (
+        (await db.execute(select(Secret).where(Secret.purpose == launch_config.chute_id)))
+        .unique()
+        .scalars()
+        .all()
+    )
+    if secrets:
+        return_value["secrets"] = {}
+        for secret in secrets:
+            value = await decrypt_secret(secret.value)
+            return_value["secrets"][secret.key] = value
+
+    return_value["activation_url"] = (
+        f"https://api.{settings.base_domain}/instances/launch_config/{launch_config.config_id}/activate"
+    )
+
+    return return_value
+
+
+@router.put("/launch_config/{config_id}")
+async def verify_launch_config_instance(
+    config_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
+):
+    token = authorization.strip().split(" ")[-1]
+    launch_config = await load_launch_config_from_jwt(db, config_id, token, allow_retrieved=True)
+
+    _validate_launch_config_not_expired(launch_config)
 
     # Check decryption time.
     now = (await db.scalar(select(func.now()))).replace(tzinfo=None)
@@ -977,114 +1433,13 @@ async def verify_launch_config_instance(
             detail=launch_config.verification_error,
         )
 
-    # Valid filesystem/integrity?
-    if semcomp(instance.chute.chutes_version, "0.3.1") < 0:
-        image_id = instance.chute.image_id
-        patch_version = instance.chute.image.patch_version
-        if "CFSV_OP" in os.environ:
-            task = await generate_fs_hash.kiq(
-                image_id,
-                patch_version,
-                launch_config.seed,
-                sparse=False,
-                exclude_path=f"/app/{instance.chute.filename}",
-            )
-            result = await task.wait_result()
-            expected_hash = result.return_value
-            if expected_hash != response_body["fsv"]:
-                reason = (
-                    f"Filesystem challenge failed for {config_id=} and {instance.instance_id=} {instance.miner_hotkey=}, "
-                    f"{expected_hash=} for {image_id=} {patch_version=} but received {response_body['fsv']}"
-                )
-                logger.error(reason)
-                launch_config.failed_at = func.now()
-                launch_config.verification_error = reason
-                await db.delete(instance)
-                await db.execute(
-                    text(
-                        "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = :instance_id"
-                    ),
-                    {"instance_id": instance.instance_id, "reason": reason},
-                )
-                await db.commit()
-                asyncio.create_task(notify_deleted(instance))
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=launch_config.verification_error,
-                )
-        else:
-            logger.warning("Extended filesystem verification disabled, skipping...")
+    await _validate_legacy_filesystem(db, instance, launch_config, response_body)
 
     # Everything checks out.
     launch_config.verified_at = func.now()
-    job = instance.job
-    if job:
-        # Test the ports are open.
-        for port_map in instance.port_mappings:
-            if port_map["internal_port"] in (8000, 8001):
-                continue
-            if not await verify_port_map(instance, port_map):
-                reason = f"Failed port verification on {port_map=} for {instance.instance_id=} {instance.miner_hotkey=}"
-                logger.error(reason)
-                await db.execute(
-                    text(
-                        "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = :instance_id"
-                    ),
-                    {"instance_id": instance.instance_id, "reason": reason},
-                )
-                asyncio.create_task(notify_deleted(instance))
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Failed port verification on {port_map=}",
-                )
-
-        # All good!
-        job.started_at = func.now()
-
-    # Can't do this via the instance attrs directly, circular dependency :/
-    await db.execute(
-        text(
-            "UPDATE instances SET verified = true, verification_error = null, last_verified_at = now() WHERE instance_id = :instance_id"
-        ),
-        {"instance_id": instance.instance_id},
-    )
-
-    await db.commit()
-    await db.refresh(launch_config)
-    if job:
-        await db.refresh(job)
-    return_value = {
-        "chute_id": launch_config.chute_id,
-        "instance_id": instance.instance_id,
-        "verified_at": launch_config.verified_at.isoformat(),
-    }
-    if job:
-        job_token = create_job_jwt(job.job_id)
-        return_value.update(
-            {
-                "job_id": instance.job.job_id,
-                "job_method": instance.job.method,
-                "job_data": instance.job.job_args,
-                "job_status_url": f"https://api.{settings.base_domain}/jobs/{instance.job.job_id}?token={job_token}",
-            }
-        )
-
-    # Secrets, e.g. private HF tokens etc.
-    secrets = (
-        (await db.execute(select(Secret).where(Secret.purpose == launch_config.chute_id)))
-        .unique()
-        .scalars()
-        .all()
-    )
-    if secrets:
-        return_value["secrets"] = {}
-        for secret in secrets:
-            value = await decrypt_secret(secret.value)
-            return_value["secrets"][secret.key] = value
-
-    return_value["activation_url"] = (
-        f"https://api.{settings.base_domain}/instances/launch_config/{launch_config.config_id}/activate"
-    )
+    await _verify_job_ports(db, instance)
+    await _mark_instance_verified(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
 
     await db.refresh(instance)
     asyncio.create_task(notify_verified(instance))
@@ -1197,13 +1552,37 @@ async def delete_instance(
         job.miner_terminated = True
         job.finished_at = func.now()
 
+    # Bounties are negated if an instance of a public chute is deleted with no other active instanes.
+    negate_bounty = False
+    if not instance.billed_to:
+        active_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Instance)
+                .where(
+                    Instance.chute_id == instance.chute_id,
+                    Instance.instance_id != instance.instance_id,
+                    Instance.active.is_(True),
+                )
+            )
+        ).scalar_one()
+        if active_count == 0:
+            logger.warning(
+                f"Instance {instance.instance_id=} of {instance.miner_hotkey=} terminated without any other active instances, negating bounty!"
+            )
+            negate_bounty = True
+
     await db.delete(instance)
-    await db.execute(
-        text(
-            "UPDATE instance_audit SET deletion_reason = 'miner initialized' WHERE instance_id = :instance_id"
-        ),
-        {"instance_id": instance_id},
-    )
+
+    # Update instance audit table.
+    params = {"instance_id": instance_id}
+    sql = "UPDATE instance_audit SET deletion_reason = 'miner initialized'"
+    if negate_bounty:
+        sql += ", bounty = :bounty"
+        params["bounty"] = False
+    sql += " WHERE instance_id = :instance_id"
+    await db.execute(text(sql), params)
+
     await db.commit()
     await notify_deleted(instance)
 

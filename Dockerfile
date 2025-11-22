@@ -113,7 +113,7 @@ ADD --chown=chutes watchtower.py /forge/watchtower.py
 ENV BUILDAH_ISOLATION=chroot
 ENV STORAGE_DRIVER=overlay
 
-ENTRYPOINT ["poetry", "run", "taskiq", "worker", "api.image.forge:broker", "--workers", "1", "--max-async-tasks", "1"]
+ENTRYPOINT ["poetry", "run", "python", "-m", "api.image.forge"]
 
 
 ###
@@ -145,9 +145,22 @@ FROM base AS api
 RUN curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 && chmod +x /usr/local/bin/dbmate
 RUN useradd chutes -s /bin/bash -d /home/chutes && mkdir -p /home/chutes && chown chutes:chutes /home/chutes
 RUN mkdir -p /app && chown chutes:chutes /app
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
 USER chutes
 RUN curl -sSL https://install.python-poetry.org | python3 -
 ENV PATH=$PATH:/home/chutes/.local/bin
+
+USER root
+WORKDIR /tmp/nv-attest
+COPY --chown=chutes:chutes nv-attest /tmp/nv-attest
+RUN poetry build -f wheel \
+    && python -m venv /app/nv-attest \
+    && /app/nv-attest/bin/pip install --no-cache-dir dist/*.whl
+RUN rm -rf /tmp/nv-attest
+RUN ln -s /app/nv-attest/bin/chutes-nvattest /usr/bin/chutes-nvattest
+USER chutes
+
 ADD pyproject.toml /app/
 ADD poetry.lock /app/
 WORKDIR /app
@@ -163,6 +176,8 @@ ADD --chown=chutes chute_autoscaler.py /app/chute_autoscaler.py
 ADD --chown=chutes balance_refresher.py /app/balance_refresher.py
 ADD --chown=chutes data/cache_hit_cluster_params.json /app/cache_hit_cluster_params.json
 ADD --chown=chutes log_prober.py /app/log_prober.py
+ADD --chown=chutes conn_prober.py /app/conn_prober.py
 ADD --chown=chutes scripts /app/scripts
+
 ENV PYTHONPATH=/app
 ENTRYPOINT ["poetry", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

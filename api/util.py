@@ -2,11 +2,13 @@
 Utility/helper functions.
 """
 
+import os
 import re
 import time
 import uuid
 import aiodns
 import base64
+import ctypes
 import random
 import semver
 import string
@@ -17,6 +19,7 @@ import hashlib
 import datetime
 import traceback
 import ipaddress
+import importlib.util
 from io import BytesIO
 from PIL import Image
 import orjson as json
@@ -29,7 +32,7 @@ from sqlalchemy.future import select
 from api.constants import VLM_MAX_SIZE, MIN_REG_BALANCE
 from api.metasync import MetagraphNode
 from api.permissions import Permissioning
-from fastapi import status, HTTPException
+from fastapi import Request, status, HTTPException
 from sqlalchemy import func, or_, and_, exists
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding, hashes
@@ -148,6 +151,12 @@ async def get_resolved_ips(host: str) -> Set[IPv4Address | IPv6Address]:
         raise ValueError(f"DNS resolution failed for host {host}: {str(exc)}")
 
 
+def extract_ip(request: Request) -> str:
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    actual_ip = x_forwarded_for.split(",")[0] if x_forwarded_for else request.client.host
+    return actual_ip
+
+
 async def is_valid_host(host: str) -> bool:
     """
     Validate host (IP or DNS name).
@@ -167,7 +176,6 @@ async def is_valid_host(host: str) -> bool:
             return all(not is_invalid_ip(ip) for ip in resolved_ips)
         except ValueError:
             return False
-    return False
 
 
 async def is_registered_to_subnet(session, user, netuid):
@@ -392,7 +400,8 @@ def semcomp(input_version: str, target_version: str):
     """
     if not input_version:
         input_version = "0.0.0"
-    clean_version = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+).*", input_version).group(1)
+    re_match = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+).*", input_version)
+    clean_version = re_match.group(1) if re_match else "0.0.0"
     return semver.compare(clean_version, target_version)
 
 
@@ -838,3 +847,12 @@ async def has_minimum_balance_for_registration(
                 await substrate.close()
             except Exception:
                 ...
+
+
+def load_shared_object(pkg_name: str, filename: str):
+    spec = importlib.util.find_spec(pkg_name)
+    if not spec or not spec.submodule_search_locations:
+        raise ImportError(f"Package {pkg_name} not found")
+    pkg_dir = spec.submodule_search_locations[0]
+    path = os.path.join(pkg_dir, filename)
+    return ctypes.CDLL(path)

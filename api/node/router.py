@@ -15,6 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 from api.database import get_db_session
 from api.config import settings
+from api.node.util import _track_nodes, check_node_inventory
+from api.miner.util import is_miner_blacklisted
+from api.server.util import _track_server
 from api.util import is_valid_host
 from api.gpu import SUPPORTED_GPUS
 from api.node.schemas import Node, MultiNodeArgs
@@ -23,7 +26,6 @@ from api.graval_worker import validate_gpus, broker
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.constants import HOTKEY_HEADER
-from api.metasync import get_miner_by_hotkey
 
 router = APIRouter()
 
@@ -141,17 +143,11 @@ async def create_nodes(
     """
     Add nodes/GPUs to inventory.
     """
-    mgnode = await get_miner_by_hotkey(hotkey, db)
-    if not mgnode:
+    reason = await is_miner_blacklisted(db, hotkey)
+    if reason:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Your hotkey is not registered on {settings.netuid}",
-        )
-    if mgnode.blacklist_reason:
-        logger.warning(f"MINERBLACKLIST: {hotkey=} reason={mgnode.blacklist_reason}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Your hotkey has been blacklisted: {mgnode.blacklist_reason}",
+            detail=reason,
         )
 
     # If we got here, the authorization succeeded, meaning it's from a registered hotkey.
@@ -163,16 +159,12 @@ async def create_nodes(
             detail="Limit is 10 GPUs per server.",
         )
 
-    # Check if any of the nodes are already in inventory.
     node_uuids = [node.uuid for node in args.nodes]
-    existing = (
-        (await db.execute(select(Node).where(Node.uuid.in_(node_uuids)))).unique().scalars().all()
-    )
-    if existing:
-        nodes = [node.uuid for node in existing]
+    existing_nodes = await check_node_inventory(db, node_uuids)
+    if existing_nodes:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Nodes already exist in inventory, please contact chutes team to resolve: {nodes}",
+            detail=f"Nodes already exist in inventory, please contact chutes team to resolve: {existing_nodes}",
         )
 
     # GPU hoppers...
@@ -217,29 +209,12 @@ async def create_nodes(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="One or more invalid verification_hosts provided.",
         )
+
     try:
-        for node_args in nodes_args:
-            node = Node(
-                **{
-                    **node_args.dict(),
-                    **{
-                        "miner_hotkey": hotkey,
-                        "seed": seed,
-                        "verified_at": verified_at,
-                        "server_id": args.server_id,
-                    },
-                }
-            )
-            # Legacy flags for backwards graval compatibility.
-            gpu_info = SUPPORTED_GPUS[node.gpu_identifier]
-            if "major" in gpu_info:
-                for key in ["major", "minor", "tensor_cores", "concurrent_kernels", "ecc", "sxm"]:
-                    setattr(node, key, gpu_info.get(key))
-            db.add(node)
-            nodes.append(node)
-        await db.commit()
-        for idx in range(len(nodes)):
-            await db.refresh(nodes[idx])
+        await _track_server(
+            db, args.server_id, args.nodes[0].verification_host, hotkey, is_tee=False
+        )
+        nodes = await _track_nodes(db, hotkey, args.server_id, args.nodes, seed, verified_at)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -8,20 +8,31 @@ from pathlib import Path
 import aioboto3
 import aiomcache
 import json
-from functools import cached_property
+from functools import cached_property, lru_cache
 import redis.asyncio as redis
 from boto3.session import Config
-from typing import Optional
+from typing import Dict, Optional
 from bittensor_wallet.keypair import Keypair
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from contextlib import asynccontextmanager
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
+@lru_cache(maxsize=1)
 def load_squad_cert():
     if (path := os.getenv("SQUAD_CERT_PATH")) is not None:
         with open(path, "rb") as infile:
             return infile.read()
     return b""
+
+
+@lru_cache(maxsize=1)
+def load_launch_config_private_key():
+    if (path := os.getenv("LAUNCH_CONFIG_PRIVATE_KEY_PATH")) is not None:
+        with open(path, "rb") as infile:
+            return infile.read()
+    return None
 
 
 class Settings(BaseSettings):
@@ -76,7 +87,7 @@ class Settings(BaseSettings):
     validator_ss58: Optional[str] = os.getenv("VALIDATOR_SS58")
     storage_bucket: str = os.getenv("STORAGE_BUCKET", "REPLACEME")
     redis_url: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-    memcached_host: str = os.getenv("MEMCACHED", "memcached")
+    memcached_host: str = os.getenv("MEMCACHED", "memcached.chutes.svc.cluster.local")
 
     _redis_client: Optional[redis.Redis] = None
     _cm_redis_clients: Optional[list[redis.Redis]] = None
@@ -180,6 +191,17 @@ class Settings(BaseSettings):
         os.getenv("LAUNCH_CONFIG_KEY", "launch-secret").encode()
     ).hexdigest()
 
+    # New, asymmetric launch config keys.
+    launch_config_private_key_bytes: Optional[bytes] = load_launch_config_private_key()
+
+    @cached_property
+    def launch_config_private_key(self) -> Optional[ec.EllipticCurvePrivateKey]:
+        if hasattr(self, "_launch_config_private_key"):
+            return self._launch_config_private_key
+        if (key_bytes := load_launch_config_private_key()) is not None:
+            self._launch_config_private_key = serialization.load_pem_private_key(key_bytes, None)
+        return self._launch_config_private_key
+
     # Default quotas/discounts.
     default_quotas: dict = json.loads(os.getenv("DEFAULT_QUOTAS", '{"*": 200}'))
     default_discounts: dict = json.loads(os.getenv("DEFAULT_DISCOUNTS", '{"*": 0.0}'))
@@ -204,6 +226,35 @@ class Settings(BaseSettings):
     # hCaptcha
     hcaptcha_sitekey: Optional[str] = os.getenv("HCAPTCHA_SITEKEY")
     hcaptcha_secret: Optional[str] = os.getenv("HCAPTCHA_SECRET")
+
+    # TDX Attestation settings
+    expected_mrtd: Optional[str] = os.getenv("TDX_EXPECTED_MRTD")
+    expected_boot_rmtrs: Optional[Dict[str, str]] = (
+        {
+            pair.split("=")[0]: pair.split("=")[1]
+            for pair in os.getenv("TDX_BOOT_RMTRS", "").split(",")
+            if pair and "=" in pair and len(pair.split("=")) == 2
+        }
+        if os.getenv("TDX_BOOT_RMTRS")
+        else None
+    )
+    expected_runtime_rmtrs: Optional[Dict[str, str]] = (
+        {
+            pair.split("=")[0]: pair.split("=")[1]
+            for pair in os.getenv("TDX_RUNTIME_RMTRS", "").split(",")
+            if pair and "=" in pair and len(pair.split("=")) == 2
+        }
+        if os.getenv("TDX_RUNTIME_RMTRS")
+        else None
+    )
+    luks_passphrase: Optional[str] = os.getenv("LUKS_PASSPHRASE")
+
+    # TDX verification service URLs (if using Intel's remote verification)
+    tdx_verification_url: Optional[str] = os.getenv("TDX_VERIFICATION_URL")
+    tdx_cert_chain_url: Optional[str] = os.getenv("TDX_CERT_CHAIN_URL")
+
+    # Nonce expiration (minutes)
+    attestation_nonce_expiry: int = int(os.getenv("ATTESTATION_NONCE_EXPIRY", "10"))
 
 
 settings = Settings()

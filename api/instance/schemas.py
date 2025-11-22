@@ -54,9 +54,22 @@ class LaunchConfigArgs(BaseModel):
     gpus: list[dict]
     host: str
     port_mappings: list[PortMap]
-    env: str
-    code: str
     fsv: Optional[str] = None
+    egress: Optional[bool] = None
+    netnanny_hash: Optional[str] = None
+    run_path: Optional[str] = None
+    py_dirs: Optional[list[str]] = None
+
+
+class GravalLaunchConfigArgs(LaunchConfigArgs):
+    env: str
+    code: Optional[str] = None
+    run_code: Optional[str] = None
+    inspecto: Optional[str] = None
+
+
+class TeeLaunchConfigArgs(LaunchConfigArgs):
+    gpu_evidence: list[dict]
 
 
 class Instance(Base):
@@ -91,6 +104,9 @@ class Instance(Base):
     )
     cacert = Column(String, nullable=True)
     port_mappings = Column(JSONB, nullable=True)
+    inspecto = Column(String, nullable=True)
+    env_creation = Column(JSONB, nullable=True)
+    bounty = Column(Boolean, default=False)
 
     # Hourly rate charged to customer, which may differ from the hourly rate of the actual
     # GPUs used for this instance due to node selector. For example, if a chute supports
@@ -130,6 +146,7 @@ class LaunchConfig(Base):
     )
     host = Column(String, nullable=True)
     port = Column(Integer, nullable=True)
+    env_type = Column(String, nullable=True)
     miner_uid = Column(Integer, nullable=False)
     miner_hotkey = Column(String, nullable=False)
     miner_coldkey = Column(String, nullable=False)

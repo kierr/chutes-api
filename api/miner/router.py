@@ -26,7 +26,7 @@ from api.database import get_session, get_db_session
 from api.config import settings
 from api.constants import HOTKEY_HEADER
 from api.metasync import get_miner_by_hotkey, MetagraphNode
-from api.util import memcache_get, memcache_set
+from api.util import memcache_get, memcache_set, semcomp
 from metasync.shared import get_scoring_data
 
 router = APIRouter()
@@ -42,7 +42,7 @@ def model_to_dict(obj):
         if isinstance(getattr(value, "decorator_info", None), ComputedFieldInfo):
             data[name] = getattr(obj, name)
     if isinstance(obj, Chute):
-        data["image"] = f"{obj.image.user.username}/{obj.image.name}:{obj.image.tag}"
+        data["image"] = f"{obj.image.user.username}/{obj.image.name}:{obj.image.tag}".lower()
         if obj.image.patch_version not in (None, "initial"):
             data["image"] += f"-{obj.image.patch_version}"
         ns = NodeSelector(**obj.node_selector)
@@ -52,10 +52,21 @@ def model_to_dict(obj):
                 "supported_gpus": ns.supported_gpus,
             }
         )
+        if semcomp(obj.chutes_version or "0.0.0", "0.3.61") >= 0:
+            data["code"] = "print('legacy placeholder')"
+        data["preemptible"] = obj.preemptible
     if isinstance(obj, Image):
-        data["username"] = obj.user.username
+        data["username"] = obj.user.username.lower()
+        data["name"] = obj.name.lower()
+        data["tag"] = obj.tag.lower()
     if isinstance(data.get("seed"), Decimal):
         data["seed"] = int(data["seed"])
+    data.pop("symmetric_key", None)
+    data.pop("host", None)
+    data.pop("inspecto", None)
+    data.pop("port_mappings", None)
+    data.pop("port", None)
+    data.pop("env_creation", None)
     return data
 
 
@@ -177,6 +188,7 @@ async def release_job(
 async def get_full_inventory(
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     session: AsyncSession = Depends(get_db_session),
+    _: User = Depends(get_current_user(purpose="miner", registered_to=settings.netuid)),
 ):
     query = text(
         f"""
@@ -202,7 +214,6 @@ async def get_full_inventory(
 @router.get("/metrics/")
 async def metrics(
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(get_current_user(purpose="miner", registered_to=settings.netuid)),
 ):
     async def _stream():
         async for metric in gather_metrics():

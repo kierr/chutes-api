@@ -35,7 +35,7 @@ from sqlalchemy import text, update, func, select
 from sqlalchemy.orm import joinedload, selectinload
 import api.database.orms  # noqa
 import api.miner_client as miner_client
-from api.instance.schemas import Instance
+from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import invalidate_instance_cache
 from api.chute.codecheck import is_bad_code
 
@@ -202,10 +202,12 @@ async def load_chute_instances(chute_id):
     async with get_session() as session:
         query = (
             select(Instance)
+            .join(Instance.config)
             .where(
                 Instance.chute_id == chute_id,
                 Instance.active.is_(True),
                 Instance.verified.is_(True),
+                LaunchConfig.env_type != "tee",  # Exclude TEE
             )
             .options(joinedload(Instance.nodes))
         )
@@ -750,9 +752,32 @@ def is_kubernetes_env(
     # Ignore if we don't have envdump configured.
     if not settings.kubecheck_salt:
         return True
+
     # Requires chutes SDK 0.2.53+
     if semcomp(instance.chutes_version or "0.0.0", "0.2.53") < 0:
         return True
+
+    # Lib overrides.
+    if standard_template:
+        exclude = {
+            "UV_SYSTEM_PYTHON",
+            "PYTHONUNBUFFERED",
+            "PYTHONIOENCODING",
+            "PYTHONWARNINGS",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+        }
+        bad = [key for key in dump["env"] if "python" in key.lower() and key.upper() not in exclude]
+        if bad:
+            logger.warning(f"{log_prefix} Invalid environment found: PYTHON env override(s): {bad}")
+            return False
+    if semcomp(instance.chutes_version or "0.0.0", "0.3.61") >= 0:
+        if (
+            dump["env"].get("LD_PRELOAD")
+            != "/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-logintercept.so"
+        ):
+            logger.warning(f"{log_prefix} Invalid environment found: LD_PRELOAD tampering")
+            return False
 
     # Simple flags.
     flat = uuid_dict(dump, salt=settings.kubecheck_salt)
@@ -819,29 +844,6 @@ def is_kubernetes_env(
         )
         return False
 
-    # Extra sneaky.
-    if special_key := flat.get("3aba393c-2046-59e2-b524-992f5c17b3f4"):
-        for value in special_key:
-            nested = uuid_dict(value, salt=settings.kubecheck_salt)
-            if secret := nested.get("cc523b3d-4ca2-5062-9182-bdfbf2fda998"):
-                if any(
-                    [
-                        str(uuid.uuid5(uuid.NAMESPACE_OID, part + settings.kubecheck_salt))
-                        == "5a3a3898-bbc3-59bb-91de-14d67e124039"
-                        for part in secret.split("/")
-                    ]
-                ):
-                    logger.warning(
-                        f"{log_prefix} Invalid environment found: "
-                        "expecting NOT to find magic uuid 5a3a3898-bbc3-59bb-91de-14d67e124039 "
-                        "in magic key 3aba393c-2046-59e2-b524-992f5c17b3f4"
-                    )
-                    return False
-    else:
-        logger.warning(
-            f"{log_prefix} Did not find expected magic key 3aba393c-2046-59e2-b524-992f5c17b3f4"
-        )
-        return False
     logger.success(f"{log_prefix} kubernetes check passed")
     return True
 
@@ -867,31 +869,35 @@ async def check_sglang(instance_id: str, chute: Chute, dump: dict, log_prefix: s
     found_sglang = False
     sglang_process = None
     for process in processes:
-        clean_exe = re.sub(r"([^ ]+/)?python3?(\.[0-9]+)?", "python", process["exe"].strip())
+        target_exe = process["exe"] if process["exe"].strip() else process["cmdline"].split(" ")[0]
+        clean_exe = re.sub(r"([^ ]+/)?python3?(\.[0-9]+)?", "python", target_exe)
+        cmdline = re.sub(r"([^ ]+/)?python3?(\.[0-9]+)?", "python", process["cmdline"])
         if (
-            (process["exe"] == "/opt/python/bin/python3.12" or clean_exe == "python")
+            clean_exe in ["python", "python3.10", "python3.11", "python3.12"]
             and process["username"] == "chutes"
-            and (
-                process["cmdline"].startswith(
-                    f"python -m sglang.launch_server --host 127.0.0.1 --port 10101 --model-path {model_name}"
-                )
-                or process["cmdline"].startswith(
-                    "sglang::http_server/tokenizer_manager"
-                )  # XXX SGLang now uses setproctitle
+            and cmdline.startswith(
+                f"python -m sglang.launch_server --host 127.0.0.1 --port 10101 --model-path {model_name}"
             )
         ):
-            logger.success(f"{log_prefix} found SGLang chute: {process=}")
-            found_sglang = True
-            sglang_process = process
-            if revision:
-                if revision in process["cmdline"]:
-                    logger.success(f"{log_prefix} also found revision identifier")
+            if semcomp(chute.chutes_version or "0.0.0", "0.3.48") >= 0:
+                if "--enable-cache-report" not in cmdline:
+                    logger.warning(f"Cache report not enabled: {cmdline}")
+                elif "--enable-return-hidden-states" not in cmdline:
+                    logger.warning(f"Hidden states return not enabled: {cmdline}")
                 else:
-                    logger.warning(f"{log_prefix} did not find chute revision: {revision}")
-            break
+                    found_sglang = True
+            else:
+                found_sglang = True
+            if revision and revision not in cmdline:
+                found_sglang = False
+                logger.warning(f"Did not find model revision in SGLang command: {cmdline}")
+            if found_sglang:
+                logger.success(f"{log_prefix} found valid SGLang chute: {process=}")
+                sglang_process = process
+                break
 
     if not found_sglang:
-        logger.error(f"{log_prefix} did not find SGLang process, bad...")
+        logger.error(f"{log_prefix} did not find SGLang process, bad: {processes=}")
         return False
 
     # Track the process.

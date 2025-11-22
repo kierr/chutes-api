@@ -39,7 +39,7 @@ from api.chute.templates import (
     build_diffusion_code,
     build_tei_code,
 )
-from api.gpu import SUPPORTED_GPUS
+from api.gpu import ALLOW_INCLUDE, SUPPORTED_GPUS
 from api.chute.response import ChuteResponse
 from api.chute.util import (
     selector_hourly_price,
@@ -276,6 +276,26 @@ async def unshare_chute(
     return {
         "status": f"Successfully unshared {chute.name=} with {user.username=} (if share exists)"
     }
+
+
+@router.get("/boosted")
+async def list_boosted_chutes():
+    """
+    Get a list of chutes that have a boost.
+    """
+    async with get_session() as session:
+        query = (
+            select(Chute.chute_id, Chute.name, Chute.boost)
+            .where(Chute.boost.isnot(None))
+            .where(Chute.boost >= 1)
+            .where(Chute.boost <= 20)
+        )
+        result = await session.execute(query)
+        chutes = [
+            {"chute_id": str(cid), "name": name, "boost": boost}
+            for cid, name, boost in result.all()
+        ]
+        return chutes
 
 
 @router.get("/affine_available")
@@ -620,7 +640,7 @@ async def get_chute_code(
             )
         )
         or "/affine" in chute.name.lower()
-        or subnet_role_accessible(chute, current_user, admin=True)
+        or (current_user and subnet_role_accessible(chute, current_user, admin=True))
     ):
         authorized = True
     if not authorized:
@@ -699,7 +719,7 @@ async def get_chute_utilization(request: Request):
             item = dict(row)
             scale_value = await settings.redis_client.get(f"scale:{item['chute_id']}")
             target_count = int(scale_value) if scale_value else item.get("target_count", 0)
-            current_count = item.get("total_instance_count", 0)
+            current_count = item.get("active_instance_count", 0)
             item["scalable"] = current_count < target_count
             item["scale_allowance"] = max(0, target_count - current_count)
             item["avg_busy_ratio"] = item.get("utilization_1h", 0)
@@ -860,18 +880,38 @@ async def _deploy_chute(
         )
 
     # Default for external egress.
-    allow_egress = True
+    allow_egress = chute_args.allow_external_egress
     if (
-        chute_args.allow_external_egress is None
+        allow_egress is None
         and chute_args.standard_template in ("vllm", "embedding")
         and semcomp(image.chutes_version, "0.3.45") >= 0
     ):
         allow_egress = False
+    elif allow_egress is None:
+        allow_egress = False
+    if "affine" in chute_args.name.lower() or "turbovision" in chute_args.name.lower():
+        allow_egress = False
+
+    # Cache encryption, currently not fully function so disabled.
+    if chute_args.encrypted_fs is None:
+        chute_args.encrypted_fs = False
 
     if not chute_args.node_selector:
         chute_args.node_selector = {"gpu_count": 1}
     if isinstance(chute_args.node_selector, dict):
         chute_args.node_selector = NodeSelector(**chute_args.node_selector)
+    for gpu in chute_args.node_selector.include or []:
+        if gpu not in ALLOW_INCLUDE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Only these GPUs can be specified in the `include` field: {ALLOW_INCLUDE}",
+            )
+    if len(chute_args.node_selector.exclude or []) > 4:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum of 4 GPUs can be included in the `exclude` field",
+        )
+
     allowed_gpus = set(chute_args.node_selector.supported_gpus)
     if not allowed_gpus - set(["5090", "3090", "4090"]):
         raise HTTPException(
@@ -950,33 +990,26 @@ async def _deploy_chute(
             detail="Missing required revision parameter for vllm template.",
         )
 
-    # Prevent deploying images with old chutes SDK versions.
-    if not image.chutes_version or semcomp(image.chutes_version, "0.3.31") < 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Unable to deploy chutes with legacy images (chutes SDK < 0.3.31.rc1), please upgrade "
-                f"(or ask chutes team to upgrade) {image.name=} {image.image_id=} currently {image.chutes_version}"
-            ),
-        )
-
     # Only allow newer SGLang versions for affine.
     if "/affine" in chute_args.name.lower():
         if (
-            not image_supports_cllmv(image, min_version=2025102603)
+            not image_supports_cllmv(image, min_version=2025111900)
             or image.user_id != await chutes_user_id()
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Must use image="chutes/sglang:2025102603" (or more recent dated versions) for affine deployments.',
+                detail='Must use image="chutes/sglang:nightly-2025111900" (or more recent dated versions) for affine deployments.',
             )
 
-    # Require min chutes version for turbovision.
-    if "turbovision" in chute_args.name.lower() and semcomp(image.chutes_version, "0.3.47") < 0:
+    # Prevent deploying images with old chutes SDK versions.
+    min_version = "0.3.61"
+    if current_user.user_id != await chutes_user_id() and (
+        not image.chutes_version or semcomp(image.chutes_version, min_version) < 0
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "Unable to deploy turbovision chutes with chutes version < 0.3.47, please upgrade "
+                f"Unable to deploy chutes with chutes version < {min_version}, please upgrade "
                 f"(or ask chutes team to upgrade) {image.name=} {image.image_id=} currently {image.chutes_version=}"
             ),
         )
@@ -1044,6 +1077,7 @@ async def _deploy_chute(
             else (chute_args.scaling_threshold or 0.75)
         )
         chute.allow_external_egress = allow_egress
+        chute.encrypted_fs = chute.encrypted_fs and chute_args.encrypted_fs  # XX prevent changing
     else:
         try:
             is_public = (
@@ -1086,6 +1120,7 @@ async def _deploy_chute(
                 if is_public or current_user.user_id == await chutes_user_id()
                 else (chute_args.shutdown_after_seconds or 300),
                 allow_external_egress=allow_egress,
+                encrypted_fs=chute_args.encrypted_fs,
             )
         except ValueError as exc:
             raise HTTPException(

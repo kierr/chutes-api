@@ -13,6 +13,7 @@ import traceback
 import orjson as json
 import base64
 import gzip
+import math
 import pickle
 import random
 from async_lru import alru_cache
@@ -39,11 +40,13 @@ from api.exceptions import (
     BadRequest,
     KeyExchangeRequired,
     EmptyLLMResponse,
+    InvalidResponse,
     InvalidCLLMV,
 )
 from api.util import (
     sse,
     now_str,
+    semcomp,
     aes_encrypt,
     aes_decrypt,
     use_encryption_v2,
@@ -53,7 +56,6 @@ from api.util import (
     has_legacy_private_billing,
 )
 from api.util import memcache_get, memcache_set, memcache_delete
-from api.bounty.util import claim_bounty
 from api.chute.schemas import Chute, NodeSelector, ChuteShare, LLMDetail
 from api.user.schemas import User, InvocationQuota, InvocationDiscount, PriceOverride
 from api.user.service import chutes_user_id
@@ -86,6 +88,7 @@ LLM_PATHS = {"chat_stream", "completion_stream", "chat", "completion"}
 
 BASE_UNIFIED_INVOCATION_INSERT = """
 INSERT INTO {table_name} (
+    bounty,
     parent_invocation_id,
     invocation_id,
     chute_id,
@@ -101,9 +104,9 @@ INSERT INTO {table_name} (
     completed_at,
     error_message,
     compute_multiplier,
-    bounty,
     metrics
 ) VALUES (
+    0,
     :parent_invocation_id,
     :invocation_id,
     :chute_id,
@@ -119,7 +122,6 @@ INSERT INTO {table_name} (
     CURRENT_TIMESTAMP,
     :error_message,
     :compute_multiplier,
-    :bounty,
     :metrics
 )
 """
@@ -154,44 +156,50 @@ async def store_invocation(
     duration: float,
     compute_multiplier: float,
     error_message: Optional[str] = None,
-    bounty: Optional[int] = 0,
     metrics: Optional[dict] = {},
     legacy: Optional[bool] = False,
 ):
     insert_sql = UNIFIED_INVOCATION_INSERT_LEGACY if legacy else UNIFIED_INVOCATION_INSERT
     async with get_session(legacy=legacy) as session:
-        result = await session.execute(
-            insert_sql,
-            {
-                "parent_invocation_id": parent_invocation_id,
-                "invocation_id": invocation_id,
-                "chute_id": chute_id,
-                "chute_user_id": chute_user_id,
-                "function_name": function_name,
-                "user_id": user_id,
-                "image_id": image_id,
-                "image_user_id": image_user_id,
-                "instance_id": instance_id,
-                "miner_uid": miner_uid,
-                "miner_hotkey": miner_hotkey,
-                "duration": duration,
-                "error_message": error_message,
-                "compute_multiplier": compute_multiplier,
-                "bounty": bounty,
-                "metrics": json.dumps(metrics).decode(),
-            },
-        )
-        row = result.first()
-        return row
+        async with session.begin():
+            result = await session.execute(
+                insert_sql,
+                {
+                    "parent_invocation_id": parent_invocation_id,
+                    "invocation_id": invocation_id,
+                    "chute_id": chute_id,
+                    "chute_user_id": chute_user_id,
+                    "function_name": function_name,
+                    "user_id": user_id,
+                    "image_id": image_id,
+                    "image_user_id": image_user_id,
+                    "instance_id": instance_id,
+                    "miner_uid": miner_uid,
+                    "miner_hotkey": miner_hotkey,
+                    "duration": duration,
+                    "error_message": error_message,
+                    "compute_multiplier": compute_multiplier,
+                    "metrics": json.dumps(metrics).decode(),
+                },
+            )
+            row = result.first()
+            return row
 
 
-async def get_miner_session(instance: Instance) -> aiohttp.ClientSession:
+async def safe_store_invocation(*args, **kwargs):
+    try:
+        await store_invocation(*args, **kwargs)
+    except Exception as exc:
+        logger.error(f"SAFE_STORE_INVOCATION: failed to insert invocation record: {str(exc)}")
+
+
+async def get_miner_session(instance: Instance, timeout: int = 600) -> aiohttp.ClientSession:
     """
     Get or create an aiohttp session for an instance.
     """
     return aiohttp.ClientSession(
         base_url=f"http://{instance.host}:{instance.port}",
-        timeout=aiohttp.ClientTimeout(connect=5.0, total=600.0),
+        timeout=aiohttp.ClientTimeout(connect=5.0, total=timeout),
         read_bufsize=8 * 1024 * 1024,
     )
 
@@ -448,8 +456,9 @@ async def _invoke_one(
         path = encrypted_path
 
     session, response = None, None
+    timeout = 600 if semcomp(target.chutes_version or "0.0.0", "0.3.59") < 0 else 900
     try:
-        session = await get_miner_session(target)
+        session = await get_miner_session(target, timeout=timeout)
         headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
         if iv:
             headers["X-Chutes-Serialized"] = "true"
@@ -528,14 +537,9 @@ async def _invoke_one(
                             f"BAD_RESPONSE {target.instance_id=} {chute.name} returned invalid chunk (model name)"
                         )
 
-                    # Error in response?
-                    if isinstance(data, dict) and data.get("error"):
-                        logger.warning(f"Chunk included an error response: {data['error']=}")
-
                     # CLLMV check.
                     if (
-                        chunk_idx <= 10
-                        and isinstance(data, dict)
+                        (random.random() <= 0.05 or chunk_idx <= 5)
                         and image_supports_cllmv(chute.image)
                         and target.version == chute.version
                         and chute.chute_id
@@ -559,19 +563,20 @@ async def _invoke_one(
                         ):
                             choice = data["choices"][0]
                             if isinstance(choice, dict):
-                                if "text" in choice:
-                                    text = choice["text"]
-                                elif (
-                                    "delta" in choice
-                                    and choice["delta"]
-                                    and isinstance(choice["delta"], dict)
-                                ):
-                                    text = choice["delta"].get("content") or choice["delta"].get(
-                                        "reasoning_content"
-                                    )
-                                    tool_calls = choice["delta"].get("tool_calls")
-                                    if isinstance(tool_calls, list) and tool_calls:
-                                        has_tool_call = True
+                                if plain_path.startswith("chat"):
+                                    if (
+                                        "delta" in choice
+                                        and choice["delta"]
+                                        and isinstance(choice["delta"], dict)
+                                    ):
+                                        text = choice["delta"].get("content") or choice[
+                                            "delta"
+                                        ].get("reasoning_content")
+                                        tool_calls = choice["delta"].get("tool_calls")
+                                        if isinstance(tool_calls, list) and tool_calls:
+                                            has_tool_call = True
+                                else:
+                                    text = choice.get("text")
 
                         # Verify the hash.
                         if (text or not has_tool_call) and (
@@ -760,7 +765,7 @@ async def _invoke_one(
                         text = None
                         if json_data.get("choices"):
                             choice = json_data["choices"][0]
-                            if "text" in choice:
+                            if "text" in choice and not plain_path.startswith("chat"):
                                 text = choice["text"]
                             elif isinstance(choice.get("message"), dict):
                                 text = choice["message"].get(
@@ -822,6 +827,13 @@ async def _invoke_one(
                                 )
                             else:
                                 prompt_tokens = claimed_prompt_tokens
+                    else:
+                        logger.warning(
+                            f"Response from {target.instance_id=} {target.miner_hotkey=} of {chute.chute_id=} {chute.name=} did not include usage data!"
+                        )
+                        raise InvalidResponse(
+                            f"BAD_RESPONSE {target.instance_id=} {chute.name=} returned invalid response (missing usage data)"
+                        )
 
                     # Track metrics using either sane claimed usage metrics or estimates.
                     metrics["tokens"] = completion_tokens
@@ -995,54 +1007,51 @@ async def invoke(
                         ...
                     yield sse({"result": data})
 
-                # Check any bounty values.
-                bounty = await claim_bounty(chute_id)
-                if bounty is None:
-                    bounty = 0
-
+                # Store complete record in new invocations database, async.
                 # XXX this is a different started_at from global request started_at, for compute units
                 duration = time.time() - started_at
-
-                # Store in new database.
-                await store_invocation(
-                    parent_invocation_id,
-                    invocation_id,
-                    chute.chute_id,
-                    chute.user_id,
-                    function,
-                    user_id,
-                    chute.image_id,
-                    chute.image.user_id,
-                    target.instance_id,
-                    target.miner_uid,
-                    target.miner_hotkey,
-                    duration,
-                    multiplier,
-                    error_message=None,
-                    bounty=bounty,
-                    metrics=metrics,
-                    legacy=False,
+                asyncio.create_task(
+                    safe_store_invocation(
+                        parent_invocation_id,
+                        invocation_id,
+                        chute.chute_id,
+                        chute.user_id,
+                        function,
+                        user_id,
+                        chute.image_id,
+                        chute.image.user_id,
+                        target.instance_id,
+                        target.miner_uid,
+                        target.miner_hotkey,
+                        duration,
+                        multiplier,
+                        error_message=None,
+                        metrics=metrics,
+                        legacy=False,
+                    )
                 )
 
-                # Store in old database.
-                store_result = await store_invocation(
-                    parent_invocation_id,
-                    invocation_id,
-                    chute.chute_id,
-                    chute.user_id,
-                    function,
-                    user_id,
-                    chute.image_id,
-                    chute.image.user_id,
-                    target.instance_id,
-                    target.miner_uid,
-                    target.miner_hotkey,
-                    duration,
-                    multiplier,
-                    error_message=None,
-                    bounty=bounty,
-                    metrics=metrics,
-                    legacy=True,
+                # Track in the legacy DB.
+                compute_units = multiplier * math.ceil(duration)
+                asyncio.create_task(
+                    store_invocation(
+                        parent_invocation_id,
+                        invocation_id,
+                        chute.chute_id,
+                        chute.user_id,
+                        function,
+                        user_id,
+                        chute.image_id,
+                        chute.image.user_id,
+                        target.instance_id,
+                        target.miner_uid,
+                        target.miner_hotkey,
+                        duration,
+                        multiplier,
+                        error_message=None,
+                        metrics=metrics,
+                        legacy=True,
+                    )
                 )
 
                 # Clear any consecutive failure flags.
@@ -1056,7 +1065,6 @@ async def invoke(
                 # Calculate the credits used and deduct from user's balance asynchronously.
                 # For LLMs and Diffusion chutes, we use custom per token/image step pricing,
                 # otherwise it's just based on time used.
-                compute_units = store_result.total_compute_units
                 balance_used = 0.0
                 override_applied = False
                 if compute_units and not request.state.free_invocation:
@@ -1126,24 +1134,13 @@ async def invoke(
                     if user_discount:
                         balance_used -= balance_used * user_discount
 
-                # For private/user-created chutes, the costs of the chute are offset by
-                # usage of the chute from users other than the chute owner, i.e.
-                # when a private chute is shared with another user and that user makes
-                # use of the chute, that user is charged per request and that balance is
-                # added to the chute owner's account, reducing their overall cost.
-                add_balance_to = None
+                # Don't charge for private instances.
                 if (
                     not chute.public
                     and not has_legacy_private_billing(chute)
                     and chute.user_id != await chutes_user_id()
                 ):
-                    if user_id == chute.user_id:
-                        balance_used = 0
-                    else:
-                        add_balance_to = chute.user_id
-                        logger.info(
-                            f"Adding {balance_used} credits to {chute.user_id} due to invocation of {chute.name=} from {user_id=}"
-                        )
+                    balance_used = 0
 
                 # Ship the data over to usage tracker which actually deducts/aggregates balance/etc.
                 try:
@@ -1155,9 +1152,6 @@ async def invoke(
                         pipeline.hincrby(key, "input_tokens", metrics.get("it", 0))
                         pipeline.hincrby(key, "output_tokens", metrics.get("ot", 0))
                     pipeline.hset(key, "timestamp", int(time.time()))
-                    if balance_used and add_balance_to:
-                        transfer_key = f"balance:{chute.user_id}:{chute.chute_id}"
-                        pipeline.hincrbyfloat(transfer_key, "amount", 0 - balance_used)
                     await pipeline.execute()
                 except Exception as exc:
                     logger.error(f"Error updating usage pipeline: {exc}")
@@ -1247,22 +1241,24 @@ async def invoke(
                 )
 
                 # Legacy invocations table storage.
-                store_result = await store_invocation(
-                    parent_invocation_id,
-                    invocation_id,
-                    chute.chute_id,
-                    chute.user_id,
-                    function,
-                    user_id,
-                    chute.image_id,
-                    chute.image.user_id,
-                    target.instance_id,
-                    target.miner_uid,
-                    target.miner_hotkey,
-                    duration,
-                    multiplier,
-                    error_message=error_message,
-                    legacy=True,
+                asyncio.create_task(
+                    safe_store_invocation(
+                        parent_invocation_id,
+                        invocation_id,
+                        chute.chute_id,
+                        chute.user_id,
+                        function,
+                        user_id,
+                        chute.image_id,
+                        chute.image.user_id,
+                        target.instance_id,
+                        target.miner_uid,
+                        target.miner_hotkey,
+                        duration,
+                        multiplier,
+                        error_message=error_message,
+                        legacy=True,
+                    )
                 )
 
                 async with get_session() as session:
@@ -1381,7 +1377,7 @@ async def load_llm_details(chute, target):
         iv = bytes.fromhex(payload[:32])
 
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(connect=5.0, total=600.0),
+        timeout=aiohttp.ClientTimeout(connect=5.0, total=60.0),
         read_bufsize=8 * 1024 * 1024,
         raise_for_status=True,
     ) as session:
@@ -1502,6 +1498,8 @@ async def get_and_store_llm_details(chute_id: str):
         for instance in instances:
             try:
                 model_info = await load_llm_details(chute, instance)
+                model_info["id"] = chute.name
+                model_info["chute_id"] = chute.chute_id
                 model_info["price"] = price
 
                 # OpenRouter format.

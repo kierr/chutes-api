@@ -7,7 +7,17 @@ import uuid
 import asyncio
 import orjson as json
 from loguru import logger
-from fastapi import APIRouter, Depends, HTTPException, status, File, Form, UploadFile, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+    File,
+    Form,
+    UploadFile,
+    Response,
+    Request,
+)
 from fastapi_cache.decorator import cache
 from starlette.responses import StreamingResponse
 from sqlalchemy import and_, or_, exists, func
@@ -23,7 +33,7 @@ from api.config import settings
 from api.image.response import ImageResponse
 from api.image.util import get_image_by_id_or_name
 from api.pagination import PaginatedResponse
-from api.util import limit_images
+from api.util import limit_images, semcomp
 from api.permissions import Permissioning
 
 router = APIRouter()
@@ -227,6 +237,7 @@ async def delete_image(
 
 @router.post("/", status_code=status.HTTP_202_ACCEPTED)
 async def create_image(
+    request: Request,
     wait: bool = Form(...),
     build_context: UploadFile = File(...),
     username: str = Form(...),
@@ -250,6 +261,17 @@ async def create_image(
             detail="Cannot make images for users other than yourself!",
         )
     await limit_images(db, current_user)
+
+    # Check for legacy versions.
+    chutes_sdk_version = request.headers.get("X-Chutes-Version", "0.0.0").lower() or "0.0.0"
+    logger.warning(
+        f"Attempt to build image with: {chutes_sdk_version=} from {current_user.username=} {current_user.user_id=}"
+    )
+    if semcomp(chutes_sdk_version, "0.3.61") < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please upgrade your local chutes lib to version >= 0.3.61, e.g. `pip3 install chutes==0.3.61` and try again",
+        )
 
     # Make sure user has reasonable balance before allowing image creation.
     if not current_user.has_role(Permissioning.unlimited_dev):
@@ -280,15 +302,6 @@ async def create_image(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Image with {name=} and {tag=} aready exists",
         )
-
-    # Force installation of chutes with the specified version.
-    dockerfile += "\n\n" + "\n".join(
-        [
-            f"RUN pip install chutes=={settings.chutes_version}",
-            "RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), \"chutes-netnanny.so\"))') /usr/local/lib/chutes-netnanny.so",
-            "ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so",
-        ]
-    )
 
     # Upload the build context to our S3-compatible storage backend.
     for obj, destination in (
