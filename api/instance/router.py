@@ -897,7 +897,7 @@ async def get_launch_config(
 
 
 @router.post("/launch_config/{config_id}/attest")
-async def validate_tee_launch_config_instance(
+async def initialize_tee_launch_config_instance(
     config_id: str,
     args: TeeLaunchConfigArgs,
     request: Request,
@@ -915,11 +915,7 @@ async def validate_tee_launch_config_instance(
     await db.commit()
     await db.refresh(launch_config)
 
-    async with get_session() as session:
-        await session.execute(
-            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
-            {"config_id": config_id},
-        )
+    await _mark_launch_config_retrieved(config_id)
 
     # Send event.
     await db.refresh(instance)
@@ -929,33 +925,49 @@ async def validate_tee_launch_config_instance(
 
     await verify_gpu_evidence(args.gpu_evidence, expected_nonce)
 
-    request_body = await request.json()
+    return {"symmetric_key": instance.symmetric_key}
 
-    # Reload instance with chute relationship for filesystem validation
-    # Lazy load fails
-    stmt = (
+
+@router.put("/launch_config/{config_id}/attest")
+async def finalize_tee_launch_config_instance(
+    config_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
+):
+    token = authorization.strip().split(" ")[-1]
+    launch_config = await load_launch_config_from_jwt(db, config_id, token, allow_retrieved=True)
+
+    _validate_launch_config_not_expired(launch_config)
+    if not launch_config.retrieved_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Launch config must be retrieved before verification.",
+        )
+
+    query = (
         select(Instance)
-        .where(Instance.instance_id == instance.instance_id)
+        .where(Instance.config_id == launch_config.config_id)
         .options(
-            joinedload(Instance.chute).joinedload(Chute.image),
+            joinedload(Instance.nodes),
             joinedload(Instance.job),
+            joinedload(Instance.chute).joinedload(Chute.image),
         )
     )
-    instance = (await db.execute(stmt)).scalar_one()
+    instance = (await db.execute(query)).unique().scalar_one_or_none()
+    if not instance:
+        launch_config.failed_at = func.now()
+        launch_config.verification_error = "Instance was deleted"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Instance disappeared (did you update gepetto reconcile?)",
+    )
 
-    # Filesystem integrity checks for < 0.3.1
-    await _validate_legacy_filesystem(db, instance, launch_config, request_body)
-
-    # Everything checks out.
-    launch_config.verified_at = func.now()
-    await _verify_job_ports(db, instance)
-    await _mark_instance_verified(db, instance, launch_config)
-    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
-    return_value["symmetric_key"] = instance.symmetric_key
-
-    await db.refresh(instance)
-    asyncio.create_task(notify_verified(instance))
-    return return_value
+    request_body = await request.json()
+    return await _finalize_launch_config_verification(
+        db, instance, launch_config, request_body
+    )
 
 
 @router.post("/launch_config/{config_id}")
@@ -995,11 +1007,7 @@ async def claim_launch_config(
     await db.refresh(launch_config)
 
     # Set timestamp in a fresh transaction so it's not affected by the long cipher gen time.
-    async with get_session() as session:
-        await session.execute(
-            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
-            {"config_id": config_id},
-        )
+    await _mark_launch_config_retrieved(config_id)
 
     # Send event.
     await db.refresh(instance)
@@ -1263,6 +1271,41 @@ async def _verify_job_ports(db: AsyncSession, instance: Instance):
         await db.refresh(job)
 
 
+async def _mark_launch_config_retrieved(config_id: str):
+    """
+    Set retrieved_at for a launch config in a separate transaction.
+    """
+    async with get_session() as session:
+        await session.execute(
+            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
+            {"config_id": config_id},
+        )
+
+
+async def _finalize_launch_config_verification(
+    db: AsyncSession,
+    instance: Instance,
+    launch_config: LaunchConfig,
+    response_body: dict | None = None,
+):
+    """
+    Finalize verification for either TEE or GraVal workflows.
+    """
+    fs_payload = response_body or {}
+    if "fsv" not in fs_payload and instance.env_creation:
+        fs_payload = instance.env_creation
+    await _validate_legacy_filesystem(db, instance, launch_config, fs_payload)
+
+    launch_config.verified_at = func.now()
+    await _verify_job_ports(db, instance)
+    await _mark_instance_verified(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
+
+    await db.refresh(instance)
+    asyncio.create_task(notify_verified(instance))
+    return return_value
+
+
 async def _mark_instance_verified(
     db: AsyncSession, instance: Instance, launch_config: LaunchConfig
 ):
@@ -1438,17 +1481,9 @@ async def verify_launch_config_instance(
             detail=launch_config.verification_error,
         )
 
-    await _validate_legacy_filesystem(db, instance, launch_config, response_body)
-
-    # Everything checks out.
-    launch_config.verified_at = func.now()
-    await _verify_job_ports(db, instance)
-    await _mark_instance_verified(db, instance, launch_config)
-    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
-
-    await db.refresh(instance)
-    asyncio.create_task(notify_verified(instance))
-    return return_value
+    return await _finalize_launch_config_verification(
+        db, instance, launch_config, response_body
+    )
 
 
 @router.get("/token_check")
