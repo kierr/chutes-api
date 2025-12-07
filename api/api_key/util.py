@@ -8,10 +8,10 @@ from async_lru import alru_cache
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 from fastapi import Request, HTTPException, status
+from api.config import settings
 from api.api_key.schemas import APIKey
 from api.database import get_session
 from api.user.schemas import User
-from api.util import memcache_get, memcache_set, memcache_delete
 
 
 def reinject_dash(uuid_str: str) -> str:
@@ -24,15 +24,15 @@ def reinject_dash(uuid_str: str) -> str:
 @alru_cache(maxsize=1000, ttl=60)
 async def _load_key(token_id: str):
     """
-    Load API key from database with memcache caching.
+    Load API key from database with caching.
     """
-    cache_key = f"akey:{token_id}".encode()
-    cached = await memcache_get(cache_key)
+    cache_key = f"akey:{token_id}"
+    cached = await settings.redis_client.get(cache_key)
     if cached:
         try:
             return pickle.loads(cached)
         except Exception:
-            await memcache_delete(cache_key)
+            await settings.redis_client.delete(cache_key)
     async with get_session() as session:
         api_key = (
             (
@@ -51,7 +51,7 @@ async def _load_key(token_id: str):
                 if api_key.user.current_balance:
                     _ = api_key.user.current_balance.effective_balance
             serialized = pickle.dumps(api_key)
-            await memcache_set(cache_key, serialized, exptime=60)
+            await settings.redis_client.set(cache_key, serialized, ex=60)
         return api_key
 
 

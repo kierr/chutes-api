@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
 # Install system dependencies and Python 3.12
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get upgrade && apt-get install -y \
     python3.12 \
     python3.12-dev \
     python3.12-venv \
@@ -37,7 +37,6 @@ RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/s
 
 # Set Python 3.12 as default python3
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-
 
 ###
 # FORGE
@@ -79,7 +78,7 @@ ADD data/containers.conf /etc/containers/containers.conf
 RUN mkdir -p /root/build /forge /var/lib/containers
 
 # Install trivy
-RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.64.1
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.68.1
 
 # Install cosign
 ENV COSIGN_VERSION=2.5.3

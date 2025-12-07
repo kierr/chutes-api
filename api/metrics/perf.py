@@ -5,8 +5,8 @@ Track LLM usage metrics in prometheus (in addition to DB).
 from loguru import logger
 from typing import Optional
 from functools import lru_cache
+from api.config import settings
 from api.metrics.aema import AdaptiveEMA
-from api.util import memcache_get, memcache_set
 
 
 @lru_cache()
@@ -38,8 +38,8 @@ class PerfTracker:
     async def update_average(self, value: float, chute_id: str, metric: str) -> float:
         v_key, c_key, l_key = self._keys(chute_id, metric)
         try:
-            old_avg_bytes = await memcache_get(v_key.encode())
-            count_bytes = await memcache_get(c_key.encode())
+            old_avg_bytes = await settings.redis_client.get(v_key)
+            count_bytes = await settings.redis_client.get(c_key)
             old_avg = float(old_avg_bytes) if old_avg_bytes else None
             count = int(count_bytes) if count_bytes else 0
             if old_avg is not None:
@@ -48,9 +48,9 @@ class PerfTracker:
             else:
                 new_avg = value
                 new_count = 1
-            await memcache_set(v_key.encode(), str(new_avg).encode(), exptime=self.ttl_seconds)
-            await memcache_set(c_key.encode(), str(new_count).encode(), exptime=self.ttl_seconds)
-            await memcache_set(l_key.encode(), str(value).encode(), exptime=self.ttl_seconds)
+            await settings.redis_client.set(v_key, str(new_avg), ex=self.ttl_seconds)
+            await settings.redis_client.set(c_key, str(new_count), ex=self.ttl_seconds)
+            await settings.redis_client.set(l_key, str(value), ex=self.ttl_seconds)
             return new_avg
         except Exception as e:
             logger.debug(f"Memcache error: {e}")
@@ -144,9 +144,9 @@ class PerfTracker:
         for metric in ["sps", "spt"]:
             v_key, c_key, l_key = self._keys(chute_id, metric)
             try:
-                v_bytes = await memcache_get(v_key.encode())
-                c_bytes = await memcache_get(c_key.encode())
-                l_bytes = await memcache_get(l_key.encode())
+                v_bytes = await settings.redis_client.get(v_key)
+                c_bytes = await settings.redis_client.get(c_key)
+                l_bytes = await settings.redis_client.get(l_key)
                 if v_bytes:
                     result[metric] = {
                         "v": float(v_bytes),

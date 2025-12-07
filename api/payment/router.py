@@ -8,12 +8,12 @@ from pydantic import BaseModel
 from fastapi import APIRouter, status, HTTPException, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from api.gpu import SUPPORTED_GPUS, COMPUTE_UNIT_PRICE_BASIS, COMPUTE_MIN
+from api.config import settings
 from api.fmv.fetcher import get_fetcher
 from api.database import get_db_session
 from api.user.util import refund_deposit
 from api.user.schemas import User
 from api.user.service import get_current_user
-from api.util import memcache_get, memcache_set
 from api.payment.schemas import Payment
 from sqlalchemy import select, desc, func, text
 
@@ -182,8 +182,8 @@ async def list_payments(
     List all payments.
     """
     if request:
-        cache_key = f"payment_list:{page}:{limit}".encode()
-        if cached := await memcache_get(cache_key):
+        cache_key = f"payment_list:{page}:{limit}"
+        if cached := await settings.redis_client.get(cache_key):
             return json.loads(cached)
     query = (
         select(Payment, User)
@@ -228,5 +228,5 @@ async def list_payments(
         "limit": limit,
         "items": results,
     }
-    await memcache_set(cache_key, json.dumps(response), exptime=300)
+    await settings.redis_client.set(cache_key, json.dumps(response), ex=300)
     return response

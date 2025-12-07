@@ -26,7 +26,7 @@ from api.database import get_session, get_db_session
 from api.config import settings
 from api.constants import HOTKEY_HEADER
 from api.metasync import get_miner_by_hotkey, MetagraphNode
-from api.util import memcache_get, memcache_set, semcomp
+from api.util import semcomp
 from metasync.shared import get_scoring_data
 
 router = APIRouter()
@@ -261,7 +261,7 @@ async def get_stats(
     Get invocation status over different intervals.
     """
 
-    cache_key = f"mstats:{per_chute}".encode()
+    cache_key = f"mstats:{per_chute}"
 
     def _filter_by_key(mstats):
         if miner_hotkey:
@@ -271,7 +271,7 @@ async def get_stats(
         return mstats
 
     if request:
-        cached = await memcache_get(cache_key)
+        cached = await settings.redis_client.get(cache_key)
         if cached:
             return _filter_by_key(json.loads(cached))
 
@@ -467,7 +467,7 @@ async def get_stats(
             "compute_units": compute_data,
         }
 
-    await memcache_set(cache_key, json.dumps(results))
+    await settings.redis_client.set(cache_key, json.dumps(results))
     return _filter_by_key(results)
 
 
@@ -475,7 +475,7 @@ async def get_stats(
 async def get_scores(hotkey: Optional[str] = None, request: Request = None):
     rv = None
     if request:
-        cached = await memcache_get(b"miner_scores")
+        cached = await settings.redis_client.get("miner_scores")
         if cached:
             rv = json.loads(cached)
         else:
@@ -485,7 +485,7 @@ async def get_scores(hotkey: Optional[str] = None, request: Request = None):
             )
     if not rv:
         rv = await get_scoring_data()
-        await memcache_set(b"miner_scores", json.dumps(rv))
+        await settings.redis_client.set("miner_scores", json.dumps(rv))
     if hotkey:
         for key in rv:
             if key != "totals":
@@ -495,17 +495,17 @@ async def get_scores(hotkey: Optional[str] = None, request: Request = None):
 
 @router.get("/unique_chute_history/{hotkey}")
 async def unique_chute_history(hotkey: str, request: Request = None):
-    if not await memcache_get(f"miner_exists:{hotkey}".encode()):
+    if not await settings.redis_client.get(f"miner_exists:{hotkey}"):
         async with get_session(readonly=True) as session:
             if not await get_miner_by_hotkey(hotkey, session):
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Miner {hotkey} not found in metagraph.",
                 )
-        await memcache_set(f"miner_exists:{hotkey}".encode(), b"1", exptime=7200)
+        await settings.redis_client.set(f"miner_exists:{hotkey}", "1", ex=7200)
 
-    cache_key = f"uqhist:{hotkey}".encode()
-    cached = await memcache_get(cache_key)
+    cache_key = f"uqhist:{hotkey}"
+    cached = await settings.redis_client.get(cache_key)
     if cached:
         return json.loads(cached)
     raise HTTPException(

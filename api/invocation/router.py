@@ -31,8 +31,6 @@ from api.chute.util import (
     count_prompt_tokens,
 )
 from api.util import (
-    memcache_get,
-    memcache_set,
     recreate_vlm_payload,
     has_legacy_private_billing,
 )
@@ -67,15 +65,20 @@ class DiffusionInput(BaseModel):
         extra = "forbid"
 
 
+async def initialize_quota_cache(cache_key: str) -> None:
+    await settings.redis_client.incrbyfloat(cache_key, 0.0)
+    await settings.redis_client.expire(cache_key, 25 * 60 * 60)
+
+
 @router.get("/usage")
 async def get_usage(request: Request):
     """
     Get aggregated usage data, which is the amount of revenue
     we would be receiving if no usage was free.
     """
-    cache_key = b"invocation_usage_data"
+    cache_key = "invocation_usage_data"
     if request:
-        if cached := await memcache_get(cache_key):
+        if (cached := await settings.redis_client.get(cache_key)) is not None:
             return json.loads(cached)
     query = text(
         "SELECT chute_id, DATE(bucket) as date, sum(amount) as usd_amount, sum(count) as invocation_count "
@@ -96,12 +99,12 @@ async def get_usage(request: Request):
                     "invocation_count": int(invocation_count),
                 }
             )
-        await memcache_set(cache_key, json.dumps(rv))
+        await settings.redis_client.set(cache_key, json.dumps(rv))
         return rv
 
 
 async def _cached_get_metrics(table, cache_key):
-    if cached := await memcache_get(cache_key):
+    if (cached := await settings.redis_client.get(cache_key)) is not None:
         return json.loads(gzip.decompress(base64.b64decode(cached)))
     async with get_session() as session:
         result = await session.execute(text(f"SELECT * FROM {table}"))
@@ -112,7 +115,7 @@ async def _cached_get_metrics(table, cache_key):
                 if isinstance(value, decimal.Decimal):
                     row[key] = float(value)
         cache_value = base64.b64encode(gzip.compress(json.dumps(rv)))
-        await memcache_set(cache_key, cache_value, exptime=300)
+        await settings.redis_client.set(cache_key, cache_value, ex=300)
         return rv
 
 
@@ -342,12 +345,12 @@ async def _invoke(
                 try:
                     qkey = f"free_usage:{quota_date}:{current_user.user_id}"
                     free_usage = await settings.redis_client.incr(qkey)
-                    if free_usage == 1:
+                    if free_usage <= 3:
                         tomorrow = datetime.combine(quota_date, datetime.min.time()) + timedelta(
                             days=1
                         )
                         exp = max(int((tomorrow - datetime.now()).total_seconds()), 1)
-                        await settings.redis_client.expire(qkey, exp)
+                        asyncio.create_task(settings.redis_client.expire(qkey, exp))
                 except Exception as exc:
                     logger.warning(
                         f"Error checking free usage for {current_user.user_id=}: {str(exc)}"
@@ -406,26 +409,15 @@ async def _invoke(
     ):
         quota = await InvocationQuota.get(current_user.user_id, chute.chute_id)
         key = await InvocationQuota.quota_key(current_user.user_id, chute.chute_id)
-        cached = None
-        quota_init = True
-        try:
-            cached = await settings.redis_client.get(key)
-        except Exception as exc:
-            logger.error(f"Failed to fetch quota for {current_user.user_id=}: {str(exc)}")
-            quota_init = False
+        client_success, cached = await settings.redis_client.get_with_status(key)
         request_count = 0.0
-        if cached:
+        if cached is not None:
             try:
                 request_count = float(cached.decode())
             except ValueError:
                 await settings.redis_client.delete(key)
-        elif quota_init:
-            # Initialize the quota key with an expiration date (keys are daily)
-            try:
-                await settings.redis_client.incrbyfloat(key, 0.0)
-                await settings.redis_client.expire(key, 25 * 60 * 60)
-            except Exception as exc:
-                logger.error(f"Failed to initialize quota for {current_user.user_id=}: {str(exc)}")
+        elif client_success:
+            asyncio.create_task(initialize_quota_cache(key))
 
         # No quota for private/user-created chutes.
         effective_balance = (
@@ -641,7 +633,8 @@ async def _invoke(
             prompt_key = f"userreq:{current_user.user_id}{prompt_hash}"
             prompt_count = await settings.redis_client.incr(prompt_key)
             if prompt_count:
-                await settings.redis_client.expire(prompt_key, 30 * 60)  # 30 minute re-roll clock.
+                # 30 minute re-roll clock.
+                asyncio.create_task(settings.redis_client.expire(prompt_key, 30 * 60))
                 if 1 < prompt_count <= 15:
                     reroll = True
                 elif prompt_count > 15:

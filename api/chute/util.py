@@ -55,7 +55,6 @@ from api.util import (
     image_supports_cllmv,
     has_legacy_private_billing,
 )
-from api.util import memcache_get, memcache_set, memcache_delete
 from api.chute.schemas import Chute, NodeSelector, ChuteShare, LLMDetail
 from api.user.schemas import User, InvocationQuota, InvocationDiscount, PriceOverride
 from api.user.service import chutes_user_id
@@ -332,17 +331,15 @@ async def chute_id_by_slug(slug: str):
     Check if a chute exists with the specified slug (which is a subdomain for standard apps).
     """
     cache_key = f"idbyslug:{slug}".lower()
-    cached = await memcache_get(cache_key)
+    cached = await settings.redis_client.get(cache_key)
     if cached:
-        if isinstance(cached, bytes):
-            return cached.decode()
-        return cached
+        return cached.decode()
 
     async with get_session() as session:
         if chute_id := (
             await session.execute(select(Chute.chute_id).where(Chute.slug == slug))
         ).scalar_one_or_none():
-            await memcache_set(cache_key, chute_id, exptime=900)
+            await settings.redis_client.set(cache_key, chute_id, ex=900)
             return chute_id
     return None
 
@@ -353,13 +350,13 @@ async def _get_one(name_or_id: str, nonce: int = None):
     Load a chute by it's name or ID.
     """
     # Memcached lookup first.
-    cache_key = f"_chute:{name_or_id}".encode()
-    cached = await memcache_get(cache_key)
+    cache_key = f"_chute:{name_or_id}"
+    cached = await settings.redis_client.get(cache_key)
     if cached:
         try:
             return pickle.loads(cached)
         except Exception:
-            await memcache_delete(cache_key)
+            await settings.redis_client.delete(cache_key)
 
     # Load from DB.
     chute_user = await chutes_user_id()
@@ -393,7 +390,7 @@ async def _get_one(name_or_id: str, nonce: int = None):
                 _ = chute.image.user
                 _ = chute.image.logo
             serialized = pickle.dumps(chute)
-            await memcache_set(cache_key, serialized, exptime=180)
+            await settings.redis_client.set(cache_key, serialized, ex=180)
         return chute
 
 
@@ -413,7 +410,7 @@ async def is_shared(chute_id: str, user_id: str):
     Check if a chute has been shared with a user.
     """
     cache_key = f"cshare:{chute_id}:{user_id}"
-    cached = await memcache_get(cache_key)
+    cached = await settings.redis_client.get(cache_key)
     if cached:
         return cached == b"1"
     async with get_session() as db:
@@ -422,7 +419,7 @@ async def is_shared(chute_id: str, user_id: str):
         )
         result = await db.execute(query)
         shared = result.scalar()
-        await memcache_set(cache_key, b"1" if shared else b"0", exptime=60)
+        await settings.redis_client.set(cache_key, b"1" if shared else b"0", ex=60)
         return shared
 
 
@@ -431,7 +428,7 @@ async def track_prefix_hashes(prefixes, instance_id):
         return
     try:
         for _, prefix_hash in prefixes:
-            await memcache_set(f"pfx:{prefix_hash}:{instance_id}".encode(), b"1", exptime=600)
+            await settings.redis_client.set(f"pfx:{prefix_hash}:{instance_id}", b"1", ex=600)
             break  # XXX only track the largest prefix
     except Exception as exc:
         logger.warning(f"Error setting prefix hash cache: {exc}")
@@ -1447,15 +1444,15 @@ async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float]:
     Get the per-million token price for an LLM.
     """
     cache_key = f"mtokenprice:{user_id}:{chute_id}"
-    cached = await memcache_get(cache_key)
+    cached = await settings.redis_client.get(cache_key)
     if cached is not None:
         try:
             parts = cached.decode().split(":")
             if len(parts) == 2:
                 return float(parts[0]), float(parts[1])
-            await memcache_delete(cache_key)
+            await settings.redis_client.delete(cache_key)
         except Exception:
-            await memcache_delete(cache_key)
+            await settings.redis_client.delete(cache_key)
 
     # Inject the pricing information, first by checking price overrides, then
     # using the standard node-selector based calculation.
@@ -1499,7 +1496,7 @@ async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float]:
 
     per_million_in = round(per_million_in, 2)
     per_million_out = round(per_million_out, 2)
-    await memcache_set(cache_key, f"{per_million_in}:{per_million_out}".encode(), exptime=300)
+    await settings.redis_client.set(cache_key, f"{per_million_in}:{per_million_out}", ex=300)
     return per_million_in, per_million_out
 
 

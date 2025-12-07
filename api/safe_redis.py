@@ -72,17 +72,27 @@ def pool_stats(pool) -> str:
 
 def wrap_pipeline(pipe, default=None, timeout: float = 0.5):
     """Make pipeline.execute() fail-open."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
     orig_execute = pipe.execute
 
     async def safe_execute(*args, **kwargs):
+        task = asyncio.ensure_future(orig_execute(*args, **kwargs))
         try:
-            return await asyncio.wait_for(orig_execute(*args, **kwargs), timeout)
+            value = await asyncio.wait_for(asyncio.shield(task), timeout)
+            elapsed = loop.time() - start
+            if elapsed > 0.25:
+                logger.debug(f"SafeRedis: slow pipleine elapsed={elapsed * 1000:.1f}ms")
+            return value
+        except asyncio.TimeoutError:
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            logger.error("SafeRedis: pipeline.execute fail-open wait_for asyncio.TimeoutError")
         except FAIL_OPEN_EXCEPTIONS as exc:
             error_detail = str(exc)
             if not error_detail.strip():
                 error_detail = traceback.format_exc()
             logger.error(f"SafeRedis: pipeline.execute fail-open: {error_detail}")
-            return []  # pipelines return lists normally
+        return []
 
     pipe.execute = safe_execute
     return pipe
@@ -170,6 +180,17 @@ class SafeRedis:
             **kwargs,
         )
 
+    async def get_with_status(self, key):
+        try:
+            result = await self.client.get(key)
+            return True, result
+        except FAIL_OPEN_EXCEPTIONS as exc:
+            error_detail = str(exc)
+            if not error_detail.strip():
+                error_detail = traceback.format_exc()
+            logger.error(f"SafeRedis: fail-open on get (call): {error_detail}")
+            return False, None
+
     def __getattr__(self, name):
         name_lower = name.lower()
 
@@ -191,7 +212,7 @@ class SafeRedis:
                 return self.default
 
             if is_pipeline(result):
-                return wrap_pipeline(result, self.default, timeout=self.timeout)
+                return wrap_pipeline(result, self.default, timeout=self.timeout * 3)
 
             if inspect.isawaitable(result):
 
@@ -199,15 +220,26 @@ class SafeRedis:
                     timeout = 30.0 if name_lower == "scan" else self.timeout
                     loop = asyncio.get_running_loop()
                     start = loop.time()
+                    task = asyncio.ensure_future(result)
                     try:
-                        value = await asyncio.wait_for(result, timeout)
+                        value = await asyncio.wait_for(asyncio.shield(task), timeout)
                         elapsed = loop.time() - start
-                        if elapsed > 0.1:  # log only slow calls to keep noise down
+                        if elapsed > 0.25:
                             logger.debug(
                                 f"SafeRedis: slow call {name} elapsed={elapsed * 1000:.1f}ms "
                                 f"pool=({pool_stats(self.client.connection_pool)})"
                             )
                         return value
+                    except asyncio.TimeoutError:
+                        elapsed = loop.time() - start
+                        task.add_done_callback(
+                            lambda t: t.exception() if not t.cancelled() else None
+                        )
+                        logger.error(
+                            f"SafeRedis: timeout on {name} (shielded, task orphaned) "
+                            f"elapsed={elapsed * 1000:.1f}ms pool=({pool_stats(self.client.connection_pool)})"
+                        )
+                        return self.default
                     except FAIL_OPEN_EXCEPTIONS as exc:
                         elapsed = loop.time() - start
                         error_detail = str(exc)

@@ -725,44 +725,6 @@ def reformat_vlm_asset(data_bytes: bytes, visual_type: str = "image", max_size: 
     return f"data:video/mp4;base64,{base64.b64encode(data_bytes).decode()}"
 
 
-async def memcache_get(key: bytes):
-    """
-    Safe memcache get.
-    """
-    if isinstance(key, str):
-        key = key.encode()
-    try:
-        return await settings.memcache.get(key)
-    except Exception as exc:
-        logger.warning(f"Failed to get memcached value: {str(exc)}")
-    return None
-
-
-async def memcache_set(key: bytes, value: bytes, **kwargs):
-    """
-    Safe memcache set.
-    """
-    if isinstance(key, str):
-        key = key.encode()
-    if isinstance(value, str):
-        value = value.encode()
-    try:
-        return await settings.memcache.set(key, value, **kwargs)
-    except Exception as exc:
-        logger.warning(f"Failed to set memcached value: {str(exc)}")
-    return None
-
-
-async def memcache_delete(key: bytes):
-    if isinstance(key, str):
-        key = key.encode()
-    try:
-        return await settings.memcache.delete(key)
-    except Exception as exc:
-        logger.warning(f"Failed to delete memcached value: {str(exc)}")
-    return None
-
-
 def has_legacy_private_billing(chute):
     if chute.public or "/affine" in chute.name.lower():
         return False

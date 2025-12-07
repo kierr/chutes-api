@@ -26,7 +26,6 @@ import hashlib
 from api.database import get_session
 from api.config import settings
 from api.util import gen_random_token
-from api.util import memcache_get, memcache_set, memcache_delete
 from api.user.util import validate_the_username
 from api.permissions import Permissioning, Role
 
@@ -174,8 +173,8 @@ class InvocationQuota(Base):
 
     @staticmethod
     async def get(user_id: str, chute_id: str):
-        key = f"qta:{user_id}:{chute_id}".encode()
-        cached = (await memcache_get(key) or b"").decode()
+        key = f"qta:{user_id}:{chute_id}"
+        cached = (await settings.redis_client.get(key) or b"").decode()
         if cached and cached.isdigit():
             return int(cached)
         async with get_session() as session:
@@ -188,12 +187,12 @@ class InvocationQuota(Base):
             )
             quota = result.scalar()
             if quota is not None:
-                await memcache_set(key, str(quota).encode(), exptime=60)
+                await settings.redis_client.set(key, str(quota), ex=60)
                 return quota
             default_quota = settings.default_quotas.get(
                 chute_id, settings.default_quotas.get("*", 200)
             )
-            await memcache_set(key, str(default_quota).encode(), exptime=60)
+            await settings.redis_client.set(key, str(default_quota), ex=60)
             return default_quota
 
     @staticmethod
@@ -202,8 +201,8 @@ class InvocationQuota(Base):
         Get the quota (redis) key for a user and chute.
         """
         date = datetime.datetime.now().strftime("%Y%m%d")
-        cache_key = f"quota_type:{user_id}:{chute_id}".encode()
-        cached = await memcache_get(cache_key)
+        cache_key = f"quota_type:{user_id}:{chute_id}"
+        cached = await settings.redis_client.get(cache_key)
         if cached is not None:
             quota_type = cached.decode()
         else:
@@ -226,7 +225,7 @@ class InvocationQuota(Base):
                 quota_type = "default_wildcard"
             else:
                 quota_type = "none"
-            await memcache_set(cache_key, quota_type.encode(), exptime=3600)
+            await settings.redis_client.set(cache_key, quota_type, ex=3600)
 
         if quota_type in ["specific", "default_specific"]:
             return f"q:{date}:{user_id}:{chute_id}"
@@ -242,13 +241,13 @@ class InvocationDiscount(Base):
 
     @staticmethod
     async def get(user_id: str, chute_id: str):
-        key = f"idiscount:{user_id}:{chute_id}".encode()
-        cached = (await memcache_get(key) or b"").decode()
+        key = f"idiscount:{user_id}:{chute_id}"
+        cached = (await settings.redis_client.get(key) or b"").decode()
         if cached:
             try:
                 return float(cached)
             except ValueError:
-                await memcache_delete(key)
+                await settings.redis_client.delete(key)
 
         async with get_session() as session:
             result = await session.execute(
@@ -260,12 +259,12 @@ class InvocationDiscount(Base):
             )
             discount = result.scalar()
             if discount is not None:
-                await memcache_set(key, str(discount).encode(), exptime=1800)
+                await settings.redis_client.set(key, str(discount), ex=1800)
                 return discount
             default_discount = settings.default_discounts.get(
                 chute_id, settings.default_discounts.get("*", 200)
             )
-            await memcache_set(key, str(default_discount).encode(), exptime=1800)
+            await settings.redis_client.set(key, str(default_discount), ex=1800)
             return default_discount
 
 
@@ -307,13 +306,13 @@ class PriceOverride(Base):
 
     @staticmethod
     async def get(user_id: str, chute_id: str):
-        key = f"priceoverride:{user_id}:{chute_id}".encode()
-        cached = (await memcache_get(key) or b"").decode()
+        key = f"priceoverride:{user_id}:{chute_id}"
+        cached = (await settings.redis_client.get(key) or b"").decode()
         if cached:
             try:
                 return PriceOverride(**json.loads(cached))
             except Exception:
-                await memcache_delete(key)
+                await settings.redis_client.delete(key)
 
         async with get_session() as session:
             override = (
@@ -343,6 +342,6 @@ class PriceOverride(Base):
                         "chute_id": override.chute_id,
                     }
                 )
-                await memcache_set(key, serialized, exptime=600)
+                await settings.redis_client.set(key, serialized, ex=600)
                 return override
             return None

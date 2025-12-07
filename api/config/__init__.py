@@ -6,10 +6,8 @@ import os
 import hashlib
 from pathlib import Path
 import aioboto3
-import aiomcache
 import json
 from api.safe_redis import SafeRedis
-from api.safe_mcache import SafeMemcached
 from functools import cached_property, lru_cache
 import redis.asyncio as redis
 from redis.retry import Retry
@@ -94,17 +92,6 @@ class Settings(BaseSettings):
     validator_ss58: Optional[str] = os.getenv("VALIDATOR_SS58")
     storage_bucket: str = os.getenv("STORAGE_BUCKET", "REPLACEME")
 
-    # Base memcached settings.
-    memcached_host: str = Field(
-        default="172.16.0.100",
-        validation_alias="PRIMARY_MEMCACHED_HOST",
-    )
-    memcached_port: int = Field(
-        default=22122,
-        validation_alias="PRIMARY_MEMCACHED_PORT",
-    )
-    memcached_pool_size: int = int(os.getenv("MEMCACHED_POOL_SIZE", "512"))
-
     # Base redis settings.
     redis_host: str = Field(
         default="172.16.0.100",
@@ -125,7 +112,6 @@ class Settings(BaseSettings):
 
     _redis_client: Optional[redis.Redis] = None
     _cm_redis_clients: Optional[list[redis.Redis]] = None
-    _memcache: Optional[aiomcache.Client] = None
     cm_redis_shard_count: int = int(os.getenv("CM_REDIS_SHARD_COUNT", "5"))
     cm_redis_start_port: int = int(os.getenv("CM_REDIS_START_PORT", "1700"))
     cm_redis_socket_timeout: float = float(os.getenv("CM_REDIS_SOCKET_TIMEOUT", "30.0"))
@@ -175,17 +161,6 @@ class Settings(BaseSettings):
                 for idx in range(self.cm_redis_shard_count)
             ]
         return self._cm_redis_clients
-
-    @property
-    def memcache(self) -> Optional[aiomcache.Client]:
-        if self._memcache is None:
-            self._memcache = SafeMemcached(
-                host=self.memcached_host,
-                port=self.memcached_port,
-                pool_size=self.memcached_pool_size,
-                default=None,
-            )
-        return self._memcache
 
     registry_host: str = os.getenv("REGISTRY_HOST", "registry:5000")
     registry_external_host: str = os.getenv("REGISTRY_EXTERNAL_HOST", "registry.chutes.ai")

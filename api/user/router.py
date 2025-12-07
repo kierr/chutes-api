@@ -27,9 +27,6 @@ from api.user.schemas import (
     InvocationDiscount,
 )
 from api.util import (
-    memcache_get,
-    memcache_set,
-    memcache_delete,
     is_cloudflare_ip,
     has_minimum_balance_for_registration,
 )
@@ -88,8 +85,8 @@ class SubnetRoleRevokeRequest(BaseModel):
 async def get_user_growth(
     db: AsyncSession = Depends(get_db_session),
 ):
-    cache_key = "user_growth".encode()
-    cached = await memcache_get(cache_key)
+    cache_key = "user_growth"
+    cached = await settings.redis_client.get(cache_key)
     if cached:
         return json.loads(cached)
     query = text("""
@@ -111,7 +108,7 @@ async def get_user_growth(
         }
         for row in rows
     ]
-    await memcache_set(cache_key, json.dumps(response), exptime=600)
+    await settings.redis_client.set(cache_key, json.dumps(response), ex=600)
     return response
 
 
@@ -477,8 +474,8 @@ async def admin_quotas_change(
 
     # Purge the cache.
     for chute_id in deleted_chute_ids:
-        key = f"quota:{user_id}:{chute_id}".encode()
-        await memcache_delete(key)
+        key = f"qta:{user_id}:{chute_id}"
+        await settings.redis_client.delete(key)
 
     # Add the new values.
     for key, quota in quotas.items():
@@ -537,8 +534,8 @@ async def admin_discounts_change(
     )
     deleted_chute_ids = [row[0] for row in result]
     for chute_id in deleted_chute_ids:
-        key = f"idiscount:{user_id}:{chute_id}".encode()
-        await memcache_delete(key)
+        key = f"idiscount:{user_id}:{chute_id}"
+        await settings.redis_client.delete(key)
 
     # Add the new values.
     for key, discount in discounts.items():
@@ -888,12 +885,12 @@ async def register(
         )
     allowed_ip = None
     if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", token, re.I):
-        allowed_ip = await memcache_get(f"regtoken:{token}".encode())
+        allowed_ip = await settings.redis_client.get(f"regtoken:{token}")
         if allowed_ip:
             allowed_ip = allowed_ip.decode()
     if not allowed_ip:
         logger.warning(f"RTOK: token not found: {token=}")
-        await memcache_delete(f"regtoken:{token}".encode())
+        await settings.redis_client.delete(f"regtoken:{token}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid registration token, or registration token does not match expected IP address",
@@ -1112,7 +1109,7 @@ async def post_rtok(request: Request):
 
     # Create the token and render it.
     token = str(uuid.uuid4())
-    await memcache_set(f"regtoken:{token}".encode(), actual_ip.encode(), exptime=300)
+    await settings.redis_client.set(f"regtoken:{token}", actual_ip, ex=300)
     html_content = f"""
     <!DOCTYPE html>
     <html>

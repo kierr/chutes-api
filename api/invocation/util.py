@@ -5,8 +5,8 @@ Helpers for invocations.
 import hashlib
 import orjson as json
 from api.gpu import COMPUTE_UNIT_PRICE_BASIS
+from api.config import settings
 from api.database import get_session
-from api.util import memcache_get, memcache_set
 from sqlalchemy import text
 
 TOKEN_METRICS_QUERY = """
@@ -26,7 +26,7 @@ async def gather_metrics(interval: str = "1 hour"):
     """
     Generate invocation metrics for the last (interval).
     """
-    cached = await memcache_get(b"miner_metrics_stream")
+    cached = await settings.redis_client.get("miner_metrics_stream")
     if cached:
         rows = json.loads(cached)
         for item in rows:
@@ -90,7 +90,7 @@ GROUP BY i.chute_id"""
             item["total_usage_usd"] = item["per_second_price_usd"] * item["total_compute_time"]
             items.append(item)
             yield item
-    await memcache_set(b"miner_metrics_stream", json.dumps(items), exptime=600)
+    await settings.redis_client.set("miner_metrics_stream", json.dumps(items), ex=600)
 
 
 def get_prompt_prefix_hashes(payload: dict) -> list:

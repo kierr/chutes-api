@@ -4,7 +4,7 @@ Cache warmer to avoid hammering the database on the live endpoints.
 
 import time
 import asyncio
-import json
+import orjson as json
 from loguru import logger
 from api.config import settings
 from api.database import get_session
@@ -64,8 +64,8 @@ async def warm_up_inventory_history():
     started_at = time.time()
     history = await get_inventory_history()
     for hotkey, values in history.items():
-        cache_key = f"uqhist:{hotkey}".encode()
-        await settings.memcache.set(cache_key, json.dumps(values).encode())
+        cache_key = f"uqhist:{hotkey}"
+        await settings.redis_client.set(cache_key, json.dumps(values))
 
     delta = time.time() - started_at
     logger.success(

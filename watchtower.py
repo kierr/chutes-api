@@ -9,7 +9,7 @@ import socket
 import struct
 import random
 import hashlib
-import json
+import orjson as json
 import secrets
 import traceback
 import tempfile
@@ -263,7 +263,7 @@ async def do_slurp(instance, payload, encrypted_slurp):
     """
     Slurp a remote file.
     """
-    enc_payload = aes_encrypt(json.dumps(payload).encode(), instance.symmetric_key)
+    enc_payload = aes_encrypt(json.dumps(payload), instance.symmetric_key)
     iv = enc_payload[:32]
     path = aes_encrypt("/_slurp", instance.symmetric_key, hex_encode=True)
     async with miner_client.post(
@@ -291,9 +291,9 @@ async def get_hf_content(model, revision, filename) -> tuple[str, str]:
     """
     Get the content of a specific model file from huggingface.
     """
-    cache_key = f"hfdata:{model}:{revision}:{filename}".encode()
+    cache_key = f"hfdata:{model}:{revision}:{filename}"
     local_key = str(uuid.uuid5(uuid.NAMESPACE_OID, cache_key))
-    cached = await settings.memcache.get(cache_key)
+    cached = await settings.redis_client.get(cache_key)
     if cached and os.path.exists(f"/tmp/{local_key}"):
         with open(f"/tmp/{local_key}", "r") as infile:
             return cached.decode(), infile.read()
@@ -304,7 +304,7 @@ async def get_hf_content(model, revision, filename) -> tuple[str, str]:
                 resp.raise_for_status()
                 content = await resp.read()
                 digest = hashlib.sha256(content).hexdigest()
-                await settings.memcache.set(cache_key, digest.encode())
+                await settings.redis_client.set(cache_key, digest)
                 with open(f"/tmp/{local_key}", "w") as outfile:
                     outfile.write(content.decode())
                 return digest, content.decode()
@@ -335,8 +335,8 @@ async def check_weight_files(
     # Select a single random file to check.
     path = random.choice(list(weight_files))
     file_size = 0
-    size_key = f"hfsize:{model}:{revision}:{path}".encode()
-    cached = await settings.memcache.get(size_key)
+    size_key = f"hfsize:{model}:{revision}:{path}"
+    cached = await settings.redis_client.get(size_key)
     if cached:
         file_size = int(cached.decode())
     else:
@@ -347,7 +347,7 @@ async def check_weight_files(
                 if content_length:
                     logger.info(f"Size of {model} -> {path}: {content_length}")
                     file_size = int(content_length)
-                    await settings.memcache.set(size_key, content_length.encode())
+                    await settings.redis_client.set(size_key, content_length)
                 else:
                     logger.warning(f"Could not determine size of {model} -> {path}")
                     return
@@ -592,7 +592,7 @@ async def check_ping(chute, instance):
     payload = {"foo": expected}
     iv = None
     if use_encryption_v2(chute.chutes_version):
-        payload = aes_encrypt(json.dumps(payload).encode(), instance.symmetric_key)
+        payload = aes_encrypt(json.dumps(payload), instance.symmetric_key)
         iv = payload[:32]
     path = "_ping"
     if use_encrypted_path(chute.chutes_version):
@@ -662,11 +662,10 @@ async def increment_soft_fail(instance, chute):
     """
     Increment soft fail counts and purge if limit is reached.
     """
-    fail_key = f"watchtower:fail:{instance.instance_id}".encode()
-    if not await settings.memcache.get(fail_key):
-        await settings.memcache.set(fail_key, b"0", exptime=3600)
-    fail_count = await settings.memcache.incr(fail_key)
-    if fail_count >= 2:
+    fail_key = f"watchtower:fail:{instance.instance_id}"
+    fail_count = await settings.redis_client.incr(fail_key)
+    await settings.redis_client.expire(fail_key, 3600)
+    if fail_count and fail_count >= 3:
         logger.warning(
             f"Instance {instance.instance_id} "
             f"miner {instance.miner_hotkey} "
@@ -741,7 +740,7 @@ def uuid_dict(data, current_path=[], salt=settings.envcheck_52_salt):
         if isinstance(value, dict):
             flat_dict.update(uuid_dict(value, new_path, salt=salt))
         else:
-            uuid_key = str(uuid.uuid5(uuid.NAMESPACE_OID, json.dumps(new_path) + salt))
+            uuid_key = str(uuid.uuid5(uuid.NAMESPACE_OID, json.dumps(new_path).decode() + salt))
             flat_dict[uuid_key] = value
     return flat_dict
 
@@ -1170,7 +1169,7 @@ async def remove_undeployable_chutes():
                             "reason": "chute_deleted",
                             "data": {"chute_id": chute_id, "version": version},
                         }
-                    ),
+                    ).decode(),
                 )
         await session.commit()
 
@@ -1226,7 +1225,7 @@ async def remove_bad_chutes():
                 "\n".join(
                     [
                         f"Chute contains problematic code: {chute.chute_id=} {chute.name=} {chute.user_id=}",
-                        json.dumps(reason, indent=2),
+                        json.dumps(reason).decode(),
                         "Code:",
                         chute.code,
                     ]
@@ -1248,10 +1247,10 @@ async def remove_bad_chutes():
                             "reason": "chute_deleted",
                             "data": {"chute_id": chute.chute_id, "version": version},
                         }
-                    ),
+                    ).decode(),
                 )
                 await session.commit()
-            reason = f"Chute contains code identified by DeepSeek-R1 as likely cheating: {json.dumps(reason)}"
+            reason = f"Chute contains code identified by DeepSeek-R1 as likely cheating: {json.dumps(reason).decode()}"
             await generate_confirmed_reports(chute.chute_id, reason)
         else:
             logger.success(f"Chute seems fine: {chute.chute_id=} {chute.name=}")
@@ -1355,7 +1354,7 @@ async def remove_disproportionate_new_chutes():
                             "reason": "chute_deleted",
                             "data": {"chute_id": chute_id, "version": version},
                         }
-                    ),
+                    ).decode(),
                 )
         await session.commit()
 
@@ -1385,9 +1384,9 @@ async def procs_check():
                     r"^0\.2\.[3-9][0-9]$", instance.chutes_version
                 ):
                     continue
-                skip_key = f"procskip:{instance.instance_id}".encode()
-                if await settings.memcache.get(skip_key):
-                    await settings.memcache.touch(skip_key, exptime=60 * 60 * 24 * 2)
+                skip_key = f"procskip:{instance.instance_id}"
+                if await settings.redis_client.get(skip_key):
+                    await settings.redis_client.expire(skip_key, 60 * 60 * 24 * 2)
                     continue
                 path = aes_encrypt("/_procs", instance.symmetric_key, hex_encode=True)
                 try:
@@ -1414,7 +1413,7 @@ async def procs_check():
                             logger.success(
                                 f"Passed proc check: {instance.instance_id=} {instance.chute_id=} {instance.miner_hotkey=}"
                             )
-                            await settings.memcache.set(skip_key, b"y")
+                            await settings.redis_client.set(skip_key, "1", ex=60 * 60 * 24 * 2)
                 except Exception as exc:
                     logger.warning(
                         f"Couldn't check procs for {instance.miner_hotkey=} {instance.instance_id=}, must be bad? {exc}\n{traceback.format_exc()}"
@@ -1429,7 +1428,7 @@ async def get_env_dump(instance):
     """
     key = secrets.token_bytes(16)
     payload = {"key": key.hex()}
-    enc_payload = aes_encrypt(json.dumps(payload).encode(), instance.symmetric_key)
+    enc_payload = aes_encrypt(json.dumps(payload), instance.symmetric_key)
     path = aes_encrypt("/_env_dump", instance.symmetric_key, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
@@ -1449,7 +1448,7 @@ async def get_env_sig(instance, salt):
     Load the environment signature from the remote instance.
     """
     payload = {"salt": salt}
-    enc_payload = aes_encrypt(json.dumps(payload).encode(), instance.symmetric_key)
+    enc_payload = aes_encrypt(json.dumps(payload), instance.symmetric_key)
     path = aes_encrypt("/_env_sig", instance.symmetric_key, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
@@ -1472,7 +1471,7 @@ async def get_dump(instance, outdir: str = None):
 
     key = secrets.token_bytes(16).hex()
     payload = {"key": key}
-    enc_payload = aes_encrypt(json.dumps(payload).encode(), instance.symmetric_key)
+    enc_payload = aes_encrypt(json.dumps(payload), instance.symmetric_key)
     path = aes_encrypt("/_dump", instance.symmetric_key, hex_encode=True)
     logger.info(f"Querying {instance.instance_id=} envdump (dump)")
     try:
@@ -1538,7 +1537,7 @@ async def get_sig(instance):
     """
     salt = secrets.token_bytes(16).hex()
     payload = {"salt": salt}
-    enc_payload = aes_encrypt(json.dumps(payload).encode(), instance.symmetric_key)
+    enc_payload = aes_encrypt(json.dumps(payload), instance.symmetric_key)
     path = aes_encrypt("/_sig", instance.symmetric_key, hex_encode=True)
     logger.info(f"Querying {instance.instance_id=} envdump (sig)")
     async with miner_client.post(
@@ -1564,7 +1563,7 @@ async def slurp(instance, path, offset: int = 0, length: int = 0):
 
     key = secrets.token_bytes(16).hex()
     payload = {"key": key, "path": path, "offset": offset, "length": length}
-    enc_payload = aes_encrypt(json.dumps(payload).encode(), instance.symmetric_key)
+    enc_payload = aes_encrypt(json.dumps(payload), instance.symmetric_key)
     path = aes_encrypt("/_eslurp", instance.symmetric_key, hex_encode=True)
     logger.info(f"Querying {instance.instance_id=} envdump (slurp) {payload=}")
     async with miner_client.post(

@@ -21,7 +21,7 @@ from api.instance.schemas import Instance, LaunchConfig
 from api.config import settings
 from api.job.schemas import Job
 from api.database import get_session
-from api.util import has_legacy_private_billing, memcache_get, memcache_set, memcache_delete
+from api.util import has_legacy_private_billing
 from api.user.service import chutes_user_id
 from api.bounty.util import create_bounty_if_not_exists, get_bounty_amount, send_bounty_notification
 from sqlalchemy.future import select
@@ -37,7 +37,7 @@ InstanceAlias = aliased(Instance)
 @alru_cache(maxsize=1000, ttl=30)
 async def load_chute_target_ids(chute_id: str, nonce: int) -> list[str]:
     cache_key = f"inst_ids:{chute_id}:{nonce}"
-    cached = await memcache_get(cache_key)
+    cached = await settings.redis_client.get(cache_key)
     if cached is not None:
         if isinstance(cached, bytes):
             cached = cached.decode()
@@ -54,20 +54,19 @@ async def load_chute_target_ids(chute_id: str, nonce: int) -> list[str]:
     async with get_session() as session:
         result = await session.execute(query)
         instance_ids = [row[0] for row in result.all()]
-        await memcache_set(cache_key, "|".join(instance_ids), exptime=60)
+        await settings.redis_client.set(cache_key, "|".join(instance_ids), ex=60)
         return instance_ids
 
 
 @alru_cache(maxsize=5000, ttl=300)
 async def load_chute_target(instance_id: str) -> Instance:
-    # Try memcache first.
     cache_key = f"instance:{instance_id}"
-    cached = await memcache_get(cache_key)
+    cached = await settings.redis_client.get(cache_key)
     if cached:
         try:
             return pickle.loads(cached)
         except Exception:
-            await memcache_delete(cache_key)
+            await settings.redis_client.delete(cache_key)
 
     # Load from DB.
     query = (
@@ -97,7 +96,7 @@ async def load_chute_target(instance_id: str) -> Instance:
                 _ = instance.chute.user
             try:
                 serialized = pickle.dumps(instance)
-                await memcache_set(cache_key, serialized, exptime=300)
+                await settings.redis_client.set(cache_key, serialized, ex=300)
             except Exception:
                 ...
         return instance
@@ -117,8 +116,8 @@ async def invalidate_instance_cache(chute_id, instance_id: str = None):
     load_chute_target_ids.cache_invalidate(chute_id, nonce=0)
     load_chute_targets.cache_invalidate(chute_id, nonce=0)
     load_chute_target.cache_invalidate(instance_id)
-    await memcache_delete(f"inst_ids:{chute_id}:0".encode())
-    await memcache_delete(f"instance:{instance_id}".encode())
+    await settings.redis_client.delete(f"inst_ids:{chute_id}:0")
+    await settings.redis_client.delete(f"instance:{instance_id}")
 
 
 MANAGERS = {}
@@ -199,8 +198,7 @@ class LeastConnManager:
                 break
             except Exception as e:
                 logger.error(f"Error in cleanup loop: {e}", exc_info=True)
-            finally:
-                await self.redis_client.expire(lock_key, self.cleanup_interval * 3)
+            await self.redis_client.expire(lock_key, self.cleanup_interval * 3)
             await asyncio.sleep(self.cleanup_interval)
 
     async def _cleanup_expired_connections(self):
@@ -312,11 +310,12 @@ class LeastConnManager:
         for size, prefix_hash in prefixes:
             try:
                 instance_ids = list(counts.keys())
-                cache_keys = [f"pfx:{prefix_hash}:{iid}".encode() for iid in instance_ids]
-                has_prefix = await settings.memcache.multi_get(*cache_keys)
-                for idx, iid in enumerate(instance_ids):
-                    if has_prefix[idx]:
-                        likely_cached.add(iid)
+                cache_keys = [f"pfx:{prefix_hash}:{iid}" for iid in instance_ids]
+                has_prefix = await settings.redis_client.mget(cache_keys)
+                if has_prefix is not None:
+                    for idx, iid in enumerate(instance_ids):
+                        if has_prefix[idx]:
+                            likely_cached.add(iid)
 
                 if likely_cached:
                     break
