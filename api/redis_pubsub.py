@@ -2,10 +2,11 @@
 Redis pubsub classes and methods.
 """
 
-import os
 import asyncio
 import orjson as json
 import redis.asyncio as redis
+from redis.retry import Retry
+from redis.backoff import ConstantBackoff
 from datetime import datetime
 import api.database.orms  # noqa
 from api.config import settings
@@ -36,7 +37,20 @@ class RedisListener:
         while self.is_running:
             try:
                 if not self.pubsub:
-                    self.pubsub = settings.redis_client.pubsub()
+                    client = redis.Redis(
+                        host=settings.redis_host,
+                        port=settings.redis_port,
+                        db=settings.redis_db,
+                        password=settings.redis_password,
+                        socket_connect_timeout=2.5,
+                        socket_timeout=60,
+                        max_connections=128,
+                        socket_keepalive=True,
+                        health_check_interval=30,
+                        retry_on_timeout=True,
+                        retry=Retry(ConstantBackoff(0.5), 2),
+                    )
+                    self.pubsub = client.pubsub()
                     await self.pubsub.subscribe(self.channel)
                     logger.info(f"Subscribed to channel: {self.channel}")
                     self.reconnect_attempts = 0

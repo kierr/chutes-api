@@ -784,7 +784,9 @@ def is_kubernetes_env(
             return False
 
     if not dump.get("k8s_info", {}).get("has_service_account"):
-        logger.warning(f"{log_prefix} Invalid environment found: k8s (supposed) pod does not have valid service account")
+        logger.warning(
+            f"{log_prefix} Invalid environment found: k8s (supposed) pod does not have valid service account"
+        )
         return False
 
     logger.success(f"{log_prefix} kubernetes check passed")
