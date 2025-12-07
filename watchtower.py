@@ -748,10 +748,6 @@ def uuid_dict(data, current_path=[], salt=settings.envcheck_52_salt):
 def is_kubernetes_env(
     instance: Instance, dump: dict, log_prefix: str, standard_template: str = None
 ):
-    # Ignore if we don't have envdump configured.
-    if not settings.kubecheck_salt:
-        return True
-
     # Requires chutes SDK 0.2.53+
     if semcomp(instance.chutes_version or "0.0.0", "0.2.53") < 0:
         return True
@@ -777,6 +773,8 @@ def is_kubernetes_env(
         if bad:
             logger.warning(f"{log_prefix} Invalid environment found: PYTHON env override(s): {bad}")
             return False
+
+    # Verify our LD_PRELOAD (netnanny and logger).
     if semcomp(instance.chutes_version or "0.0.0", "0.3.61") >= 0:
         if (
             dump["env"].get("LD_PRELOAD")
@@ -785,69 +783,8 @@ def is_kubernetes_env(
             logger.warning(f"{log_prefix} Invalid environment found: LD_PRELOAD tampering")
             return False
 
-    # Simple flags.
-    flat = uuid_dict(dump, salt=settings.kubecheck_salt)
-    if standard_template and flat.get("b3633cbf-9ee4-50ef-a8b9-fb17926a7bc7"):
-        logger.warning(
-            f"{log_prefix} Invalid environment found: "
-            "expected NOT to find b3633cbf-9ee4-50ef-a8b9-fb17926a7bc7"
-        )
-        return False
-
-    secret = flat.get("8bc7db7a-4fd5-56a8-a595-e67c4b3bd61d")
-    if not secret:
-        logger.warning(
-            f"{log_prefix} Invalid environment found: "
-            "expecting magic uuid 8bc7db7a-4fd5-56a8-a595-e67c4b3bd61d"
-        )
-        return False
-    if not flat.get("a4286a4a-858c-56c3-ad11-734cbcc88c00"):
-        logger.warning(
-            f"{log_prefix} Invalid environment found: "
-            "expecting truthy magic uuid a4286a4a-858c-56c3-ad11-734cbcc88c00"
-        )
-        return False
-    if (
-        str(uuid.uuid5(uuid.NAMESPACE_OID, secret[:6] + settings.kubecheck_salt))
-        != "03cb7733-6b08-588f-aa3c-b0c9a50f4799"
-    ):
-        logger.warning(
-            f"{log_prefix} Invalid environment found: "
-            "expecting magic uuid 8bc7db7a-4fd5-56a8-a595-e67c4b3bd61d "
-            f"to contain magic value 03cb7733-6b08-588f-aa3c-b0c9a50f4799"
-        )
-        return False
-
-    # Sneaky flags.
-    found_expected = False
-    expected = [
-        (
-            settings.kubecheck_prefix
-            + "_".join(secret.split("-")[1:-2]).upper()
-            + settings.kubecheck_suffix
-        ),
-        (
-            settings.kubecheck_prefix
-            + "_".join(secret.split("-")[1:-1]).upper()
-            + settings.kubecheck_suffix
-        ),
-    ]
-    expected_uuids = [
-        str(uuid.uuid5(uuid.NAMESPACE_OID, e + settings.kubecheck_salt)) for e in expected
-    ]
-    for v in dump.values():
-        if isinstance(v, dict):
-            for key in v:
-                if (
-                    str(uuid.uuid5(uuid.NAMESPACE_OID, key + settings.kubecheck_salt))
-                    in expected_uuids
-                ):
-                    found_expected = True
-                    break
-    if not found_expected:
-        logger.warning(
-            f"{log_prefix} did not find expected magic key derived from 8bc7db7a-4fd5-56a8-a595-e67c4b3bd61d"
-        )
+    if not dump.get("k8s_info", {}).get("has_service_account"):
+        logger.warning(f"{log_prefix} Invalid environment found: k8s (supposed) pod does not have valid service account")
         return False
 
     logger.success(f"{log_prefix} kubernetes check passed")
@@ -960,7 +897,7 @@ async def check_chute(chute_id):
                 instance = instance_map[instance_id]
                 log_prefix = f"ENVDUMP: {instance.instance_id=} {instance.miner_hotkey=} {instance.chute_id=}"
                 with open(path) as infile:
-                    dump = json.load(infile)
+                    dump = json.loads(infile.read())
 
                 # Ensure proper k8s env.
                 if not is_kubernetes_env(instance, dump, log_prefix):
@@ -1494,7 +1431,7 @@ async def get_dump(instance, outdir: str = None):
                 if outdir:
                     outpath = os.path.join(outdir, f"dump-{instance.instance_id}.json")
                     with open(outpath, "w") as outfile:
-                        bytes_ = outfile.write(json.dumps(result, indent=2))
+                        bytes_ = outfile.write(json.dumps(result).decode())
                     logger.success(f"Saved {bytes_} byte JSON dump to {outpath}")
                     return outpath
                 return result
@@ -1589,21 +1526,6 @@ async def slurp(instance, path, offset: int = 0, length: int = 0):
             return DUMPER.decrypt(key, body["result"])
         except Exception as exc:
             raise EnvdumpMissing(f"Failed to load and decrypt _eslurp payload: {exc=}")
-
-
-async def report_missing_short_lived_instances():
-    """
-    Continuously report invocations for instances alive less than threshold
-    that didn't get reported from the trigger (in-flight during/after termination timestamp).
-    """
-    while True:
-        logger.info("Reporting short-lived invocations not caught by the trigger.")
-        try:
-            async with get_session() as session:
-                await session.execute(text("SELECT report_missing_short_lived_instances()"))
-        except Exception as exc:
-            logger.warning(f"Failed to execute report_missing_short_lived_instances(): {exc=}")
-        await asyncio.sleep(600)
 
 
 def parse_proc_net_tcp(raw_content_ipv4, raw_content_ipv6):
@@ -1726,9 +1648,6 @@ async def main():
     """
     Main loop, continuously check all chutes and instances.
     """
-
-    # Short-lived report cleanup (invocations created after instance deletion date).
-    asyncio.create_task(report_missing_short_lived_instances())
 
     # Rolling update cleanup.
     asyncio.create_task(rolling_update_cleanup())
