@@ -67,6 +67,7 @@ class DiffusionInput(BaseModel):
 
 async def initialize_quota_cache(cache_key: str) -> None:
     await settings.redis_client.incrbyfloat(cache_key, 0.0)
+    await settings.redis_client.expire(cache_key, 25 * 60 * 60)
 
 
 @router.get("/usage")
@@ -349,6 +350,7 @@ async def _invoke(
                             days=1
                         )
                         exp = max(int((tomorrow - datetime.now()).total_seconds()), 1)
+                        asyncio.create_task(settings.redis_client.expire(qkey, exp))
                 except Exception as exc:
                     logger.warning(
                         f"Error checking free usage for {current_user.user_id=}: {str(exc)}"
@@ -631,6 +633,8 @@ async def _invoke(
             prompt_key = f"userreq:{current_user.user_id}{prompt_hash}"
             prompt_count = await settings.redis_client.incr(prompt_key)
             if prompt_count:
+                # 30 minute re-roll clock.
+                asyncio.create_task(settings.redis_client.expire(prompt_key, 30 * 60))
                 if 1 < prompt_count <= 15:
                     reroll = True
                 elif prompt_count > 15:

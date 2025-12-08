@@ -191,7 +191,7 @@ class LeastConnManager:
         lock_key = f"_cleanuplock:{self.chute_id}"
         while True:
             try:
-                if await self.redis_client.setnx(lock_key, "1"):
+                if random.random() <= 0.01 and await self.redis_client.setnx(lock_key, "1"):
                     await self._cleanup_expired_connections()
                     await self.redis_client.delete(lock_key)
             except asyncio.CancelledError:
