@@ -40,7 +40,7 @@ from api.node.schemas import Node
 from api.payment.util import decrypt_secret
 from api.node.util import get_node_by_id
 from api.chute.schemas import Chute, NodeSelector
-from api.chute.util import is_shared
+from api.chute.util import get_manual_boost, is_shared
 from api.bounty.util import claim_bounty, calculate_bounty_boost
 from api.secret.schemas import Secret
 from api.image.schemas import Image  # noqa
@@ -722,6 +722,15 @@ async def _validate_launch_config_instance(
         instance.compute_multiplier *= chute.boost
         logger.info(
             f"Adding chute boost {chute.boost=} to {instance.instance_id} "
+            f"for total {instance.compute_multiplier=} for {chute.name=} {chute.chute_id=}"
+        )
+
+    # Add manual boost (optional fine-tuning).
+    manual_boost = await get_manual_boost(chute.chute_id, db=db)
+    if manual_boost != 1.0:
+        instance.compute_multiplier *= manual_boost
+        logger.info(
+            f"Adding manual boost {manual_boost=} to {instance.instance_id} "
             f"for total {instance.compute_multiplier=} for {chute.name=} {chute.chute_id=}"
         )
 

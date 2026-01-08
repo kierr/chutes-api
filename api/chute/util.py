@@ -254,10 +254,96 @@ async def selector_hourly_price(node_selector) -> float:
     return price["usd"]["hour"]
 
 
+MANUAL_BOOST_CACHE_TTL = 300
+
+
+def _normalize_manual_boost(value) -> float:
+    if value is None:
+        return 1.0
+    try:
+        boost_value = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if boost_value <= 0:
+        return 1.0
+    return min(boost_value, 20.0)
+
+
+async def get_manual_boost(chute_id: str, db=None) -> float:
+    """
+    Fetch the optional manual boost multiplier for a chute (cached).
+    """
+    if not chute_id:
+        return 1.0
+
+    cache_key = f"manual_boost:{chute_id}"
+    cached = await settings.redis_client.get(cache_key)
+    if cached is not None:
+        return _normalize_manual_boost(cached.decode() if isinstance(cached, bytes) else cached)
+
+    query = text("SELECT boost FROM chute_manual_boosts WHERE chute_id = :chute_id")
+    if db is not None:
+        result = await db.execute(query, {"chute_id": chute_id})
+        boost = result.scalar_one_or_none()
+    else:
+        async with get_session(readonly=True) as session:
+            result = await session.execute(query, {"chute_id": chute_id})
+            boost = result.scalar_one_or_none()
+
+    normalized = _normalize_manual_boost(boost)
+    await settings.redis_client.set(cache_key, str(normalized), ex=MANUAL_BOOST_CACHE_TTL)
+    return normalized
+
+
+async def get_manual_boosts(chute_ids: list[str], db=None) -> dict[str, float]:
+    """
+    Bulk fetch manual boost multipliers for multiple chutes (cached).
+    """
+    if not chute_ids:
+        return {}
+
+    unique_ids = list(dict.fromkeys(chute_ids))
+    cache_keys = [f"manual_boost:{chute_id}" for chute_id in unique_ids]
+    cached_values = await settings.redis_client.mget(cache_keys)
+    boosts = {}
+    missing_ids = []
+
+    for chute_id, cached in zip(unique_ids, cached_values):
+        if cached is None:
+            missing_ids.append(chute_id)
+            continue
+        boosts[chute_id] = _normalize_manual_boost(
+            cached.decode() if isinstance(cached, bytes) else cached
+        )
+
+    if missing_ids:
+        query = text(
+            "SELECT chute_id, boost FROM chute_manual_boosts WHERE chute_id = ANY(:chute_ids)"
+        )
+        if db is not None:
+            result = await db.execute(query, {"chute_ids": missing_ids})
+            rows = result.all()
+        else:
+            async with get_session(readonly=True) as session:
+                result = await session.execute(query, {"chute_ids": missing_ids})
+                rows = result.all()
+
+        found = {row[0]: row[1] for row in rows}
+        for chute_id in missing_ids:
+            normalized = _normalize_manual_boost(found.get(chute_id))
+            boosts[chute_id] = normalized
+            await settings.redis_client.set(
+                f"manual_boost:{chute_id}", str(normalized), ex=MANUAL_BOOST_CACHE_TTL
+            )
+
+    return boosts
+
+
 async def calculate_effective_compute_multiplier(
     chute: Chute,
     include_bounty: bool = True,
     bounty_info: Optional[dict] = None,
+    manual_boost: Optional[float] = None,
 ) -> dict:
     """
     Calculate the effective compute multiplier a miner would receive if they
@@ -278,6 +364,7 @@ async def calculate_effective_compute_multiplier(
     - Base compute_multiplier from node_selector (GPU type * count)
     - Private instance bonus (2x) or Integrated subnet bonus (3x)
     - Urgency boost from autoscaler (from chute.boost)
+    - Manual boost (optional per chute)
     - Bounty boost (dynamic 1.5x-4x based on bounty age) - only if include_bounty=True
     - TEE bonus (1.5x if tee=True)
     """
@@ -309,6 +396,15 @@ async def calculate_effective_compute_multiplier(
     if chute.boost is not None and chute.boost > 0 and chute.boost <= 20:
         factors["urgency_boost"] = chute.boost
         total *= chute.boost
+
+    # Manual boost (optional fine-tuning).
+    if manual_boost is None:
+        manual_boost = await get_manual_boost(chute.chute_id)
+    else:
+        manual_boost = _normalize_manual_boost(manual_boost)
+    if manual_boost != 1.0:
+        factors["manual_boost"] = manual_boost
+        total *= manual_boost
 
     # Bounty boost (only if requested).
     # Uses dynamic boost based on bounty age (1.5x at 0min → 4x at 180min+)
@@ -1095,6 +1191,7 @@ async def invoke(
 
     infra_overload = False
     avoid = []
+    manual_boost = await get_manual_boost(chute_id)
     for attempt_idx in range(5):
         async with manager.get_target(avoid=avoid, prefixes=prefixes) as (target, error_message):
             try:
@@ -1130,6 +1227,8 @@ async def invoke(
             multiplier = NodeSelector(**chute.node_selector).compute_multiplier
             if chute.boost:
                 multiplier *= chute.boost
+            if manual_boost != 1.0:
+                multiplier *= manual_boost
 
             try:
                 yield sse(

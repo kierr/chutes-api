@@ -278,6 +278,8 @@ class AutoScaleContext:
         self.pending_instance_count = info.pending_instance_count if info else 0
         # Concurrency: how many concurrent requests per instance before rate limiting
         self.concurrency = info.concurrency if info else 1
+        # Optional manual boost multiplier (fine-tuning)
+        self.manual_boost = info.manual_boost if info else 1.0
 
         # Decision outputs
         self.target_count = self.current_count
@@ -1228,6 +1230,7 @@ async def _perform_autoscale_impl(
                             MAX(COALESCE(ucb.effective_balance, 0)) AS user_balance,
                             c.max_instances,
                             c.scaling_threshold,
+                            COALESCE(MAX(cmb.boost), 1.0) AS manual_boost,
                             NOW() - c.created_at <= INTERVAL '3 hours' AS new_chute,
                             COUNT(DISTINCT CASE WHEN i.active = true AND i.verified = true THEN i.instance_id END) AS instance_count,
                             COUNT(DISTINCT CASE WHEN i.verified = false AND i.created_at > NOW() - INTERVAL '30 minutes' THEN i.instance_id END) AS pending_instance_count,
@@ -1236,6 +1239,7 @@ async def _perform_autoscale_impl(
                         FROM chutes c
                         LEFT JOIN instances i ON c.chute_id = i.chute_id
                         LEFT JOIN user_current_balance ucb on ucb.user_id = c.user_id
+                        LEFT JOIN chute_manual_boosts cmb on cmb.chute_id = c.chute_id
                         WHERE c.jobs IS NULL
                               OR c.jobs = '[]'::jsonb
                               OR c.jobs = '{}'::jsonb
@@ -1708,6 +1712,10 @@ async def _perform_autoscale_impl(
         # Urgency boost
         if ctx.boost > 1.0:
             total *= ctx.boost
+
+        # Manual boost
+        if ctx.manual_boost and ctx.manual_boost > 0:
+            total *= min(ctx.manual_boost, 20.0)
 
         # Bounty boost
         bounty_info = bounty_infos.get(ctx.chute_id)

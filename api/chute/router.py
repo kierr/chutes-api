@@ -46,6 +46,7 @@ from api.chute.util import (
     is_shared,
     get_mtoken_price,
     calculate_effective_compute_multiplier,
+    get_manual_boosts,
 )
 from api.bounty.util import get_bounty_info, get_bounty_infos
 from api.instance.schemas import Instance
@@ -144,12 +145,17 @@ async def _inject_current_estimated_price(chute: Chute, response: ChuteResponse)
 
 
 async def _inject_effective_compute_multiplier(
-    chute: Chute, response: ChuteResponse, bounty_info: Optional[dict] = None
+    chute: Chute,
+    response: ChuteResponse,
+    bounty_info: Optional[dict] = None,
+    manual_boost: Optional[float] = None,
 ):
     """
     Inject the effective compute multiplier and factors into a ChuteResponse.
     """
-    result = await calculate_effective_compute_multiplier(chute, bounty_info=bounty_info)
+    result = await calculate_effective_compute_multiplier(
+        chute, bounty_info=bounty_info, manual_boost=manual_boost
+    )
     response.effective_compute_multiplier = result["effective_compute_multiplier"]
     response.compute_multiplier_factors = result["compute_multiplier_factors"]
     response.bounty = result["bounty"]
@@ -296,16 +302,30 @@ async def list_boosted_chutes():
     Get a list of chutes that have a boost.
     """
     async with get_session() as session:
-        query = (
-            select(Chute.chute_id, Chute.name, Chute.boost)
-            .where(Chute.boost.isnot(None))
-            .where(Chute.boost >= 1)
-            .where(Chute.boost <= 20)
+        result = await session.execute(
+            text(
+                """
+                SELECT
+                    c.chute_id,
+                    c.name,
+                    c.boost,
+                    cmb.boost AS manual_boost
+                FROM chutes c
+                LEFT JOIN chute_manual_boosts cmb ON cmb.chute_id = c.chute_id
+                WHERE
+                    (c.boost IS NOT NULL AND c.boost >= 1 AND c.boost <= 20)
+                    OR (cmb.boost IS NOT NULL AND cmb.boost > 1)
+                """
+            )
         )
-        result = await session.execute(query)
         chutes = [
-            {"chute_id": str(cid), "name": name, "boost": boost}
-            for cid, name, boost in result.all()
+            {
+                "chute_id": str(cid),
+                "name": name,
+                "boost": boost,
+                "manual_boost": manual_boost,
+            }
+            for cid, name, boost, manual_boost in result.all()
         ]
         return chutes
 
@@ -423,6 +443,7 @@ async def list_chutes(
     result = await db.execute(query)
     items = result.unique().scalars().all()
     bounty_infos = await get_bounty_infos([item.chute_id for item in items])
+    manual_boosts = await get_manual_boosts([item.chute_id for item in items], db=db)
     responses = []
     cord_refs = {}
     for item in items:
@@ -443,7 +464,10 @@ async def list_chutes(
         responses.append(chute_response)
         await _inject_current_estimated_price(item, responses[-1])
         await _inject_effective_compute_multiplier(
-            item, responses[-1], bounty_info=bounty_infos.get(item.chute_id)
+            item,
+            responses[-1],
+            bounty_info=bounty_infos.get(item.chute_id),
+            manual_boost=manual_boosts.get(item.chute_id),
         )
     result = {
         "total": total,
