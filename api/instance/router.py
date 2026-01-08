@@ -181,7 +181,8 @@ async def _check_scalable(db, chute, hotkey, created_at=None):
                 LIMIT 1
             """)
             capacity_result = await db.execute(
-                capacity_query, {"chute_id": chute_id, "created_at": created_at}
+                capacity_query,
+                {"chute_id": chute_id, "created_at": created_at.replace(tzinfo=None)},
             )
             capacity_row = capacity_result.mappings().first()
             if (
