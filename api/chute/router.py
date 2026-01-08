@@ -313,7 +313,7 @@ async def list_boosted_chutes():
                 FROM chutes c
                 LEFT JOIN chute_manual_boosts cmb ON cmb.chute_id = c.chute_id
                 WHERE
-                    (c.boost IS NOT NULL AND c.boost >= 1 AND c.boost <= 20)
+                    (c.boost IS NOT NULL AND c.boost > 1)
                     OR (cmb.boost IS NOT NULL AND cmb.boost > 1)
                 """
             )

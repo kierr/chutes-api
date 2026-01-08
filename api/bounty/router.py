@@ -89,7 +89,10 @@ async def increase_chute_bounty(
 
     # Boosting?
     if boost and 1.0 <= boost <= 4.0:
-        chute.boost = boost
+        await session.execute(
+            text("INSERT INTO chute_manual_boosts (chute_id, boost) VALUES (:chute_id, :boost)"),
+            {"chute_id": chute_id, "boost": boost},
+        )
         await db.commit()
 
     return {
