@@ -189,11 +189,11 @@ async def _check_scalable(db, chute, hotkey, created_at=None):
                 capacity_row
                 and capacity_row.get("target_count") is not None
                 and capacity_row.get("instance_count") is not None
-                and capacity_row["instance_count"] < capacity_row["target_count"]
+                and active_count < capacity_row["target_count"]
             ):
                 logger.info(
                     f"SCALELOCK bypass: {chute_id=} instance created at {created_at} when "
-                    f"target_count={capacity_row['target_count']} and instance_count={capacity_row['instance_count']}"
+                    f"target_count={capacity_row['target_count']}"
                 )
                 return
         logger.warning(
