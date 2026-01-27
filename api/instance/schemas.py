@@ -63,9 +63,6 @@ class LaunchConfigArgs(BaseModel):
     rint_commitment: Optional[str] = None
     rint_nonce: Optional[str] = None
     rint_pubkey: Optional[str] = None
-
-
-class GravalLaunchConfigArgs(LaunchConfigArgs):
     env: str
     code: Optional[str] = None
     run_code: Optional[str] = None
@@ -73,8 +70,7 @@ class GravalLaunchConfigArgs(LaunchConfigArgs):
 
 
 class TeeLaunchConfigArgs(LaunchConfigArgs):
-    gpu_evidence: list[dict]
-    inspecto: Optional[str] = None
+    deployment_id: str
 
 
 class Instance(Base):

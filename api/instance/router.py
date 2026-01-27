@@ -36,6 +36,7 @@ from api.constants import (
     PRIVATE_INSTANCE_BONUS,
     INTEGRATED_SUBNETS,
     INTEGRATED_SUBNET_BONUS,
+    NoncePurpose,
 )
 from api.node.schemas import Node
 from api.permissions import Permissioning
@@ -47,7 +48,7 @@ from api.bounty.util import claim_bounty, calculate_bounty_boost
 from api.secret.schemas import Secret
 from api.image.schemas import Image  # noqa
 from api.instance.schemas import (
-    GravalLaunchConfigArgs,
+    LaunchConfigArgs,
     TeeLaunchConfigArgs,
     Instance,
     instance_nodes,
@@ -63,10 +64,11 @@ from api.instance.util import (
     create_job_jwt,
     load_launch_config_from_jwt,
     invalidate_instance_cache,
+    verify_tee_chute,
 )
 from api.server.service import (
     validate_request_nonce,
-    verify_gpu_evidence,
+    create_nonce,
 )
 from api.user.schemas import User
 from api.user.service import get_current_user, chutes_user_id, subnet_role_accessible
@@ -84,6 +86,7 @@ from api.util import (
     notify_activated,
     load_shared_object,
     has_legacy_private_billing,
+    extract_ip,
 )
 from api.bounty.util import check_bounty_exists, delete_bounty
 from starlette.responses import StreamingResponse
@@ -466,7 +469,7 @@ async def _validate_launch_config_env(
     db: AsyncSession,
     launch_config: LaunchConfig,
     chute: Chute,
-    args: GravalLaunchConfigArgs,
+    args: LaunchConfigArgs,
     log_prefix: str,
 ):
     from chutes.envdump import DUMPER
@@ -570,7 +573,7 @@ async def _validate_launch_config_inspecto(
     db: AsyncSession,
     launch_config: LaunchConfig,
     chute: Chute,
-    args: GravalLaunchConfigArgs,
+    args: LaunchConfigArgs,
     log_prefix: str,
 ):
     if semcomp(chute.chutes_version, "0.3.50") >= 0:
@@ -634,7 +637,7 @@ async def _validate_launch_config_inspecto(
 
 
 async def _validate_launch_config_filesystem(
-    db: AsyncSession, launch_config: LaunchConfig, chute: Chute, args: GravalLaunchConfigArgs
+    db: AsyncSession, launch_config: LaunchConfig, chute: Chute, args: LaunchConfigArgs
 ):
     # Valid filesystem/integrity?
     if semcomp(chute.chutes_version, "0.3.1") >= 0:
@@ -1002,7 +1005,7 @@ async def _validate_launch_config_instance(
 
 async def _validate_graval_launch_config_instance(
     config_id: str,
-    args: GravalLaunchConfigArgs,
+    args: LaunchConfigArgs,
     request: Request,
     db: AsyncSession,
     authorization: str,
@@ -1226,15 +1229,16 @@ async def get_rint_nonce(
     return PlainTextResponse(nonce.decode() if isinstance(nonce, bytes) else nonce)
 
 
-@router.post("/launch_config/{config_id}/attest")
-async def validate_tee_launch_config_instance(
+@router.post("/launch_config/tee/{config_id}")
+async def claim_tee_launch_config(
     config_id: str,
     args: TeeLaunchConfigArgs,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
-    expected_nonce: str = Depends(validate_request_nonce()),
+    expected_nonce: str = Depends(validate_request_nonce(NoncePurpose.INSTANCE_VERIFICATION)),
 ):
+    """Claim a TEE launch config, verify attestation, and receive symmetric key."""
     launch_config, nodes, instance, validator_pubkey = await _validate_tee_launch_config_instance(
         config_id, args, request, db, authorization
     )
@@ -1257,49 +1261,28 @@ async def validate_tee_launch_config_instance(
     gpu_type = nodes[0].gpu_identifier
     asyncio.create_task(notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type))
 
-    await verify_gpu_evidence(args.gpu_evidence, expected_nonce)
+    # Verify TEE attestation evidence
+    await verify_tee_chute(db, instance, launch_config, args.deployment_id, expected_nonce)
 
-    request_body = await request.json()
+    response = {
+        "symmetric_key": instance.symmetric_key
+    }
 
-    # Reload instance with chute relationship for filesystem validation
-    # Lazy load fails
-    stmt = (
-        select(Instance)
-        .where(Instance.instance_id == instance.instance_id)
-        .options(
-            joinedload(Instance.chute).joinedload(Chute.image),
-            joinedload(Instance.job),
-        )
-    )
-    instance = (await db.execute(stmt)).scalar_one()
-
-    # Filesystem integrity checks for < 0.3.1
-    await _validate_legacy_filesystem(db, instance, launch_config, request_body)
-
-    # Everything checks out.
-    launch_config.verified_at = func.now()
-    await _verify_job_ports(db, instance)
-    await _mark_instance_verified(db, instance, launch_config)
-    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
-    return_value["symmetric_key"] = instance.symmetric_key
-
-    # Include validator pubkey if ECDH was used (for miner to derive session key)
     if validator_pubkey:
-        return_value["validator_pubkey"] = validator_pubkey
+        response["validator_pubkey"] = validator_pubkey
 
-    await db.refresh(instance)
-    asyncio.create_task(notify_verified(instance))
-    return return_value
+    return response
 
 
-@router.post("/launch_config/{config_id}")
-async def claim_launch_config(
+@router.post("/launch_config/graval/{config_id}")
+async def claim_graval_launch_config(
     config_id: str,
-    args: GravalLaunchConfigArgs,
+    args: LaunchConfigArgs,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
 ):
+    """Claim a Graval launch config and receive PoVW challenge."""
     launch_config, nodes, instance, validator_pubkey = await _validate_graval_launch_config_instance(
         config_id, args, request, db, authorization
     )
@@ -1725,13 +1708,14 @@ async def _build_launch_config_verified_response(
     return return_value
 
 
-@router.put("/launch_config/{config_id}")
-async def verify_launch_config_instance(
+@router.put("/launch_config/graval/{config_id}")
+async def verify_graval_launch_config_instance(
     config_id: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
 ):
+    """Verify Graval launch config instance by validating PoVW proof and symmetric key usage."""
     token = authorization.strip().split(" ")[-1]
     launch_config = await load_launch_config_from_jwt(db, config_id, token, allow_retrieved=True)
 
@@ -1857,6 +1841,77 @@ async def verify_launch_config_instance(
     return return_value
 
 
+@router.put("/launch_config/tee/{config_id}")
+async def verify_tee_launch_config_instance(
+    config_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
+):
+    """Verify TEE launch config instance by validating symmetric key usage via dummy ports."""
+    token = authorization.strip().split(" ")[-1]
+    launch_config = await load_launch_config_from_jwt(db, config_id, token, allow_retrieved=True)
+
+    _validate_launch_config_not_expired(launch_config)
+
+    # Load instance with relationships
+    query = (
+        select(Instance)
+        .where(Instance.config_id == launch_config.config_id)
+        .options(
+            joinedload(Instance.nodes),
+            joinedload(Instance.job),
+            joinedload(Instance.chute),
+        )
+    )
+    instance = (await db.execute(query)).unique().scalar_one_or_none()
+    if not instance:
+        logger.error(
+            f"Instance associated with launch config has been deleted! {launch_config.config_id=}"
+        )
+        launch_config.failed_at = func.now()
+        launch_config.verification_error = "Instance was deleted"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Instance disappeared (did you update gepetto reconcile?)",
+        )
+
+    # TEE instances skip PoVW checks - they were verified during claim via attestation
+    # Just verify the symmetric key via port checks
+    launch_config.verified_at = func.now()
+    await _verify_job_ports(db, instance)
+    await _mark_instance_verified(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
+
+    await db.refresh(instance)
+    asyncio.create_task(notify_verified(instance))
+    return return_value
+
+
+@router.get("/nonce")
+async def get_instance_nonce(request: Request):
+    """
+    Generate a nonce for TEE instance verification.
+    
+    This endpoint is called by chute instances during TEE verification (Phase 1).
+    The nonce is used to bind the attestation evidence to this specific verification request.
+    """
+    try:
+        server_ip = extract_ip(request)
+        nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.INSTANCE_VERIFICATION)
+        
+        # Return just the nonce string as JSON (library expects this format)
+        # The library will use this nonce in the X-Chutes-Nonce header
+        return nonce_info["nonce"]
+    except Exception as e:
+        logger.error(f"Failed to generate instance nonce: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate nonce"
+        )
+
+
 @router.get("/token_check")
 async def get_token(salt: str = None, request: Request = None):
     origin_ip = request.headers.get("x-forwarded-for", "").split(",")[0]
@@ -1870,7 +1925,7 @@ async def stream_logs(
     backfill: Optional[int] = 100,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(purpose="logs")),
 ):
     """
     Fetch raw kubernetes pod logs.

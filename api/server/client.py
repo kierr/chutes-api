@@ -94,3 +94,31 @@ class TeeServerClient:
         except Exception as exc:
             logger.error(f"Failed to get attestation evidence from {self._url}: {exc}")
             raise GetEvidenceError(f"Failed to get evidence for attestation: {str(exc)}")
+
+    async def get_chute_evidence(self, deployment_id: str) -> Tuple[TdxQuote, Dict[str, str], str]:
+        """Get attestation evidence for a specific chute deployment.
+        
+        Args:
+            deployment_id: The chute deployment ID
+            
+        Returns:
+            Tuple of (quote, gpu_evidence, cert_hash)
+            
+        Raises:
+            GetEvidenceError: If evidence retrieval fails
+        """
+        try:
+            url = urljoin(self._url, f"service/chute-service-{deployment_id}/_tee_evidence")
+            # Sign the request with purpose="attest" to match the proxy's authorize dependency
+            headers, _ = self._sign_request(purpose="attest")
+            async with self._attestation_session() as session:
+                async with session.get(url, headers=headers) as resp:
+                    expected_cert_hash = extract_server_cert_hash(resp)
+                    data = await resp.json()
+                    quote = RuntimeTdxQuote.from_base64(data["evidence"]["tdx_quote"])
+                    gpu_evidence = json.loads(data["evidence"]["nvtrust_evidence"])
+
+                    return quote, gpu_evidence, expected_cert_hash
+        except Exception as exc:
+            logger.error(f"Failed to get chute evidence from {self._url}: {exc}")
+            raise GetEvidenceError()

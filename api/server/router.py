@@ -5,6 +5,7 @@ FastAPI routes for server management and TDX attestation.
 from typing import List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Header
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError, DatabaseError
 from loguru import logger
 
 from api.database import get_db_session
@@ -12,7 +13,7 @@ from api.config import settings
 from api.node.util import check_node_inventory
 from api.user.schemas import User
 from api.user.service import get_current_user
-from api.constants import HOTKEY_HEADER
+from api.constants import HOTKEY_HEADER, NoncePurpose
 
 from api.server.schemas import (
     BootAttestationArgs,
@@ -62,7 +63,7 @@ async def get_nonce(request: Request):
     """
     try:
         server_ip = extract_ip(request)
-        nonce_info = await create_nonce(server_ip)
+        nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.BOOT)
 
         return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
     except Exception as e:
@@ -77,7 +78,7 @@ async def verify_boot_attestation(
     request: Request,
     args: BootAttestationArgs,
     db: AsyncSession = Depends(get_db_session),
-    nonce=Depends(validate_request_nonce()),
+    nonce=Depends(validate_request_nonce(NoncePurpose.BOOT)),
     expected_cert_hash=Depends(extract_client_cert_hash()),
 ):
     """
@@ -238,10 +239,29 @@ async def create_server(
         return {"message": "Server registered successfully."}
 
     except ServerRegistrationError as e:
-        logger.error(f"Server registration failed: {str(e)}")
+        logger.error(
+            f"Server registration failed: server_id={args.id} host={args.host} miner_hotkey={hotkey} error={e.detail}"
+        )
         raise e
+    except HTTPException:
+        # Re-raise HTTPExceptions (like blacklist, node conflicts, invalid host) as-is
+        raise
+    except (IntegrityError, DatabaseError) as e:
+        # Handle database errors that might occur before register_server is called
+        # (e.g., in check_node_inventory)
+        logger.error(
+            f"Database error in server registration: server_id={args.id} host={args.host} miner_hotkey={hotkey} error={str(e)}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server registration failed - database error. Please contact support with your server ID and miner hotkey.",
+        )
     except Exception as e:
-        logger.error(f"Unexpected error in server registration: {str(e)}")
+        logger.error(
+            f"Unexpected error in server registration: server_id={args.id} host={args.host} miner_hotkey={hotkey} error={str(e)}",
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server registration failed"
         )
@@ -360,7 +380,7 @@ async def get_runtime_nonce(
         if server.ip != actual_ip:
             raise Exception()
 
-        nonce_info = await create_nonce(server.ip)
+        nonce_info = await create_nonce(server.ip, purpose=NoncePurpose.RUNTIME)
 
         return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
 
@@ -383,7 +403,7 @@ async def verify_runtime_attestation(
     _: User = Depends(
         get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
     ),
-    nonce=Depends(validate_request_nonce()),
+    nonce=Depends(validate_request_nonce(NoncePurpose.RUNTIME)),
     expected_cert_hash=Depends(extract_client_cert_hash()),
 ):
     """

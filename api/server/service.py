@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from api.config import settings
-from api.constants import NONCE_HEADER
+from api.constants import NONCE_HEADER, NoncePurpose
 from api.gpu import SUPPORTED_GPUS
 from api.node.util import _track_nodes
 from api.server.client import TeeServerClient
@@ -54,13 +54,13 @@ from api.server.util import (
 from api.util import extract_ip
 
 
-async def create_nonce(server_ip: str) -> Dict[str, str]:
+async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
     """
     Create a new attestation nonce using Redis.
 
     Args:
-        attestation_type: 'boot' or 'runtime'
-        server_id: Optional server ID for runtime attestations
+        server_ip: IP address of the server/instance requesting the nonce
+        purpose: Purpose of the nonce (NoncePurpose enum value)
 
     Returns:
         Dictionary with nonce and expiry info
@@ -69,8 +69,9 @@ async def create_nonce(server_ip: str) -> Dict[str, str]:
     expiry_seconds = get_nonce_expiry_seconds()
 
     # Use Redis to store nonce with TTL
+    # Store as JSON to include both server_ip and purpose
     redis_key = f"nonce:{nonce}"
-    redis_value = f"{server_ip}"
+    redis_value = json.dumps({"server_ip": server_ip, "purpose": purpose.value})
 
     await settings.redis_client.setex(redis_key, expiry_seconds, redis_value)
 
@@ -78,22 +79,22 @@ async def create_nonce(server_ip: str) -> Dict[str, str]:
         seconds=expiry_seconds
     )
 
-    logger.info(f"Created nonce: {nonce[:8]}... for server {server_ip}")
+    logger.info(f"Created nonce: {nonce[:8]}... for server {server_ip} with purpose {purpose}")
 
     return {"nonce": nonce, "expires_at": expires_at.isoformat()}
 
 
-async def validate_and_consume_nonce(nonce_value: str, server_ip: str) -> None:
+async def validate_and_consume_nonce(nonce_value: str, server_ip: str, purpose: NoncePurpose) -> None:
     """
     Validate and consume a nonce using Redis.
 
     Args:
         nonce_value: Nonce to validate
-        attestation_type: Expected attestation type
-        server_id: Expected server ID (for runtime attestations)
+        server_ip: Expected server IP address
+        purpose: Expected purpose for the nonce (NoncePurpose enum value)
 
     Raises:
-        NonceError: If nonce is invalid, expired, or already used
+        NonceError: If nonce is invalid, expired, already used, or purpose/server mismatch
     """
     redis_key = f"nonce:{nonce_value}"
 
@@ -105,31 +106,54 @@ async def validate_and_consume_nonce(nonce_value: str, server_ip: str) -> None:
 
     # Parse the stored value
     try:
-        stored_server = redis_value.decode()
-    except (ValueError, AttributeError):
+        stored_data = json.loads(redis_value.decode())
+        
+        # Handle legacy format (just server_ip as string) for backward compatibility
+        if isinstance(stored_data, str):
+            stored_server = stored_data
+            stored_purpose = None
+        else:
+            stored_server = stored_data.get("server_ip")
+            stored_purpose = stored_data.get("purpose")
+    except (ValueError, AttributeError, json.JSONDecodeError):
         raise NonceError("Invalid nonce format")
 
-    # Validate server ID
-    expected_server = server_ip
-    if stored_server != expected_server:
-        raise NonceError(f"Nonce server mismatch: expected {expected_server}, got {stored_server}")
+    # Validate server IP
+    if stored_server != server_ip:
+        raise NonceError(f"Nonce server mismatch: expected {server_ip}, got {stored_server}")
+
+    # Validate purpose (if stored nonce has a purpose, it must match)
+    if stored_purpose and stored_purpose != purpose.value:
+        raise NonceError(
+            f"Nonce purpose mismatch: expected {purpose.value}, got {stored_purpose}. "
+            f"Nonces are purpose-specific and cannot be reused across different operations."
+        )
 
     # Consume the nonce by deleting it
     deleted = await settings.redis_client.delete(redis_key)
     if not deleted:
         raise NonceError("Nonce was already consumed")
 
-    logger.info(f"Validated and consumed nonce: {nonce_value[:8]}...")
+    logger.info(f"Validated and consumed nonce: {nonce_value[:8]}... for purpose {purpose}")
 
 
-def validate_request_nonce():
+def validate_request_nonce(purpose: NoncePurpose):
+    """
+    Create a nonce validator dependency that validates nonces for a specific purpose.
+    
+    Args:
+        purpose: The expected purpose for the nonce (NoncePurpose enum value)
+    
+    Returns:
+        A FastAPI dependency function that validates the nonce
+    """
     async def _validate_request_nonce(
         request: Request, nonce: str | None = Header(None, alias=NONCE_HEADER)
     ):
         server_ip = extract_ip(request)
 
         try:
-            await validate_and_consume_nonce(nonce, server_ip)
+            await validate_and_consume_nonce(nonce, server_ip, purpose)
 
             return nonce
         except NonceError as e:
@@ -295,17 +319,30 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
         # Track nodes once verified
         await _track_nodes(db, miner_hotkey, server.server_id, args.gpus, "0", func.now())
 
-    except AttestationError:
-        logger.error(f"Attestation failed for server {args.host}")
-        raise ServerRegistrationError("Server registration failed - attestation failed.")
+    except AttestationError as e:
+        # Preserve the specific error message from the AttestationError
+        error_detail = e.detail if hasattr(e, "detail") else str(e)
+        logger.error(
+            f"Server registration failed - attestation error: server_id={args.id} host={args.host} miner_hotkey={miner_hotkey} error={error_detail}"
+        )
+        raise ServerRegistrationError(f"Server registration failed - {error_detail}")
     except IntegrityError as e:
         await db.rollback()
-        logger.error(f"Server registration failed: {str(e)}")
-        raise ServerRegistrationError("Server registration failed - constraint violation")
+        logger.error(
+            f"Server registration failed - IntegrityError: server_id={args.id} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}"
+        )
+        raise ServerRegistrationError(
+            "Server registration failed - database constraint violation. This may indicate a duplicate server ID, invalid miner configuration, or other database conflict. Please contact support with your server ID and miner hotkey."
+        )
     except Exception as e:
         await db.rollback()
-        logger.error(f"Unexpected error during server registration: {str(e)}")
-        raise ServerRegistrationError(f"Server registration failed: {str(e)}")
+        logger.error(
+            f"Unexpected error during server registration: server_id={args.id} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}",
+            exc_info=True,
+        )
+        raise ServerRegistrationError(
+            "Server registration failed - unexpected error occurred. Please contact support with your server ID and miner hotkey."
+        )
 
 
 async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> None:
@@ -329,14 +366,18 @@ async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> 
         client = TeeServerClient(server)
 
         nonce = generate_nonce()
-        logger.info(f"Verifying server {server.ip} with nonce {nonce}")
+        logger.info(
+            f"Verifying server server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} with nonce {nonce}"
+        )
         quote, gpu_evidence, expected_cert_hash = await client.get_evidence(nonce)
 
         await verify_quote(quote, nonce, expected_cert_hash)
 
         await verify_gpu_evidence(gpu_evidence, nonce)
 
-        logger.success(f"Verified server {server.server_id} for miner: {miner_hotkey}")
+        logger.success(
+            f"Verified server server_id={server.server_id} ip={server.ip} for miner: {miner_hotkey}"
+        )
 
         # Create attestation record
         server_attestation = ServerAttestation(
@@ -352,21 +393,32 @@ async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> 
 
     except GetEvidenceError as e:
         failure_reason = "Failed to get attestation evidence."
+        logger.error(
+            f"Server verification failed - GetEvidenceError: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         raise e
     except (InvalidQuoteError, MeasurementMismatchError) as e:
-        logger.error(f"Server verification failed for {server.ip}:\n{e}")
+        logger.error(
+            f"Server verification failed - quote error: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         failure_reason = "Server verification failed: invalid quote"
         raise e
     except InvalidGpuEvidenceError as e:
-        logger.error(f"Failed to verify GPU evidence for {server.ip}.  Invalid GPU evidence.")
+        logger.error(
+            f"Server verification failed - invalid GPU evidence: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         failure_reason = "Server verification failed: invalid GPU evidence"
         raise e
     except GpuEvidenceError as e:
-        logger.error(f"Failed to verify GPU evidence for {server.ip}")
+        logger.error(
+            f"Server verification failed - GPU evidence error: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         failure_reason = "Server verification failed: Failed to verify GPU evidence"
         raise e
     except Exception as e:
-        logger.error(f"Unexpected error during server verification for {server.ip}: {str(e)}")
+        logger.error(
+            f"Unexpected error during server verification: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={str(e)}"
+        )
         failure_reason = "Unexpected error during server verification."
         raise e
     finally:

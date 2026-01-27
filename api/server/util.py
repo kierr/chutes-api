@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from api.server.exceptions import (
     InvalidQuoteError,
+    AttestationError,
     InvalidSignatureError,
     InvalidTdxConfiguration,
     MeasurementMismatchError,
@@ -244,11 +245,11 @@ def _verify_measurements(quote: TdxQuote, expected_rtmrs: Dict[str, str]) -> boo
                 logger.error(error_msg)
                 mismatches.append(error_msg)
 
-        # If any mismatches found, raise with all details
+        # If any mismatches found, raise with generic message
+        # (detailed mismatch info is already logged above)
         if mismatches:
-            raise MeasurementMismatchError(
-                f"Measurement verification failed: {'; '.join(mismatches)}"
-            )
+            logger.error(f"Measurement verification failed: {'; '.join(mismatches)}")
+            raise MeasurementMismatchError()
 
         logger.info("Measurements verified successfully")
         return True
@@ -256,8 +257,9 @@ def _verify_measurements(quote: TdxQuote, expected_rtmrs: Dict[str, str]) -> boo
     except MeasurementMismatchError:
         raise
     except Exception as e:
-        logger.error(f"Runtime measurement verification failed: {e}")
-        raise MeasurementMismatchError(f"Runtime measurement verification error: {str(e)}")
+        logger.error(f"Unexpected error during measurement verification: {e}", exc_info=True)
+        # Re-raise as AttestationError for unexpected exceptions
+        raise AttestationError("Measurement verification failed due to an unexpected error.")
 
 
 def get_luks_passphrase() -> str:
