@@ -7,7 +7,7 @@ import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
 import tempfile
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
 from sqlalchemy import select, func
@@ -44,6 +44,7 @@ from api.server.util import (
     _track_server,
     extract_report_data,
     verify_measurements,
+    get_matching_measurement_config,
     generate_nonce,
     get_nonce_expiry_seconds,
     verify_quote_signature,
@@ -51,6 +52,7 @@ from api.server.util import (
     get_cache_passphrase,
     create_or_update_cache_passphrase,
 )
+from api.node.schemas import NodeArgs
 from api.util import extract_ip
 
 
@@ -188,6 +190,47 @@ async def verify_quote(
     return result
 
 
+def validate_gpus_for_measurements(quote: TdxQuote, gpus: list[NodeArgs]) -> None:
+    """
+    Validate that the provided GPUs match the expected GPUs for this measurement configuration.
+
+    Looks up the measurement configuration using the quote's RTMR0.
+
+    Args:
+        quote: Verified TDX quote (must have been verified via verify_quote)
+        gpus: List of GPU nodes being registered
+
+    Raises:
+        MeasurementMismatchError: If GPUs don't match measurement configuration expectations
+    """
+    # Look up measurement configuration by full MRTD + RTMRs (same as verify_measurements)
+    measurement_config = get_matching_measurement_config(quote)
+
+    # Extract GPU identifiers
+    provided_gpu_ids = {gpu.gpu_identifier.lower() for gpu in gpus}
+    expected_gpu_ids = set(measurement_config.expected_gpus)
+
+    # Check that all provided GPUs are in expected list
+    unexpected_gpus = provided_gpu_ids - expected_gpu_ids
+    if unexpected_gpus:
+        raise MeasurementMismatchError(
+            f"GPU mismatch for measurement config '{measurement_config.name}': "
+            f"Expected GPUs {expected_gpu_ids}, but got {unexpected_gpus}"
+        )
+
+    # Check GPU count if specified
+    if measurement_config.gpu_count and len(gpus) != measurement_config.gpu_count:
+        raise MeasurementMismatchError(
+            f"GPU count mismatch for measurement config '{measurement_config.name}': "
+            f"Expected {measurement_config.gpu_count} GPUs, but got {len(gpus)}"
+        )
+
+    logger.info(
+        f"GPU validation passed for measurement config '{measurement_config.name}': "
+        f"{len(gpus)} GPUs of types {provided_gpu_ids}"
+    )
+
+
 async def verify_gpu_evidence(evidence: list[Dict[str, str]], expected_nonce: str) -> None:
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as fp:
@@ -268,10 +311,12 @@ async def process_boot_attestation(
         quote = BootTdxQuote.from_base64(args.quote)
         await verify_quote(quote, nonce, expected_cert_hash)
 
+        measurement_config = get_matching_measurement_config(quote)
         # Create boot attestation record
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
+            measurement_version=measurement_config.version,
             created_at=func.now(),
             verified_at=func.now(),
         )
@@ -288,11 +333,19 @@ async def process_boot_attestation(
         return boot_token
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
-        # Create failed attestation record
+        # Create failed attestation record; set measurement_version if quote matched a config
+        measurement_version = None
+        try:
+            quote = BootTdxQuote.from_base64(args.quote)
+            measurement_config = get_matching_measurement_config(quote)
+            measurement_version = measurement_config.version
+        except (InvalidQuoteError, MeasurementMismatchError):
+            pass
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
             verification_error=str(e.detail),
+            measurement_version=measurement_version,
             created_at=func.now(),
         )
 
@@ -313,8 +366,8 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
             for key in ["processors", "max_threads_per_processor"]:
                 setattr(gpu, key, gpu_info.get(key))
 
-        # Start verification process
-        await verify_server(db, server, miner_hotkey)
+        # Start verification process (pass GPUs for validation)
+        await verify_server(db, server, miner_hotkey, gpus=args.gpus)
 
         # Track nodes once verified
         await _track_nodes(db, miner_hotkey, server.server_id, args.gpus, "0", func.now())
@@ -345,20 +398,17 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
         )
 
 
-async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> None:
+async def verify_server(
+    db: AsyncSession, server: Server, miner_hotkey: str, gpus: list[NodeArgs]
+) -> None:
     """
-    Register a new server.
+    Verify server attestation and validate GPUs match measurement configuration.
 
     Args:
         db: Database session
-        args: Server registration arguments
-        miner_hotkey: Miner hotkey from authentication
-
-    Returns:
-        Created server object
-
-    Raises:
-        ServerRegistrationError: If registration fails
+        server: Server to verify
+        miner_hotkey: Miner hotkey
+        gpus: List of GPUs to validate against measurement configuration
     """
     failure_reason = ""
     quote = None
@@ -371,20 +421,28 @@ async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> 
         )
         quote, gpu_evidence, expected_cert_hash = await client.get_evidence(nonce)
 
+        # Verify quote measurements (matches by full MRTD + RTMRs; multiple configs may share RTMR0)
         await verify_quote(quote, nonce, expected_cert_hash)
 
+        # Verify GPU evidence
         await verify_gpu_evidence(gpu_evidence, nonce)
+
+        # Validate GPUs match measurement configuration
+        validate_gpus_for_measurements(quote, gpus)
+
+        measurement_config = get_matching_measurement_config(quote)
 
         logger.success(
             f"Verified server server_id={server.server_id} ip={server.ip} for miner: {miner_hotkey}"
         )
 
-        # Create attestation record
+        # Create attestation record (measurement_version for audit trail; server version = latest attestation)
         server_attestation = ServerAttestation(
             quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8"),
             server_id=server.server_id,
             created_at=func.now(),
             verified_at=func.now(),
+            measurement_version=measurement_config.version,
         )
 
         db.add(server_attestation)
@@ -423,12 +481,19 @@ async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> 
         raise e
     finally:
         if failure_reason:
-            # Create attestation record
+            measurement_version = None
+            if quote:
+                try:
+                    measurement_config = get_matching_measurement_config(quote)
+                    measurement_version = measurement_config.version
+                except MeasurementMismatchError:
+                    pass
             server_attestation = ServerAttestation(
                 quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8") if quote else None,
                 server_id=server.server_id,
                 verification_error=failure_reason,
                 created_at=func.now(),
+                measurement_version=measurement_version,
             )
 
             db.add(server_attestation)
@@ -504,14 +569,12 @@ async def process_runtime_attestation(
         result = await verify_quote(quote, expected_nonce, expected_cert_hash)
 
         # Create runtime attestation record
+        measurement_config = get_matching_measurement_config(quote)
         attestation = ServerAttestation(
             server_id=server_id,
             quote_data=args.quote,
-            mrtd=quote.mrtd,
-            rtmrs=quote.rtmrs,
-            verification_result=result.to_dict(),
-            verified=True,
-            nonce_used=expected_nonce,
+            verification_error=None,
+            measurement_version=measurement_config.version,
             verified_at=func.now(),
         )
 
@@ -529,12 +592,18 @@ async def process_runtime_attestation(
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         # Create failed attestation record
+        measurement_version = None
+        try:
+            quote_parsed = RuntimeTdxQuote.from_base64(args.quote)
+            measurement_config = get_matching_measurement_config(quote_parsed)
+            measurement_version = measurement_config.version
+        except (InvalidQuoteError, MeasurementMismatchError):
+            pass
         attestation = ServerAttestation(
             server_id=server_id,
             quote_data=args.quote,
-            verified=False,
             verification_error=str(e.detail),
-            nonce_used=expected_nonce,
+            measurement_version=measurement_version,
         )
 
         db.add(attestation)
@@ -579,16 +648,17 @@ async def get_server_attestation_status(
     }
 
     if latest_attestation:
+        verified = latest_attestation.verification_error is None
         status["last_attestation"] = {
             "attestation_id": latest_attestation.attestation_id,
-            "verified": latest_attestation.verified,
+            "verified": verified,
             "created_at": latest_attestation.created_at.isoformat(),
             "verified_at": latest_attestation.verified_at.isoformat()
             if latest_attestation.verified_at
             else None,
             "verification_error": latest_attestation.verification_error,
         }
-        status["attestation_status"] = "verified" if latest_attestation.verified else "failed"
+        status["attestation_status"] = "verified" if verified else "failed"
 
     return status
 

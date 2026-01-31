@@ -7,13 +7,15 @@ import hashlib
 from pathlib import Path
 import aioboto3
 import json
+import yaml
+from dataclasses import dataclass
 from api.safe_redis import SafeRedis
 from functools import cached_property, lru_cache
 import redis.asyncio as redis
 from redis.retry import Retry
 from redis.backoff import ConstantBackoff
 from boto3.session import Config
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from bittensor_wallet.keypair import Keypair
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -21,6 +23,7 @@ from contextlib import asynccontextmanager
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.fernet import Fernet
+from loguru import logger
 
 
 @lru_cache(maxsize=1)
@@ -39,9 +42,28 @@ def load_launch_config_private_key():
     return None
 
 
+@dataclass
+class TeeMeasurementConfig:
+    """Configuration for allowed measurements for a TEE VM."""
+
+    version: str
+    mrtd: str
+    name: str
+    boot_rtmrs: Dict[str, str]
+    runtime_rtmrs: Dict[str, str]
+    expected_gpus: List[str]
+    gpu_count: Optional[int] = None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(arbitrary_types_allowed=True)
     _validator_keypair: Optional[Keypair] = None
+
+    def model_post_init(self, __context) -> None:
+        """Validate configuration after initialization."""
+        # Eagerly validate TEE measurement configuration only when the config file is mounted
+        if self.tee_measurement_config_path.exists():
+            _ = self.tee_measurements
 
     @cached_property
     def validator_keypair(self) -> Optional[Keypair]:
@@ -315,26 +337,69 @@ class Settings(BaseSettings):
     hcaptcha_sitekey: Optional[str] = os.getenv("HCAPTCHA_SITEKEY")
     hcaptcha_secret: Optional[str] = os.getenv("HCAPTCHA_SECRET")
 
-    # TDX Attestation settings
-    expected_mrtd: Optional[str] = os.getenv("TDX_EXPECTED_MRTD")
-    expected_boot_rmtrs: Optional[Dict[str, str]] = (
-        {
-            pair.split("=")[0]: pair.split("=")[1]
-            for pair in os.getenv("TDX_BOOT_RMTRS", "").split(",")
-            if pair and "=" in pair and len(pair.split("=")) == 2
-        }
-        if os.getenv("TDX_BOOT_RMTRS")
-        else None
-    )
-    expected_runtime_rmtrs: Optional[Dict[str, str]] = (
-        {
-            pair.split("=")[0]: pair.split("=")[1]
-            for pair in os.getenv("TDX_RUNTIME_RMTRS", "").split(",")
-            if pair and "=" in pair and len(pair.split("=")) == 2
-        }
-        if os.getenv("TDX_RUNTIME_RMTRS")
-        else None
-    )
+    # TDX Attestation settings - Measurement configuration loaded from ConfigMap
+    tee_measurement_config_path: Path = Path("/etc/config/tee_measurements.yaml")
+
+    @cached_property
+    def tee_measurements(self) -> List[TeeMeasurementConfig]:
+        """Load TEE measurement configurations from YAML file (mounted from ConfigMap)."""
+        try:
+            with open(self.tee_measurement_config_path) as f:
+                config = yaml.safe_load(f)
+        except Exception as e:
+            logger.error(f"Failed to load TEE measurement config: {e}")
+            return []
+
+        measurements: List[TeeMeasurementConfig] = []
+        for measurement_config in config.get("measurements", []):
+            config_name = measurement_config.get("name", "unnamed")
+            version = measurement_config.get("version")
+            if not version or not str(version).strip():
+                error_msg = (
+                    f"Missing or empty 'version' for measurement config '{config_name}'. "
+                    "Each measurement configuration must have a version."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            rtmr0_upper = measurement_config["boot_rtmrs"]["rtmr0"].upper().strip()
+            if len(rtmr0_upper) != 96:
+                logger.warning(
+                    f"Invalid RTMR0 length for measurement config {config_name}: {len(rtmr0_upper)} (expected 96)"
+                )
+                continue
+
+            mrtd_upper = measurement_config["mrtd"].upper().strip()
+            if len(mrtd_upper) != 96:
+                logger.warning(
+                    f"Invalid MRTD length for measurement config {config_name}: {len(mrtd_upper)} (expected 96)"
+                )
+                continue
+
+            boot_rtmrs = {k.upper(): v.upper().strip() for k, v in measurement_config["boot_rtmrs"].items()}
+            runtime_rtmrs = {k.upper(): v.upper().strip() for k, v in measurement_config["runtime_rtmrs"].items()}
+
+            if boot_rtmrs.get("RTMR0") != runtime_rtmrs.get("RTMR0"):
+                logger.warning(
+                    f"RTMR0 mismatch between boot and runtime for measurement config {config_name}. "
+                    "This is unexpected - RTMR0 should be the same (ACPI tables don't change)."
+                )
+
+            measurements.append(
+                TeeMeasurementConfig(
+                    version=str(version).strip(),
+                    mrtd=mrtd_upper,
+                    name=measurement_config["name"],
+                    boot_rtmrs=boot_rtmrs,
+                    runtime_rtmrs=runtime_rtmrs,
+                    expected_gpus=[gpu.lower() for gpu in measurement_config["expected_gpus"]],
+                    gpu_count=measurement_config.get("gpu_count"),
+                )
+            )
+
+        logger.info(f"Loaded {len(measurements)} TEE measurement configurations")
+        return measurements
+
     luks_passphrase: Optional[str] = os.getenv("LUKS_PASSPHRASE")
     cache_passphrase_key: Optional[str] = os.getenv("CACHE_PASSPHRASE_KEY")
 

@@ -3,7 +3,7 @@ TDX quote parsing, crypto operations, and server helper functions.
 """
 
 import secrets
-from typing import Dict
+from typing import Dict, List, Optional
 from sqlalchemy import select
 from sqlalchemy.sql import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,7 +13,7 @@ from cryptography.fernet import Fernet
 from fastapi import Request, status
 from loguru import logger
 from dcap_qvl import get_collateral_and_verify
-from api.config import settings
+from api.config import settings, TeeMeasurementConfig
 from cryptography import x509
 from cryptography.x509 import Certificate
 from cryptography.hazmat.primitives import serialization
@@ -132,6 +132,11 @@ def _get_client_certificate(request: Request) -> bytes:
 
 
 def extract_nonce(quote: TdxQuote):
+    """Extract nonce from quote report_data. Raises InvalidQuoteError if report_data is missing."""
+    if quote.report_data is None:
+        raise InvalidQuoteError(
+            "Quote has no report data; nonce cannot be extracted. The quote may be malformed."
+        )
     return quote.report_data[:64].lower()
 
 
@@ -180,9 +185,34 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
         raise InvalidQuoteError(f"Unable to parse provided quote for verification.")
 
 
+def get_matching_measurement_config(quote: TdxQuote) -> TeeMeasurementConfig:
+    """
+    Find the measurement config that matches the quote by full MRTD + RTMRs.
+
+    Multiple configs may share the same RTMR0 (e.g. old and new VM versions);
+    matching is by full MRTD and all RTMRs from the quote.
+
+    Returns:
+        The matching TeeMeasurementConfig
+
+    Raises:
+        MeasurementMismatchError: If no config matches
+    """
+    for config in settings.tee_measurements:
+        if quote.matches_measurement(config):
+            return config
+
+    logger.info("No measurement config matched quote (MRTD + RTMRs).")
+    raise MeasurementMismatchError(
+        "Quote does not match expected measurements. Ensure you are running a supported VM."
+    )
+
+
 def verify_measurements(quote: TdxQuote) -> bool:
     """
-    Verify quote measurements against expected values.
+    Verify quote measurements against allowed measurement values.
+
+    Finds the matching config by full MRTD + RTMRs (multiple configs may share RTMR0).
 
     Args:
         quote: Parsed TDX quote
@@ -193,65 +223,84 @@ def verify_measurements(quote: TdxQuote) -> bool:
     Raises:
         MeasurementMismatchError: If any measurements don't match
     """
+    measurement_config = get_matching_measurement_config(quote)
     expected_rtmrs = (
-        settings.expected_boot_rmtrs
+        measurement_config.boot_rtmrs
         if quote.quote_type == "boot"
-        else settings.expected_runtime_rmtrs
+        else measurement_config.runtime_rtmrs
     )
-    logger.info("Verifying quote against configured MRTD and RTMRS.")
-    return _verify_measurements(quote, expected_rtmrs)
+
+    logger.info(
+        f"Verifying quote for measurement config '{measurement_config.name}' "
+        f"(version={measurement_config.version}, RTMR0: {quote.rtmr0.upper()[:16]}...)"
+    )
+    return _verify_measurements(
+        quote, expected_rtmrs, measurement_config.name, measurement_config.mrtd
+    )
 
 
 def verify_result(quote: TdxQuote, result: TdxVerificationResult) -> bool:
     """
-    Verify quote measurements against verification result values.
+    Ensure the parsed quote matches the DCAP verification result.
 
-    Args:
-        quote: Parsed TDX quote
-        result: The verification result from DCAP
-
-    Returns:
-        True if all measurements match
+    Compares quote.mrtd and quote.rtmrs to result.mrtd and result.rtmrs.
+    Has nothing to do with measurement config; only validates that our parsing
+    matches what DCAP verified.
 
     Raises:
-        MeasurementMismatchError: If any measurements don't match
+        MeasurementMismatchError: If quote and result measurements differ
     """
-    logger.info("Verifying quote against verification result MRTD and RTMRS.")
-    return _verify_measurements(quote, result.rtmrs)
+    logger.info("Verifying quote matches DCAP verification result.")
+    return _verify_measurements(
+        quote, result.rtmrs, "DCAP result", result.mrtd
+    )
 
 
-def _verify_measurements(quote: TdxQuote, expected_rtmrs: Dict[str, str]) -> bool:
+def _verify_measurements(
+    quote: TdxQuote,
+    expected_rtmrs: Dict[str, str],
+    measurement_name: str,
+    expected_mrtd: str,
+) -> bool:
+    """
+    Compare quote measurements to expected mrtd and rtmrs.
+
+    Used both to compare quote to config (verify_measurements) and quote to DCAP result (verify_result).
+    """
     try:
         mismatches = []
 
-        # Verify MRTD
-        expected_mrtd = settings.expected_mrtd
         if quote.mrtd.upper() != expected_mrtd.upper():
-            error_msg = f"MRTD mismatch: expected {expected_mrtd}, got {quote.mrtd}"
+            error_msg = (
+                f"MRTD mismatch for measurement config '{measurement_name}': "
+                f"expected {expected_mrtd[:16]}..., got {quote.mrtd[:16]}..."
+            )
             logger.error(error_msg)
             mismatches.append(error_msg)
 
-        # Verify RTMRs
         for rtmr_name, expected_value in expected_rtmrs.items():
-            actual_value = quote.rtmrs.get(rtmr_name)
+            actual_value = quote.rtmrs.get(rtmr_name.lower()) or quote.rtmrs.get(
+                rtmr_name
+            )
             if not actual_value:
                 error_msg = f"Quote missing expected RTMR[{rtmr_name}]"
                 logger.error(error_msg)
                 mismatches.append(error_msg)
             elif actual_value.upper() != expected_value.upper():
                 error_msg = (
-                    f"RTMR {rtmr_name} mismatch: expected {expected_value}, got {actual_value}"
+                    f"RTMR {rtmr_name} mismatch for measurement config '{measurement_name}': "
                 )
-                logger.error(error_msg)
+                logger.error(
+                    f"{error_msg} "
+                    f"expected {expected_value}..., got {actual_value}..."
+                )
                 mismatches.append(error_msg)
 
-        # If any mismatches found, raise with generic message
-        # (detailed mismatch info is already logged above)
         if mismatches:
             logger.error(f"Measurement verification failed: {'; '.join(mismatches)}")
             raise MeasurementMismatchError()
 
-        logger.info("Measurements verified successfully")
+        logger.info(f"Measurements verified successfully for measurement config '{measurement_name}'")
         return True
 
     except MeasurementMismatchError:
@@ -273,7 +322,7 @@ def get_luks_passphrase() -> str:
     passphrase = settings.luks_passphrase
     if not passphrase:
         logger.error("No LUKS passphrase configured")
-        raise InvalidTdxConfiguration("Missing LUKS phassphrase configuration")
+        raise InvalidTdxConfiguration("Missing LUKS passphrase configuration")
 
     return passphrase
 
