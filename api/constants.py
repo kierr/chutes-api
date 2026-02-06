@@ -3,7 +3,7 @@ from enum import Enum
 
 class NoncePurpose(str, Enum):
     """Purpose values for attestation nonces to prevent cross-purpose reuse."""
-    
+
     BOOT = "boot"
     RUNTIME = "runtime"
     INSTANCE_VERIFICATION = "instance_verification"
@@ -19,6 +19,9 @@ PURPOSE_HEADER = "X-Chutes-Purpose"
 MINER_HEADER = "X-Chutes-Miner"
 VALIDATOR_HEADER = "X-Chutes-Validator"
 ENCRYPTED_HEADER = "X-Chutes-Encrypted"
+
+# LUKS volume names allowed in GET/POST (extendable)
+SUPPORTED_LUKS_VOLUMES = ("storage", "cache")
 
 # Min balance to register via the CLI (tao units)
 MIN_REG_BALANCE = 0.25

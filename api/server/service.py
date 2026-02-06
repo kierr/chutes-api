@@ -10,7 +10,7 @@ import tempfile
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
-from sqlalchemy import select, func
+from sqlalchemy import or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
@@ -49,8 +49,8 @@ from api.server.util import (
     get_nonce_expiry_seconds,
     verify_quote_signature,
     verify_result,
-    get_cache_passphrase,
-    create_or_update_cache_passphrase,
+    sync_server_luks_passphrases,
+    delete_luks_passphrases_for_server,
 )
 from api.node.schemas import NodeArgs
 from api.util import extract_ip
@@ -86,7 +86,9 @@ async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
     return {"nonce": nonce, "expires_at": expires_at.isoformat()}
 
 
-async def validate_and_consume_nonce(nonce_value: str, server_ip: str, purpose: NoncePurpose) -> None:
+async def validate_and_consume_nonce(
+    nonce_value: str, server_ip: str, purpose: NoncePurpose
+) -> None:
     """
     Validate and consume a nonce using Redis.
 
@@ -109,7 +111,7 @@ async def validate_and_consume_nonce(nonce_value: str, server_ip: str, purpose: 
     # Parse the stored value
     try:
         stored_data = json.loads(redis_value.decode())
-        
+
         # Handle legacy format (just server_ip as string) for backward compatibility
         if isinstance(stored_data, str):
             stored_server = stored_data
@@ -142,13 +144,14 @@ async def validate_and_consume_nonce(nonce_value: str, server_ip: str, purpose: 
 def validate_request_nonce(purpose: NoncePurpose):
     """
     Create a nonce validator dependency that validates nonces for a specific purpose.
-    
+
     Args:
         purpose: The expected purpose for the nonce (NoncePurpose enum value)
-    
+
     Returns:
         A FastAPI dependency function that validates the nonce
     """
+
     async def _validate_request_nonce(
         request: Request, nonce: str | None = Header(None, alias=NONCE_HEADER)
     ):
@@ -358,7 +361,7 @@ async def process_boot_attestation(
 
 async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str):
     try:
-        server = await _track_server(db, args.id, args.host, miner_hotkey, is_tee=True)
+        server = await _track_server(db, args.id, args.name, args.host, miner_hotkey, is_tee=True)
 
         # Set the attributes we can't get from pynvml
         for gpu in args.gpus:
@@ -376,13 +379,13 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
         # Preserve the specific error message from the AttestationError
         error_detail = e.detail if hasattr(e, "detail") else str(e)
         logger.error(
-            f"Server registration failed - attestation error: server_id={args.id} host={args.host} miner_hotkey={miner_hotkey} error={error_detail}"
+            f"Server registration failed - attestation error: name={args.name} host={args.host} miner_hotkey={miner_hotkey} error={error_detail}"
         )
         raise ServerRegistrationError(f"Server registration failed - {error_detail}")
     except IntegrityError as e:
         await db.rollback()
         logger.error(
-            f"Server registration failed - IntegrityError: server_id={args.id} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}"
+            f"Server registration failed - IntegrityError: name={args.name} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}"
         )
         raise ServerRegistrationError(
             "Server registration failed - database constraint violation. This may indicate a duplicate server ID, invalid miner configuration, or other database conflict. Please contact support with your server ID and miner hotkey."
@@ -390,7 +393,7 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
     except Exception as e:
         await db.rollback()
         logger.error(
-            f"Unexpected error during server registration: server_id={args.id} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}",
+            f"Unexpected error during server registration: name={args.name} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}",
             exc_info=True,
         )
         raise ServerRegistrationError(
@@ -527,6 +530,97 @@ async def check_server_ownership(db: AsyncSession, server_id: str, miner_hotkey:
     return server
 
 
+async def get_server_by_name(db: AsyncSession, miner_hotkey: str, server_name: str) -> Server:
+    """
+    Get a server by miner hotkey and VM name (stable identity for API paths).
+
+    Args:
+        db: Database session
+        miner_hotkey: Miner hotkey (must match authenticated user)
+        vm_name: VM name
+
+    Returns:
+        Server object
+
+    Raises:
+        ServerNotFoundError: If server not found
+    """
+    query = select(Server).where(Server.miner_hotkey == miner_hotkey, Server.name == server_name)
+    result = await db.execute(query)
+    server = result.scalar_one_or_none()
+    if not server:
+        raise ServerNotFoundError(f"{server_name}")
+    return server
+
+
+async def get_server_by_name_or_id(
+    db: AsyncSession, miner_hotkey: str, server_name_or_id: str
+) -> Server:
+    """
+    Get a server by miner hotkey and either VM name or server id.
+
+    Args:
+        db: Database session
+        miner_hotkey: Miner hotkey (must match authenticated user)
+        server_name_or_id: VM name or server_id
+
+    Returns:
+        Server object
+
+    Raises:
+        ServerNotFoundError: If server not found
+    """
+    query = select(Server).where(
+        Server.miner_hotkey == miner_hotkey,
+        or_(
+            Server.name == server_name_or_id,
+            Server.server_id == server_name_or_id,
+        ),
+    )
+    result = await db.execute(query)
+    server = result.scalar_one_or_none()
+    if not server:
+        raise ServerNotFoundError(server_name_or_id)
+    return server
+
+
+async def update_server_name(
+    db: AsyncSession, miner_hotkey: str, server_id: str, server_name: str
+) -> Server:
+    """
+    Update name for an existing server (by server_id). Used to sync names for
+    servers that existed before the name schema change.
+
+    Args:
+        db: Database session
+        miner_hotkey: Authenticated miner hotkey (must own the server)
+        server_id: Server ID (e.g. k8s node uid)
+        server_name: New VM name to set (unique per miner)
+
+    Returns:
+        Updated Server
+
+    Raises:
+        ServerNotFoundError: If server not found or not owned by miner
+        HTTPException 409: If new_vm_name is already used by another server of this miner
+    """
+    server = await check_server_ownership(db, server_id, miner_hotkey)
+    if server.name == server_name:
+        return server
+    server.name = server_name
+    try:
+        await db.commit()
+        await db.refresh(server)
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"name '{server_name}' already in use by another server for this miner",
+        )
+    logger.info(f"Updated server {server_id} name to {server_name}")
+    return server
+
+
 async def process_runtime_attestation(
     db: AsyncSession,
     server_id: str,
@@ -566,7 +660,7 @@ async def process_runtime_attestation(
     try:
         # Verify quote signature
         quote = RuntimeTdxQuote.from_base64(args.quote)
-        result = await verify_quote(quote, expected_nonce, expected_cert_hash)
+        await verify_quote(quote, expected_nonce, expected_cert_hash)
 
         # Create runtime attestation record
         measurement_config = get_matching_measurement_config(quote)
@@ -702,6 +796,7 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
     """
     server = await check_server_ownership(db, server_id, miner_hotkey)
 
+    await delete_luks_passphrases_for_server(db, server.miner_hotkey, server.name)
     await db.delete(server)
     await db.commit()
 
@@ -709,7 +804,7 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
     return True
 
 
-async def validate_boot_token_and_get_vm_identity(boot_token: str) -> tuple[str, str]:
+async def _get_boot_token_context(boot_token: str) -> tuple[str, str]:
     """
     Validate boot token and return the VM identity (miner_hotkey, vm_name).
 
@@ -737,36 +832,14 @@ async def validate_boot_token_and_get_vm_identity(boot_token: str) -> tuple[str,
         logger.error(f"Failed to parse boot token value: {e}")
         raise NonceError("Invalid boot token format")
 
-    logger.info(f"Validated boot token for VM {vm_name} (miner: {miner_hotkey})")
+    logger.info(f"Retrieved boot token for VM {vm_name} (miner: {miner_hotkey})")
 
     return miner_hotkey, vm_name
 
 
-async def get_cache_passphrase_with_token(
-    db: AsyncSession, boot_token: str, hotkey: str, vm_name: str
-) -> str:
-    """
-    Validate boot token and retrieve existing cache passphrase.
-
-    This is called when the cache volume is already encrypted and needs the passphrase.
-
-    Args:
-        db: Database session
-        boot_token: Boot token from initial attestation
-        hotkey: Miner hotkey (must match boot token)
-        vm_name: VM name (must match boot token)
-
-    Returns:
-        Cache volume passphrase (decrypted)
-
-    Raises:
-        NonceError: If boot token is invalid or expired, or if hotkey/vm_name don't match
-        ValueError: If no passphrase exists (shouldn't happen for encrypted volumes)
-    """
-    # Validate token and get VM identity from boot token
-    token_hotkey, token_vm_name = await validate_boot_token_and_get_vm_identity(boot_token)
-
-    # Verify that the provided hotkey and vm_name match what's in the boot token
+async def _validate_boot_token_for_luks(boot_token: str, hotkey: str, vm_name: str) -> None:
+    """Validate boot token and verify hotkey/vm_name match. Raises NonceError on failure."""
+    token_hotkey, token_vm_name = await _get_boot_token_context(boot_token)
     if token_hotkey != hotkey:
         logger.warning(f"Hotkey mismatch: expected {token_hotkey}, got {hotkey}")
         raise NonceError("Hotkey does not match boot token")
@@ -774,52 +847,24 @@ async def get_cache_passphrase_with_token(
         logger.warning(f"VM name mismatch: expected {token_vm_name}, got {vm_name}")
         raise NonceError("VM name does not match boot token")
 
-    # Get existing passphrase
-    passphrase = await get_cache_passphrase(db, hotkey, vm_name)
 
-    # Consume the boot token after successful retrieval
+async def _consume_boot_token(boot_token: str) -> None:
     redis_key = f"boot_token:{boot_token}"
     await settings.redis_client.delete(redis_key)
 
-    return passphrase
 
-
-async def create_cache_passphrase_with_token(
-    db: AsyncSession, boot_token: str, hotkey: str, vm_name: str
-) -> str:
-    """
-    Validate boot token and create/override cache passphrase.
-
-    This is called when the cache volume is unencrypted (new or wiped).
-
-    Args:
-        db: Database session
-        boot_token: Boot token from initial attestation
-        hotkey: Miner hotkey (must match boot token)
-        vm_name: VM name (must match boot token)
-
-    Returns:
-        Cache volume passphrase (decrypted)
-
-    Raises:
-        NonceError: If boot token is invalid or expired, or if hotkey/vm_name don't match
-    """
-    # Validate token and get VM identity from boot token
-    token_hotkey, token_vm_name = await validate_boot_token_and_get_vm_identity(boot_token)
-
-    # Verify that the provided hotkey and vm_name match what's in the boot token
-    if token_hotkey != hotkey:
-        logger.warning(f"Hotkey mismatch: expected {token_hotkey}, got {hotkey}")
-        raise NonceError("Hotkey does not match boot token")
-    if token_vm_name != vm_name:
-        logger.warning(f"VM name mismatch: expected {token_vm_name}, got {vm_name}")
-        raise NonceError("VM name does not match boot token")
-
-    # Create or override passphrase
-    passphrase = await create_or_update_cache_passphrase(db, hotkey, vm_name)
-
-    # Consume the boot token after successful creation
-    redis_key = f"boot_token:{boot_token}"
-    await settings.redis_client.delete(redis_key)
-
-    return passphrase
+async def process_luks_passphrase_request(
+    db: AsyncSession,
+    boot_token: str,
+    hotkey: str,
+    vm_name: str,
+    volume_names: list,
+    rekey_volume_names: Optional[list] = None,
+) -> Dict[str, str]:
+    """Validate boot token and run LUKS sync (ensure keys for volumes, prune others, rekey optional). Consumes token."""
+    await _validate_boot_token_for_luks(boot_token, hotkey, vm_name)
+    result = await sync_server_luks_passphrases(
+        db, hotkey, vm_name, volume_names, rekey_volume_names=rekey_volume_names
+    )
+    await _consume_boot_token(boot_token)
+    return result

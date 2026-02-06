@@ -20,9 +20,12 @@ from api.server.service import (
     register_server,
     verify_server,
     check_server_ownership,
+    get_server_by_name,
+    update_server_name,
     get_server_attestation_status,
     list_servers,
     delete_server,
+    process_luks_passphrase_request,
 )
 from api.server.schemas import (
     Server,
@@ -58,7 +61,12 @@ def _tee_measurements_for_service_tests():
             mrtd="a" * 96,
             name="test",
             boot_rtmrs={"RTMR0": "b" * 96, "RTMR1": "c" * 96, "RTMR2": "d" * 96, "RTMR3": "e" * 96},
-            runtime_rtmrs={"RTMR0": "d" * 96, "RTMR1": "e" * 96, "RTMR2": "f" * 96, "RTMR3": "0" * 96},
+            runtime_rtmrs={
+                "RTMR0": "d" * 96,
+                "RTMR1": "e" * 96,
+                "RTMR2": "f" * 96,
+                "RTMR3": "0" * 96,
+            },
             expected_gpus=["h200"],
             gpu_count=None,  # allow any count in unit tests
         ),
@@ -229,8 +237,8 @@ def _sample_node_args():
 def server_args():
     """Sample ServerArgs for testing."""
     return ServerArgs(
-        id="test-server-123",
         host=TEST_SERVER_IP,
+        name="test-vm-name",
         gpus=[_sample_node_args()],
     )
 
@@ -242,6 +250,7 @@ def sample_server():
         server_id="test-server-123",
         ip=TEST_SERVER_IP,
         miner_hotkey="5FTestHotkey123",
+        name="test-vm-name",
         created_at=datetime.now(timezone.utc),
         updated_at=None,
     )
@@ -312,9 +321,7 @@ async def test_create_nonce(mock_settings):
     assert "expires_at" in result
 
     # Verify Redis operations (value is JSON: server_ip + purpose)
-    expected_value = json.dumps(
-        {"server_ip": TEST_SERVER_IP, "purpose": NoncePurpose.BOOT.value}
-    )
+    expected_value = json.dumps({"server_ip": TEST_SERVER_IP, "purpose": NoncePurpose.BOOT.value})
     mock_settings.redis_client.setex.assert_called_once_with(
         f"nonce:{TEST_NONCE}", 600, expected_value
     )
@@ -338,9 +345,7 @@ async def test_validate_and_consume_nonce_not_found(mock_settings):
     mock_settings.redis_client.get.return_value = None
 
     with pytest.raises(NonceError, match="Nonce not found or expired"):
-        await validate_and_consume_nonce(
-            "invalid_nonce", TEST_SERVER_IP, NoncePurpose.BOOT
-        )
+        await validate_and_consume_nonce("invalid_nonce", TEST_SERVER_IP, NoncePurpose.BOOT)
 
 
 @pytest.mark.asyncio
@@ -363,9 +368,7 @@ async def test_validate_and_consume_nonce_already_consumed(mock_settings):
     mock_settings.redis_client.delete.return_value = 0  # Nothing deleted (already consumed)
 
     with pytest.raises(NonceError, match="Nonce was already consumed"):
-        await validate_and_consume_nonce(
-            TEST_GPU_NONCE, TEST_SERVER_IP, NoncePurpose.BOOT
-        )
+        await validate_and_consume_nonce(TEST_GPU_NONCE, TEST_SERVER_IP, NoncePurpose.BOOT)
 
 
 # Quote Verification Tests
@@ -473,14 +476,14 @@ async def test_process_boot_attestation_quote_failure(mock_db_session, boot_atte
         "api.server.service.BootTdxQuote.from_base64",
         side_effect=InvalidQuoteError("Invalid quote"),
     ):
-            with pytest.raises(InvalidQuoteError):
-                await process_boot_attestation(
-                    mock_db_session,
-                    TEST_SERVER_IP,
-                    boot_attestation_args,
-                    TEST_NONCE,
-                    TEST_CERT_HASH,
-                )
+        with pytest.raises(InvalidQuoteError):
+            await process_boot_attestation(
+                mock_db_session,
+                TEST_SERVER_IP,
+                boot_attestation_args,
+                TEST_NONCE,
+                TEST_CERT_HASH,
+            )
 
 
 @pytest.mark.asyncio
@@ -542,14 +545,14 @@ async def test_process_runtime_attestation_success(
                 mock_db_session.refresh.side_effect = mock_refresh
 
                 result = await process_runtime_attestation(
-                mock_db_session,
-                server_id,
-                TEST_SERVER_IP,
-                runtime_attestation_args,
-                miner_hotkey,
-                TEST_NONCE,
-                TEST_CERT_HASH,
-            )
+                    mock_db_session,
+                    server_id,
+                    TEST_SERVER_IP,
+                    runtime_attestation_args,
+                    miner_hotkey,
+                    TEST_NONCE,
+                    TEST_CERT_HASH,
+                )
 
             assert result["attestation_id"] == "runtime-attest-123"
             assert result["status"] == "verified"
@@ -616,9 +619,7 @@ async def test_register_server_success(
                 parsed_at=datetime.now(timezone.utc),
                 is_valid=True,
             )
-            await verify_server(
-                mock_db_session, sample_server, miner_hotkey, server_args.gpus
-            )
+            await verify_server(mock_db_session, sample_server, miner_hotkey, server_args.gpus)
 
     # Verify database operations
     mock_db_session.add.assert_called_once()
@@ -657,9 +658,7 @@ async def test_register_server_integrity_error(
                         is_valid=True,
                     )
                     with pytest.raises(ServerRegistrationError):
-                        await register_server(
-                            mock_db_session, server_args, miner_hotkey
-                        )
+                        await register_server(mock_db_session, server_args, miner_hotkey)
 
     mock_db_session.rollback.assert_called_once()
 
@@ -754,6 +753,7 @@ async def test_list_servers_success(mock_db_session):
             server_id="server-1",
             ip=TEST_SERVER_IP,
             miner_hotkey=miner_hotkey,
+            name="vm-1",
             created_at=datetime.now(timezone.utc),
             updated_at=None,
         ),
@@ -761,6 +761,7 @@ async def test_list_servers_success(mock_db_session):
             server_id="server-2",
             ip="192.168.0.2",
             miner_hotkey=miner_hotkey,
+            name="vm-2",
             created_at=datetime.now(timezone.utc),
             updated_at=None,
         ),
@@ -795,14 +796,23 @@ async def test_list_servers_empty(mock_db_session):
 
 @pytest.mark.asyncio
 async def test_delete_server_success(mock_db_session, sample_server):
-    """Test successful server deletion (marking as inactive)."""
+    """Test successful server deletion (clears LUKS config then deletes server)."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
 
-    with patch("api.server.service.check_server_ownership", return_value=sample_server):
+    with (
+        patch("api.server.service.check_server_ownership", return_value=sample_server),
+        patch(
+            "api.server.service.delete_luks_passphrases_for_server",
+            new_callable=AsyncMock,
+        ) as mock_delete_luks,
+    ):
         result = await delete_server(mock_db_session, server_id, miner_hotkey)
 
         assert result is True
+        mock_delete_luks.assert_called_once_with(
+            mock_db_session, sample_server.miner_hotkey, sample_server.name
+        )
         mock_db_session.delete.assert_called_once()
         mock_db_session.commit.assert_called_once()
 
@@ -818,6 +828,132 @@ async def test_delete_server_not_found(mock_db_session):
     ):
         with pytest.raises(ServerNotFoundError):
             await delete_server(mock_db_session, server_id, miner_hotkey)
+
+
+# update_server_vm_name (sync server names) tests
+
+
+@pytest.mark.asyncio
+async def test_get_server_by_name_success(mock_db_session, sample_server):
+    """Test get_server_by_name returns server when found."""
+    miner_hotkey = sample_server.miner_hotkey
+    server_name = sample_server.name
+    mock_result = Mock()
+    mock_result.scalar_one_or_none.return_value = sample_server
+    mock_db_session.execute.return_value = mock_result
+
+    result = await get_server_by_name(mock_db_session, miner_hotkey, server_name)
+
+    assert result == sample_server
+
+
+@pytest.mark.asyncio
+async def test_get_server_by_name_not_found(mock_db_session):
+    """Test get_server_by_miner_and_vm raises when server not found."""
+    mock_result = Mock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_db_session.execute.return_value = mock_result
+
+    with pytest.raises(ServerNotFoundError) as exc_info:
+        await get_server_by_name(mock_db_session, "5FTestHotkey123", "nonexistent-vm")
+    assert "nonexistent-vm" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_update_server_name_success(mock_db_session, sample_server):
+    """Test update_server_name updates name and returns server."""
+    server_id = sample_server.server_id
+    miner_hotkey = sample_server.miner_hotkey
+    new_name = "my-actual-vm-name"
+
+    with patch("api.server.service.check_server_ownership", return_value=sample_server):
+        result = await update_server_name(mock_db_session, miner_hotkey, server_id, new_name)
+
+    assert result.name == new_name
+    mock_db_session.commit.assert_called_once()
+    mock_db_session.refresh.assert_called_once_with(sample_server)
+
+
+@pytest.mark.asyncio
+async def test_update_server_name_idempotent(mock_db_session, sample_server):
+    """Test update_server_name is idempotent when name unchanged."""
+    server_id = sample_server.server_id
+    miner_hotkey = sample_server.miner_hotkey
+    existing_name = sample_server.name
+
+    with patch("api.server.service.check_server_ownership", return_value=sample_server):
+        result = await update_server_name(mock_db_session, miner_hotkey, server_id, existing_name)
+
+    assert result == sample_server
+    mock_db_session.commit.assert_not_called()
+    mock_db_session.refresh.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_server_name_not_found(mock_db_session):
+    """Test update_server_vm_name raises when server not found."""
+    with patch(
+        "api.server.service.check_server_ownership",
+        side_effect=ServerNotFoundError("nonexistent-server"),
+    ):
+        with pytest.raises(ServerNotFoundError):
+            await update_server_name(
+                mock_db_session,
+                "5FTestHotkey123",
+                "nonexistent-server",
+                "new-vm-name",
+            )
+
+
+@pytest.mark.asyncio
+async def test_update_server_name_conflict(mock_db_session, sample_server):
+    """Test update_server_vm_name raises 409 when vm_name already in use."""
+    from fastapi import HTTPException
+
+    server_id = sample_server.server_id
+    miner_hotkey = sample_server.miner_hotkey
+    new_vm_name = "taken-vm-name"
+
+    with patch("api.server.service.check_server_ownership", return_value=sample_server):
+        mock_db_session.commit.side_effect = IntegrityError("conflict", None, None)
+        with pytest.raises(HTTPException) as exc_info:
+            await update_server_name(mock_db_session, miner_hotkey, server_id, new_vm_name)
+    assert exc_info.value.status_code == 409
+    mock_db_session.rollback.assert_called_once()
+
+
+# LUKS passphrase tests
+
+
+@pytest.mark.asyncio
+async def test_sync_luks_passphrase(mock_db_session, mock_redis_client):
+    """Test POST LUKS sync: validates token, calls sync_server_luks_passphrases, consumes token."""
+    boot_token = "test-boot-token"
+    hotkey = "5FTestHotkey123"
+    vm_name = "test-vm"
+    volume_names = ["storage", "cache"]
+    rekey = ["cache"]
+
+    with (
+        patch(
+            "api.server.service._validate_boot_token_for_luks",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "api.server.service.sync_server_luks_passphrases",
+            AsyncMock(return_value={"storage": "pass1", "cache": "pass2_new"}),
+        ) as mock_sync,
+        patch("api.server.service.settings") as mock_settings,
+    ):
+        mock_settings.redis_client.delete = AsyncMock(return_value=1)
+        result = await process_luks_passphrase_request(
+            mock_db_session, boot_token, hotkey, vm_name, volume_names, rekey_volume_names=rekey
+        )
+        assert result == {"storage": "pass1", "cache": "pass2_new"}
+        mock_sync.assert_called_once_with(
+            mock_db_session, hotkey, vm_name, volume_names, rekey_volume_names=rekey
+        )
+        mock_settings.redis_client.delete.assert_called_once()
 
 
 # Edge Cases and Error Handling Tests
@@ -838,9 +974,7 @@ async def test_validate_nonce_invalid_format(mock_settings):
     mock_settings.redis_client.get.return_value = b"\xff\xfe\xfd"
 
     with pytest.raises(NonceError, match="Invalid nonce format"):
-        await validate_and_consume_nonce(
-            TEST_GPU_NONCE, TEST_SERVER_IP, NoncePurpose.BOOT
-        )
+        await validate_and_consume_nonce(TEST_GPU_NONCE, TEST_SERVER_IP, NoncePurpose.BOOT)
 
 
 @pytest.mark.asyncio
@@ -874,9 +1008,7 @@ async def test_register_server_general_exception(
                         is_valid=True,
                     )
                     with pytest.raises(ServerRegistrationError):
-                        await register_server(
-                            mock_db_session, server_args, miner_hotkey
-                        )
+                        await register_server(mock_db_session, server_args, miner_hotkey)
 
     mock_db_session.rollback.assert_called_once()
 
@@ -1185,9 +1317,7 @@ async def test_multiple_nonce_operations_concurrent(mock_settings):
         # Create multiple nonces concurrently
         import asyncio
 
-        tasks = [
-            create_nonce(TEST_SERVER_IP, NoncePurpose.BOOT) for _ in range(5)
-        ]
+        tasks = [create_nonce(TEST_SERVER_IP, NoncePurpose.BOOT) for _ in range(5)]
         results = await asyncio.gather(*tasks)
 
         # All should succeed
@@ -1410,9 +1540,7 @@ async def test_runtime_attestation_database_rollback_on_error(
 
 
 @pytest.mark.asyncio
-async def test_verify_quote_with_different_quote_types(
-    mock_verify_measurements
-):
+async def test_verify_quote_with_different_quote_types(mock_verify_measurements):
     """Test quote verification with different quote implementations."""
     boot_result = TdxVerificationResult(
         mrtd="a" * 96,
