@@ -307,6 +307,21 @@ async def _invoke(
             status_code=status.HTTP_404_NOT_FOUND, detail="No matching chute found!"
         )
 
+    # Check if the chute is disabled.
+    if chute.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="This chute is currently disabled.",
+        )
+
+    # Check X-TEE-Only header - if set to true, require TEE-enabled chute
+    tee_only_header = request.headers.get("X-TEE-Only", "").lower()
+    if tee_only_header == "true" and not chute.tee:
+        raise HTTPException(
+            status_code=status.HTTP_426_UPGRADE_REQUIRED,
+            detail="This chute does not have TEE enabled. Use the /teeify endpoint to promote the chute to TEE, or remove the X-TEE-Only header.",
+        )
+
     quota_date = date.today()
     if chute.discount == 1.0:
         request.state.free_invocation = True
@@ -354,6 +369,7 @@ async def _invoke(
             "689d2caa-01c1-5de1-ba69-39c5398be0c6",
             "3048cf8d-67de-5a6d-9fdd-18ac9c560c05",
             "391c8d5f-0d84-51fe-85cf-984ea6d7e49e",
+            "6d5ac865-d053-56b6-bd56-b1919f743be4",
         ]:
             logger.warning(
                 f"Attempt to invoke {chute.chute_id=} {chute.name=} from openrouter free account."
@@ -916,14 +932,8 @@ async def hostname_invocation(
                 payload["continue_final_message"] = False
             logger.warning("Resolved continue_final_message/add_generation_prompt conflict")
 
-        # Disable logprobs for now on 3.2* models.
-        if model in (
-            "deepseek-ai/DeepSeek-V3.2-Speciale",
-            "deepseek-ai/DeepSeek-V3.2-Speciale-TEE",
-            "deepseek-ai/DeepSeek-V3.2",
-            "deepseek-ai/DeepSeek-V3.2-TEE",
-            "deepseek-ai/DeepSeek-V3.2-Exp",
-        ):
+        # Disable logprobs for all models, for now - 2026-01-29 JD
+        if "affine" not in model.lower():
             payload.pop("logprobs", None)
             payload.pop("top_logprobs", None)
 

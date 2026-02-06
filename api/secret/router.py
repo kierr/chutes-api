@@ -14,6 +14,7 @@ from typing import Optional
 from api.chute.schemas import Chute
 from api.secret.schemas import Secret, SecretArgs
 from api.secret.response import SecretResponse
+from api.util import is_integrated_subnet
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.payment.util import encrypt_secret
@@ -160,6 +161,15 @@ async def create_secret(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Banned secret key: {args.key}",
+        )
+
+    if is_integrated_subnet(chute) and args.key.upper() not in [
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+    ]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only HF_TOKEN/HUGGING_FACE_HUB_TOKEN secrets are allowed for integrated subnet chutes",
         )
 
     encrypted_value = await encrypt_secret(args.value)

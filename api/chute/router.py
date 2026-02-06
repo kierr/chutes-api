@@ -48,8 +48,18 @@ from api.chute.util import (
     get_mtoken_price,
     calculate_effective_compute_multiplier,
     get_manual_boosts,
+    invalidate_chute_cache,
+    update_usage_data,
 )
-from api.bounty.util import get_bounty_info, get_bounty_infos, delete_bounty
+from api.bounty.util import (
+    get_bounty_info,
+    get_bounty_infos,
+    delete_bounty,
+    create_bounty_if_not_exists,
+    get_bounty_amount,
+    send_bounty_notification,
+    set_chute_disabled,
+)
 from api.instance.schemas import Instance
 from api.instance.util import get_chute_target_manager
 from api.user.schemas import User, PriceOverride
@@ -81,6 +91,7 @@ from api.util import (
 from api.affine import check_affine_code
 from api.guesser import guesser
 from aiocache import cached, Cache
+from api.chute.teeify import transform_for_tee
 
 router = APIRouter()
 
@@ -90,11 +101,15 @@ async def _inject_current_estimated_price(chute: Chute, response: ChuteResponse)
     Inject the current estimated price data into a response.
     """
     if chute.standard_template == "vllm":
-        per_million_in, per_million_out = await get_mtoken_price("global", chute.chute_id)
+        per_million_in, per_million_out, cache_discount = await get_mtoken_price(
+            "global", chute.chute_id
+        )
+        input_cache_read = per_million_in * (1 - cache_discount)
         response.current_estimated_price = {
             "per_million_tokens": {
                 "input": {"usd": per_million_in},
                 "output": {"usd": per_million_out},
+                "input_cache_read": {"usd": input_cache_read},
             }
         }
         tao_usd = await get_fetcher().get_price("tao")
@@ -104,6 +119,9 @@ async def _inject_current_estimated_price(chute: Chute, response: ChuteResponse)
             )
             response.current_estimated_price["per_million_tokens"]["output"]["tao"] = (
                 per_million_out / tao_usd
+            )
+            response.current_estimated_price["per_million_tokens"]["input_cache_read"]["tao"] = (
+                input_cache_read / tao_usd
             )
     elif chute.standard_template == "diffusion":
         hourly = await selector_hourly_price(chute.node_selector)
@@ -750,6 +768,11 @@ async def warm_up_chute(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Chute not found, or does not belong to you",
         )
+    if chute.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="This chute is currently disabled.",
+        )
     if not current_user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1122,13 +1145,13 @@ async def _deploy_chute(
                 image, min_sglang_version=2025111902, min_vllm_version=2026011303
             )
             or image.user_id != await chutes_user_id()
-            or semcomp(image.chutes_version, "0.5.1") < 0
+            or semcomp(image.chutes_version, "0.5.4") < 0
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    'Must use image="chutes/sglang:nightly-2025111902.p1" or nightly tag after 20260120*, '
-                    'or image="chutes/vllm:nightly-2026012000" (or more recent nightly vllm) for affine deployments.'
+                    'Must use image="chutes/sglang:nightly-2025111902.p2" or nightly tag after 20260206*, '
+                    'or image="chutes/vllm:nightly-20260206*" (or more recent nightly vllm) for affine deployments.'
                 ),
             )
 
@@ -1152,6 +1175,13 @@ async def _deploy_chute(
 
     old_version = None
     if chute:
+        # Prevent modifications to immutable chutes
+        if chute.immutable:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This chute is immutable and cannot be modified. Only deletion is allowed.",
+            )
+
         # Create a rolling update object so we can gracefully restart/recreate.
         permitted = {}
         for inst in chute.instances:
@@ -1310,14 +1340,13 @@ async def _deploy_chute(
             f"DEPLOYMENTFEE: {deployment_fee} for {current_user.username=} with "
             f"{chute_args.node_selector=} of {chute_args.name=}, new balance={current_user.balance - deployment_fee}"
         )
-        pipeline = settings.redis_client.pipeline()
-        chute_id = str(
-            uuid.uuid5(uuid.NAMESPACE_OID, f"{current_user.username}::chute::{chute_args.name}")
+        await update_usage_data(
+            current_user.user_id,
+            chute.chute_id,
+            deployment_fee,
+            metrics=None,
+            compute_time=0.0,
         )
-        key = f"balance:{current_user.user_id}:{chute_id}"
-        pipeline.hincrbyfloat(key, "amount", deployment_fee)
-        pipeline.hset(key, "timestamp", int(time.time()))
-        await pipeline.execute()
 
     if old_version:
         if use_rolling_update:
@@ -1508,6 +1537,13 @@ async def deploy_chute(
         logger.success(
             f"Affine deployment initiated: {chute_args.name=} from {current_user.hotkey=}, "
             "code check and prelim model config/node selector config passed."
+        )
+
+    # Affine chutes cannot be created with tee=True directly - must use /teeify endpoint
+    if "affine" in chute_args.name.lower() and chute_args.tee:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Affine chutes cannot be created with tee=True. Deploy without TEE first, then use the /teeify endpoint to promote to TEE.",
         )
 
     # No-DoS-Plz.
@@ -1765,6 +1801,128 @@ async def easy_deploy_diffusion_chute(
     return await _deploy_chute(chute_args, db, current_user)
 
 
+@router.put("/{chute_id}/teeify", response_model=ChuteResponse)
+async def teeify_chute(
+    chute_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user()),
+):
+    """
+    Convert an affine chute to a TEE-enabled version.
+    """
+    # Validate chute_id is a UUID
+    try:
+        uuid.UUID(chute_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Must use chute UUID for teeify.",
+        )
+
+    # Find the chute
+    chute = (
+        (
+            await db.execute(
+                select(Chute)
+                .where(Chute.chute_id == chute_id)
+                .options(selectinload(Chute.instances))
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+
+    if not chute:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chute not found",
+        )
+
+    # Only subnet admins can promote to TEE
+    if not subnet_role_accessible(chute, current_user, admin=True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only subnet admins can promote chutes to TEE",
+        )
+
+    # Validate the chute has "affine" in its name
+    if "affine" not in chute.name.lower():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only chutes with 'affine' in the name can be TEE-ified",
+        )
+
+    # Check if already TEE-ified
+    if chute.tee:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Chute already has TEE enabled",
+        )
+
+    # Transform the code and node_selector for TEE
+    try:
+        new_code, new_node_selector = transform_for_tee(chute.code, chute.node_selector)
+    except Exception as exc:
+        logger.error(f"Failed to transform code for TEE: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to transform code for TEE: {str(exc)}",
+        )
+
+    # Delete existing instances
+    for inst in chute.instances:
+        logger.info(
+            f"Deleting instance for TEE promotion: {inst.instance_id=} {inst.miner_hotkey=}"
+        )
+        await db.delete(inst)
+        await notify_deleted(inst, "promoted to TEE")
+        await db.execute(
+            text(
+                "UPDATE instance_audit SET deletion_reason = :reason, valid_termination = true WHERE instance_id = :instance_id"
+            ),
+            {"instance_id": inst.instance_id, "reason": "promoted to TEE"},
+        )
+
+    # Update the chute
+    chute.code = new_code
+    chute.node_selector = new_node_selector
+    chute.tee = True
+    chute.immutable = True
+    chute.version = str(
+        uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.image_id}:{chute.image.patch_version}:{new_code}")
+    )
+    chute.updated_at = func.now()
+
+    await db.commit()
+    await db.refresh(chute)
+
+    # Notify miners about the update
+    await settings.redis_client.publish(
+        "miner_broadcast",
+        json.dumps(
+            {
+                "reason": "chute_updated",
+                "data": {
+                    "chute_id": chute.chute_id,
+                    "version": chute.version,
+                    "job_only": not chute.cords,
+                },
+            }
+        ).decode(),
+    )
+
+    logger.success(f"TEE-ified chute: {chute.chute_id} {chute.name}")
+    response = ChuteResponse.from_orm(chute)
+    await _inject_current_estimated_price(chute, response)
+    await create_bounty_if_not_exists(chute.chute_id)
+    amount = await get_bounty_amount(chute_id)
+    if amount:
+        await send_bounty_notification(chute_id, amount)
+    bounty_info = await get_bounty_info(chute.chute_id)
+    await _inject_effective_compute_multiplier(chute, response, bounty_info=bounty_info)
+    return response
+
+
 @router.put("/{chute_id_or_name:path}", response_model=ChuteResponse)
 async def update_common_attributes(
     chute_id_or_name: str,
@@ -1792,6 +1950,14 @@ async def update_common_attributes(
         .unique()
         .scalar_one_or_none()
     )
+
+    # Prevent modifications to immutable chutes
+    if chute.immutable:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This chute is immutable and cannot be modified. Only deletion is allowed.",
+        )
+
     if args.tagline and args.tagline.strip():
         chute.tagline = args.tagline
     if args.readme and args.readme.strip():
@@ -1800,6 +1966,39 @@ async def update_common_attributes(
         chute.tool_description = args.tool_description
     if args.logo_id:
         chute.logo_id = args.logo_id
+
+    # Handle disabled field
+    if args.disabled is not None:
+        chute.disabled = args.disabled
+
+        # Set the lightweight disabled flag in Redis for fast checks
+        await set_chute_disabled(chute.chute_id, args.disabled)
+
+        # Invalidate caches immediately so other processes see the updated state
+        await invalidate_chute_cache(chute.chute_id, chute.name)
+
+        # If disabling a private chute, terminate all instances with valid_termination=true
+        if args.disabled and not chute.public:
+            # Delete any active bounty to prevent new instances from spinning up
+            await delete_bounty(chute.chute_id)
+
+            instance_ids = [inst.instance_id for inst in chute.instances]
+            if instance_ids:
+                logger.warning(
+                    f"Disabling private chute {chute.chute_id} ({chute.name}), "
+                    f"terminating {len(instance_ids)} instances"
+                )
+                await db.execute(
+                    text(
+                        "UPDATE instance_audit SET valid_termination = true, "
+                        "deletion_reason = 'chute disabled' WHERE instance_id = ANY(:instance_ids)"
+                    ),
+                    {"instance_ids": instance_ids},
+                )
+                for inst in chute.instances:
+                    await db.delete(inst)
+                    await notify_deleted(inst, "chute disabled")
+
     await db.commit()
     await db.refresh(chute)
     return chute

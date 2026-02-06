@@ -37,6 +37,7 @@ from api.constants import (
     INTEGRATED_SUBNET_BONUS,
     TEE_BONUS,
     INTEGRATED_SUBNETS,
+    DEFAULT_CACHE_DISCOUNT,
 )
 from api.bounty.util import get_bounty_info
 from api.database import get_session, get_inv_session
@@ -56,6 +57,7 @@ from api.util import (
     decrypt_instance_response,
     encrypt_instance_request,
     notify_deleted,
+    nightly_gte,
     image_supports_cllmv,
     extract_hf_model_name,
     has_legacy_private_billing,
@@ -158,7 +160,7 @@ async def update_usage_data(
     Push usage data metrics to redis for async processing.
 
     Uses compact format to minimize network/storage overhead:
-    - Short keys: u=user_id, c=chute_id, a=amount, i=input_tokens, o=output_tokens, t=compute_time, s=timestamp
+    - Short keys: u=user_id, c=chute_id, a=amount, i=input_tokens, o=output_tokens, x=cached_tokens, t=compute_time, s=timestamp
     - compute_time rounded to 4 decimal places (0.1ms precision)
     - count omitted (always 1, handled by consumer)
     """
@@ -174,6 +176,7 @@ async def update_usage_data(
             "a": balance_used,
             "i": metrics.get("it", 0) if metrics else 0,
             "o": metrics.get("ot", 0) if metrics else 0,
+            "x": metrics.get("ct", 0) if metrics else 0,
             "t": round(compute_time, 4),
             "s": int(time.time()),
         }
@@ -607,6 +610,21 @@ async def get_one(name_or_id: str, nonce: int = None):
     return await _get_one(name_or_id, nonce=nonce)
 
 
+async def invalidate_chute_cache(chute_id: str, chute_name: str = None):
+    """
+    Invalidate all caches for a chute (both by ID and by name).
+    """
+    # Clear Redis cache
+    await settings.redis_client.delete(f"_chute:{chute_id}")
+    if chute_name:
+        await settings.redis_client.delete(f"_chute:{chute_name}")
+
+    # Clear in-memory alru_cache
+    _get_one.cache_invalidate(chute_id)
+    if chute_name:
+        _get_one.cache_invalidate(chute_name)
+
+
 @alru_cache(maxsize=5000, ttl=300)
 async def is_shared(chute_id: str, user_id: str):
     """
@@ -765,7 +783,7 @@ async def _invoke_one(
 
                     # CLLMV check.
                     if (
-                        (random.random() <= 0.005 or chunk_idx <= 3)
+                        (random.random() <= 0.01 or chunk_idx <= 3)
                         and image_supports_cllmv(chute.image)
                         and target.version == chute.version
                         and "model" in data
@@ -774,6 +792,7 @@ async def _invoke_one(
                         model_identifier = (
                             chute.name
                             if chute.image.name == "vllm"
+                            or nightly_gte(chute.image.tag, 2026020200)
                             else extract_hf_model_name(chute.chute_id, chute.code)
                         )
                         verification_token = data.get("chutes_verification")
@@ -791,20 +810,36 @@ async def _invoke_one(
                                         and choice["delta"]
                                         and isinstance(choice["delta"], dict)
                                     ):
-                                        text = choice["delta"].get("content")
-                                        if not text:
-                                            text = choice["delta"].get("reasoning_content")
+                                        for content_key in [
+                                            "content",
+                                            "reasoning",
+                                            "reasoning_content",
+                                        ]:
+                                            text = choice["delta"].get(content_key)
+                                            if text:
+                                                break
                                 else:
                                     text = choice.get("text")
 
                         # Verify the hash.
                         if text and verification_token:
+                            challenge_val = target.config_id
+                            if (
+                                semcomp(target.chutes_version, "0.5.3") >= 0
+                                and isinstance(chute.image.package_hashes, dict)
+                                and chute.image.package_hashes.get("package") == chute.image.name
+                            ):
+                                challenge_val = (
+                                    target.config_id
+                                    + target.rint_nonce
+                                    + chute.image.package_hashes["hash"]
+                                )
                             if not cllmv_validate(
                                 data.get("id") or "bad",
                                 data.get("created") or 0,
                                 text,
                                 verification_token,
-                                target.config_id,
+                                challenge_val,
                                 model_identifier,
                                 chute.revision,
                             ):
@@ -849,6 +884,7 @@ async def _invoke_one(
                     logger.warning(f"Estimated the prompt tokens: {prompt_tokens} for {chute.name}")
 
                 # Use usage data from the engine, but sanity check it...
+                cached_tokens = 0
                 if last_chunk and b'"usage"' in last_chunk:
                     try:
                         usage_obj = json.loads(last_chunk[6:].decode())
@@ -875,6 +911,16 @@ async def _invoke_one(
                                 )
                             else:
                                 completion_tokens = claimed_completion_tokens
+
+                        # Extract cached tokens from prompt_tokens_details if present.
+                        prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+                        cached_tokens = prompt_tokens_details.get("cached_tokens") or 0
+                        if cached_tokens > prompt_tokens:
+                            logger.warning(
+                                f"Cached tokens exceeded prompt tokens [stream]: {cached_tokens=} > {prompt_tokens=} "
+                                f"hotkey={target.miner_hotkey} instance_id={target.instance_id} chute={chute.name}"
+                            )
+                            cached_tokens = prompt_tokens
                     except Exception as exc:
                         logger.warning(
                             f"Error checking metrics for {chute.chute_id=} {chute.name=}: {exc}"
@@ -882,6 +928,7 @@ async def _invoke_one(
 
                 metrics["it"] = max(0, prompt_tokens or 0)
                 metrics["ot"] = max(0, completion_tokens or 0)
+                metrics["ct"] = max(0, cached_tokens or 0)
                 metrics["ctps"] = round((metrics["it"] + metrics["ot"]) / total_time, 3)
                 metrics["tps"] = round(metrics["ot"] / total_time, 3)
                 metrics["tt"] = round(total_time, 3)
@@ -958,9 +1005,9 @@ async def _invoke_one(
                         logger.warning(
                             f"NOSTREAM_BADMODEL: {chute.name=} {chute.chute_id=} response had invalid/missing model: {target.instance_id=}: json_data['model']={json_data.get('model')}"
                         )
-                        raise EmptyLLMResponse(
-                            f"BAD_RESPONSE {target.instance_id=} {chute.name} returned invalid chunk (model name)"
-                        )
+                        # raise EmptyLLMResponse(
+                        #    f"BAD_RESPONSE {target.instance_id=} {chute.name} returned invalid chunk (model name)"
+                        # )
 
                     # New verification hash.
                     if (
@@ -971,6 +1018,7 @@ async def _invoke_one(
                         model_identifier = (
                             chute.name
                             if chute.image.name == "vllm"
+                            or nightly_gte(chute.image.tag, 2026020200)
                             else extract_hf_model_name(chute.chute_id, chute.code)
                         )
                         verification_token = json_data.get("chutes_verification")
@@ -982,14 +1030,27 @@ async def _invoke_one(
                             elif isinstance(choice.get("message"), dict):
                                 text = choice["message"].get("content")
                                 if not text and chute.image.name != "sglang":
-                                    text = choice["message"].get("reasoning_content")
+                                    text = choice["message"].get(
+                                        "reasoning", choice["message"].get("reasoning_content")
+                                    )
                         if text:
+                            challenge_val = target.config_id
+                            if (
+                                semcomp(target.chutes_version, "0.5.3") >= 0
+                                and isinstance(chute.image.package_hashes, dict)
+                                and chute.image.package_hashes.get("package") == chute.image.name
+                            ):
+                                challenge_val = (
+                                    target.config_id
+                                    + target.rint_nonce
+                                    + chute.image.package_hashes["hash"]
+                                )
                             if not verification_token or not cllmv_validate(
                                 json_data.get("id") or "bad",
                                 json_data.get("created") or 0,
                                 text,
                                 verification_token,
-                                target.config_id,
+                                challenge_val,
                                 model_identifier,
                                 chute.revision,
                             ):
@@ -1008,9 +1069,10 @@ async def _invoke_one(
                     output_text = None
                     if plain_path == "chat":
                         try:
-                            output_text = json_data["choices"][0]["message"]["content"] or ""
-                            reasoning_content = json_data["choices"][0]["message"].get(
-                                "reasoning_content"
+                            message_obj = json_data["choices"][0]["message"]
+                            output_text = message_obj.get("content") or ""
+                            reasoning_content = message_obj.get(
+                                "reasoning", message_obj.get("reasoning_content")
                             )
                             if reasoning_content:
                                 output_text += " " + reasoning_content
@@ -1024,6 +1086,7 @@ async def _invoke_one(
                     if not output_text:
                         output_text = json.dumps(json_data).decode()
                     completion_tokens = await count_str_tokens(output_text)
+                    cached_tokens = 0
                     if (usage := json_data.get("usage")) is not None:
                         if claimed_completion_tokens := usage.get("completion_tokens", 0):
                             if claimed_completion_tokens > completion_tokens * 10:
@@ -1041,6 +1104,16 @@ async def _invoke_one(
                                 )
                             else:
                                 prompt_tokens = claimed_prompt_tokens
+
+                        # Extract cached tokens from prompt_tokens_details if present.
+                        prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+                        cached_tokens = prompt_tokens_details.get("cached_tokens") or 0
+                        if cached_tokens > prompt_tokens:
+                            logger.warning(
+                                f"Cached tokens exceeded prompt tokens [nostream]: {cached_tokens=} > {prompt_tokens=} "
+                                f"hotkey={target.miner_hotkey} instance_id={target.instance_id} chute={chute.name}"
+                            )
+                            cached_tokens = prompt_tokens
                     else:
                         logger.warning(
                             f"Response from {target.instance_id=} {target.miner_hotkey=} of {chute.chute_id=} {chute.name=} did not include usage data!"
@@ -1053,6 +1126,7 @@ async def _invoke_one(
                     metrics["tokens"] = completion_tokens
                     metrics["it"] = prompt_tokens
                     metrics["ot"] = completion_tokens
+                    metrics["ct"] = cached_tokens
                     metrics["ctps"] = round((metrics["it"] + metrics["ot"]) / total_time, 3)
                     metrics["tps"] = round(metrics["ot"] / total_time, 3)
                     metrics["tt"] = round(total_time, 3)
@@ -1248,13 +1322,27 @@ async def invoke(
 
                     # Per megatoken pricing.
                     if chute.standard_template == "vllm" and metrics:
-                        per_million_in, per_million_out = await get_mtoken_price(
+                        per_million_in, per_million_out, cache_discount = await get_mtoken_price(
                             user_id, chute.chute_id
                         )
-                        balance_used = (metrics.get("it", 0) or 0) / 1000000.0 * per_million_in + (
-                            metrics.get("ot", 0) or 0
-                        ) / 1000000.0 * per_million_out
+                        prompt_tokens = metrics.get("it", 0) or 0
+                        output_tokens = metrics.get("ot", 0) or 0
+                        cached_tokens = metrics.get("ct", 0) or 0
+                        # Cached tokens get a discount on input token pricing.
+                        balance_used = (
+                            prompt_tokens / 1000000.0 * per_million_in
+                            - cached_tokens / 1000000.0 * per_million_in * cache_discount
+                            + output_tokens / 1000000.0 * per_million_out
+                        )
                         override_applied = True
+
+                        # Log cache hit info.
+                        if cached_tokens > 0 and prompt_tokens > 0:
+                            cache_hit_rate = round(cached_tokens / prompt_tokens * 100, 1)
+                            logger.info(
+                                f"Cache hit: model={chute.name}:{chute.chute_id} prompt_tokens={prompt_tokens} user={user.user_id} "
+                                f"cached_tokens={cached_tokens} hit_rate={cache_hit_rate}% discount={cache_discount}"
+                            )
 
                     elif (
                         price_override := await PriceOverride.get(user_id, chute.chute_id)
@@ -1452,7 +1540,6 @@ async def invoke(
                     error_message = "KEY_EXCHANGE_REQUIRED"
                 elif isinstance(exc, EmptyLLMResponse):
                     error_message = "EMPTY_STREAM"
-                    instant_delete = True
                 elif isinstance(exc, InvalidCLLMV):
                     error_message = "CLLMV_FAILURE"
                     instant_delete = True
@@ -1613,17 +1700,19 @@ async def load_llm_details(chute, target):
             return info["data"][0]
 
 
-async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float]:
+async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float, float]:
     """
-    Get the per-million token price for an LLM.
+    Get the per-million token price for an LLM and the cache discount.
+
+    Returns: (per_million_in, per_million_out, cache_discount)
     """
-    cache_key = f"mtokenprice:{user_id}:{chute_id}"
+    cache_key = f"mtokenprice3:{user_id}:{chute_id}"
     cached = await settings.redis_client.get(cache_key)
     if cached is not None:
         try:
             parts = cached.decode().split(":")
-            if len(parts) == 2:
-                return float(parts[0]), float(parts[1])
+            if len(parts) == 3:
+                return float(parts[0]), float(parts[1]), float(parts[2])
             await settings.redis_client.delete(cache_key)
         except Exception:
             await settings.redis_client.delete(cache_key)
@@ -1631,6 +1720,7 @@ async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float]:
     # Inject the pricing information, first by checking price overrides, then
     # using the standard node-selector based calculation.
     per_million_in, per_million_out = None, None
+    cache_discount = DEFAULT_CACHE_DISCOUNT
     override = await PriceOverride.get(user_id, chute_id)
     user_discount = None
     if not override or override.user_id != user_id:
@@ -1647,6 +1737,8 @@ async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float]:
             per_million_out = override.per_million_out
             if user_discount:
                 per_million_out -= per_million_out * user_discount
+        if override.cache_discount is not None and 0 <= override.cache_discount <= 1:
+            cache_discount = override.cache_discount
 
     # Standard compute-based calcs.
     if per_million_in is None or per_million_out is None:
@@ -1670,8 +1762,10 @@ async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float]:
 
     per_million_in = round(per_million_in, 2)
     per_million_out = round(per_million_out, 2)
-    await settings.redis_client.set(cache_key, f"{per_million_in}:{per_million_out}", ex=300)
-    return per_million_in, per_million_out
+    await settings.redis_client.set(
+        cache_key, f"{per_million_in}:{per_million_out}:{cache_discount}", ex=300
+    )
+    return per_million_in, per_million_out, cache_discount
 
 
 async def get_and_store_llm_details(chute_id: str):
@@ -1695,13 +1789,18 @@ async def get_and_store_llm_details(chute_id: str):
             return
 
         # Load the price per million tokens (in USD).
-        per_million_in, per_million_out = await get_mtoken_price("global", chute_id)
+        per_million_in, per_million_out, cache_discount = await get_mtoken_price("global", chute_id)
+        input_cache_read = per_million_in * (1 - cache_discount)
 
         # Inject the tao price.
-        price = {"input": {"usd": per_million_in}, "output": {"usd": per_million_out}}
+        price = {
+            "input": {"usd": per_million_in},
+            "output": {"usd": per_million_out},
+            "input_cache_read": {"usd": input_cache_read},
+        }
         tao_usd = await get_fetcher().get_price("tao")
         if tao_usd:
-            for key in ("input", "output"):
+            for key in ("input", "output", "input_cache_read"):
                 price[key]["tao"] = price[key]["usd"] / tao_usd
 
         instances = [inst for inst in chute.instances if inst.active and inst.verified]
@@ -1721,6 +1820,7 @@ async def get_and_store_llm_details(chute_id: str):
                 model_info["pricing"] = {
                     "prompt": per_million_in,
                     "completion": per_million_out,
+                    "input_cache_read": input_cache_read,
                 }
                 if chute.llm_detail and isinstance(chute.llm_detail.overrides, dict):
                     model_info.update(

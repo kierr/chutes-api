@@ -13,10 +13,9 @@ MAX_STRING_LENGTH = 1000
 MAX_AST_DEPTH = 20
 
 ALLOWED_ENV_VARS = {
+    "NO_PROXY",
     "VLLM_BATCH_INVARIANT",
-    "LMCACHE_USE_EXPERIMENTAL",
 }
-ALLOWED_ENV_VAR_PREFIXES = ("SGLANG_", "VLLM_", "LMCACHE_")
 ALLOWED_TEMPLATE_BUILDERS = {"build_sglang_chute", "build_vllm_chute"}
 
 DANGEROUS_BUILTINS = {
@@ -80,11 +79,7 @@ DANGEROUS_BUILTINS = {
 
 
 def is_allowed_env_var(env_key: str) -> bool:
-    if "trust" in env_key.lower():
-        return False
-    if env_key in ALLOWED_ENV_VARS:
-        return True
-    return env_key.startswith(ALLOWED_ENV_VAR_PREFIXES)
+    return env_key in ALLOWED_ENV_VARS
 
 
 def is_os_environ_subscript(node: ast.Subscript) -> bool:
@@ -498,13 +493,49 @@ def check_affine_code(code: str) -> tuple[bool, str]:
                                                 False,
                                                 f"engine_args for {func_name} must be a string literal",
                                             )
-                                        if (
-                                            "trust_remote_code" in keyword.value.value
-                                            or "trust-remote-code" in keyword.value.value
-                                        ):
+                                        # Ban arguments that could allow arbitrary code execution
+                                        # These are checked as substrings
+                                        banned_args = [
+                                            # Trust flags
+                                            ("trust_remote_code", "trust-remote-code"),
+                                            (
+                                                "trust_request_chat_template",
+                                                "trust-request-chat-template",
+                                            ),
+                                            # Chat template injection
+                                            ("chat_template", "chat-template"),
+                                            (
+                                                "default_chat_template_kwargs",
+                                                "default-chat-template-kwargs",
+                                            ),
+                                            # Plugin/class loading (arbitrary code execution)
+                                            (
+                                                "logits_processor_pattern",
+                                                "logits-processor-pattern",
+                                            ),
+                                            ("logits_processors", "logits-processors"),
+                                            ("middleware", "middleware"),
+                                            ("tool_parser_plugin", "tool-parser-plugin"),
+                                            ("io_processor_plugin", "io-processor-plugin"),
+                                            ("reasoning_parser_plugin", "reasoning-parser-plugin"),
+                                            ("worker_cls", "worker-cls"),
+                                            ("worker_extension_cls", "worker-extension-cls"),
+                                            ("scheduler_cls", "scheduler-cls"),
+                                        ]
+                                        for underscore_form, dash_form in banned_args:
+                                            if (
+                                                underscore_form in keyword.value.value
+                                                or dash_form in keyword.value.value
+                                            ):
+                                                return (
+                                                    False,
+                                                    f"engine_args cannot contain '{underscore_form}' or '{dash_form}'",
+                                                )
+                                        # Can't override --config, because that can override almost everything else.
+                                        if "--config " in keyword.value.value:
                                             return (
                                                 False,
-                                                "engine_args string cannot contain 'trust_remote_code' or 'trust-remote-code'",
+                                                "engine_args cannot contain '--config'",
                                             )
                                         space_re = re.search(r"(?<=\S)--", keyword.value.value)
                                         if space_re:

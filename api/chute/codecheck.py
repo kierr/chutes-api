@@ -41,7 +41,7 @@ def extract_response_json(text):
     interval=10,
     max_tries=7,
 )
-async def is_bad_code(code: str, model: str = "deepseek-ai/DeepSeek-R1") -> bool:
+async def is_bad_code(code: str, model: str = "deepseek-ai/DeepSeek-V3.2-TEE") -> bool:
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://llm.chutes.ai/v1/chat/completions",

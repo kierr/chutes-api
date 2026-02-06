@@ -645,6 +645,8 @@ def is_kubernetes_env(
             "PYTHONUNBUFFERED",
             "PYTHONIOENCODING",
             "PYTHONWARNINGS",
+            "PYTHONDONTWRITEBYTECODE",
+            "PYTHONNOUSERSITE",
         }
         banned = {
             "HTTP_PROXY",

@@ -9,6 +9,12 @@ import orjson as json
 from loguru import logger
 from typing import Optional
 from huggingface_hub import HfApi
+from huggingface_hub.utils import (
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+    GatedRepoError,
+    HfHubHTTPError,
+)
 from urllib.parse import urlparse
 from fastapi import APIRouter, Request, Response, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
@@ -146,15 +152,18 @@ def _fetch_repo_info_sync(repo_id: str, repo_type: str, revision: str, hf_token:
     Load huggingface repo info for cache validation.
     """
     api = HfApi(token=hf_token)
-    repo_files = api.list_repo_tree(
+    repo_items = api.list_repo_tree(
         repo_id=repo_id,
         revision=revision,
         repo_type=repo_type,
         recursive=True,
     )
     files = []
-    for item in repo_files:
+    directories = []
+    for item in repo_items:
+        # Directories don't have size, but have tree_id
         if not hasattr(item, "size"):
+            directories.append(item.path)
             continue
         file_info = {
             "path": item.path,
@@ -173,6 +182,7 @@ def _fetch_repo_info_sync(repo_id: str, repo_type: str, revision: str, hf_token:
         "repo_type": repo_type,
         "revision": revision,
         "files": files,
+        "directories": directories,
     }
 
 
@@ -208,6 +218,28 @@ async def get_hf_repo_info(
         result = await asyncio.to_thread(
             _fetch_repo_info_sync, repo_id, repo_type, revision, hf_token
         )
+    except RepositoryNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Repository '{repo_id}' not found on HuggingFace",
+        )
+    except RevisionNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Revision '{revision}' not found in repository '{repo_id}'",
+        )
+    except GatedRepoError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Repository '{repo_id}' is gated; valid HF token required",
+        )
+    except HfHubHTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied to '{repo_id}': invalid or missing credentials",
+            )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 

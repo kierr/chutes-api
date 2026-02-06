@@ -5,6 +5,7 @@ ORM definitions for images.
 import re
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship, validates
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import (
     Column,
     String,
@@ -33,6 +34,7 @@ class Image(Base):
     build_started_at = Column(DateTime(timezone=True))
     build_completed_at = Column(DateTime(timezone=True))
     inspecto = Column(String, nullable=True)
+    package_hashes = Column(JSONB, nullable=True)
 
     chutes = relationship("Chute", back_populates="image")
     logo = relationship("Logo", back_populates="images", lazy="joined")
