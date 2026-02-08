@@ -201,7 +201,14 @@ async def get_hf_content(model, revision, filename) -> tuple[str, str]:
 
 
 async def check_weight_files(
-    encrypted_slurp, model, revision, instances, weight_map, hard_failed, soft_failed
+    encrypted_slurp,
+    model,
+    revision,
+    instances,
+    weight_map,
+    hard_failed,
+    soft_failed,
+    max_duration=25.0,
 ):
     """
     Check the individual weight files.
@@ -296,9 +303,10 @@ async def check_weight_files(
                 logger.success(
                     f"Digest of {path} on {instance.instance_id=} of {model} is correct: [{start_byte}:{end_byte}] {expected_digest} {duration=}"
                 )
-                if duration > 5.0:
+                if duration > max_duration:
                     logger.warning(
-                        f"Duration to fetch model weight random offset exceeded expected duration: {duration=}"
+                        f"Duration to fetch model weight random offset exceeded expected duration: {max_duration=} "
+                        f"{instance.instance_id=} {instance.miner_hotkey=} {path=} {duration=}"
                     )
                     soft_failed.append(instance)
         except Exception as exc:
@@ -369,8 +377,10 @@ async def check_llm_weights(chute, instances):
         "model.safetensors.index.json",
         "config.json",
     ]
+    max_durations = {"model.safetensors.index.json": 90}
     weight_map = None
     for target_path in target_paths:
+        max_duration = max_durations.get(target_path) or 25.0
         incorrect = []
         digest_counts = {}
         expected_digest, expected_content = await get_hf_content(model_name, revision, target_path)
@@ -405,9 +415,10 @@ async def check_llm_weights(chute, instances):
                 logger.info(
                     f"Digest of {target_path} on {instance.instance_id=} of {model_name}: {digest} {duration=}"
                 )
-                if duration > 9.0:
+                if duration > max_duration:
                     logger.warning(
-                        f"Duration to fetch model weight map exceeded expected duration: {duration=}"
+                        f"Duration to fetch model weight map exceeded expected duration: {max_duration=} "
+                        f"{instance.instance_id=} {instance.miner_hotkey=} {target_path=} {duration=}"
                     )
                     soft_failed.append(instance)
             except Exception as exc:

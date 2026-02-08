@@ -287,6 +287,33 @@ async def _check_scalable_private(db, chute, miner):
     Special scaling logic for private chutes (without legacy billing).
     """
     chute_id = chute.chute_id
+
+    # Require the miner to have at least one activated public chute instance
+    # from one week ago or older before allowing private chute instances.
+    public_history_query = text("""
+        SELECT COUNT(*) AS public_count
+        FROM instance_audit ia
+        JOIN chutes c ON c.chute_id = ia.chute_id
+        WHERE ia.miner_hotkey = :hotkey
+          AND c.public IS TRUE
+          AND ia.activated_at IS NOT NULL
+          AND ia.activated_at <= NOW() - INTERVAL '7 days'
+    """)
+    public_result = (
+        await db.execute(public_history_query, {"hotkey": miner.hotkey})
+    ).mappings().first()
+    if not public_result or public_result["public_count"] == 0:
+        logger.warning(
+            f"PRIVATE_GATE: miner {miner.hotkey} denied private chute {chute_id}: "
+            f"no public chute instance activated >= 7 days ago"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You must have at least one public chute instance >= one week old creation timestamp to deploy private chutes"
+            ),
+        )
+
     query = text("""
         SELECT
             COUNT(*) AS total_count,

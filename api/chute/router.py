@@ -1028,6 +1028,11 @@ async def _deploy_chute(
     """
     Deploy a chute!
     """
+    if ("TEE" in chute_args.name or chute_args.name.lower().endswith("tee")) and not chute_args.tee:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Avoid using 'TEE' in the chute name unless tee=True in the chute definition",
+        )
     if chute_args.public and not current_user.has_role(Permissioning.public_model_deployment):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
