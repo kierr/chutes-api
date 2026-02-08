@@ -49,6 +49,7 @@ from api.secret.schemas import Secret
 from api.image.schemas import Image  # noqa
 from api.instance.schemas import (
     LaunchConfigArgs,
+    LegacyTeeLaunchConfigArgs,
     TeeLaunchConfigArgs,
     Instance,
     instance_nodes,
@@ -69,6 +70,15 @@ from api.instance.util import (
 from api.server.service import (
     validate_request_nonce,
     create_nonce,
+    get_instance_evidence,
+    verify_gpu_evidence,
+)
+from api.server.schemas import TeeInstanceEvidence
+from api.server.exceptions import (
+    InstanceNotFoundError,
+    ChuteNotTeeError,
+    NonceError,
+    GetEvidenceError,
 )
 from api.user.schemas import User
 from api.user.service import get_current_user, chutes_user_id, subnet_role_accessible
@@ -1292,12 +1302,111 @@ async def claim_tee_launch_config(
     # Verify TEE attestation evidence
     await verify_tee_chute(db, instance, launch_config, args.deployment_id, expected_nonce)
 
+    instance.deployment_id = args.deployment_id
+    await db.commit()
+    await db.refresh(instance)
+
     response = {"symmetric_key": instance.symmetric_key}
 
     if validator_pubkey:
         response["validator_pubkey"] = validator_pubkey
 
     return response
+
+
+@router.post("/launch_config/{config_id}/attest")
+async def validate_tee_launch_config_instance(
+    config_id: str,
+    args: LegacyTeeLaunchConfigArgs,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
+    expected_nonce: str = Depends(validate_request_nonce(NoncePurpose.BOOT)),
+):
+    # TODO: Remove endpoint once all TEE VMs are upgraded to 0.2.0
+    # and once all TEE chutes are upgraded to 0.6.0
+    launch_config, nodes, instance, _ = await _validate_tee_launch_config_instance(
+        config_id, args, request, db, authorization
+    )
+
+    _validate_launch_config_not_expired(launch_config)
+
+    # Enforce rint_pubkey for chutes >= 0.5.1
+    if semcomp(instance.chutes_version or "0.0.0", "0.5.1") >= 0:
+        if not instance.rint_pubkey or not instance.rint_nonce:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="rint_pubkey and rint_nonce required for chutes >= 0.5.1",
+            )
+
+    # Generate ECDH session key if miner provided rint_pubkey
+    validator_pubkey = None
+    if instance.rint_pubkey and instance.rint_nonce:
+        try:
+            validator_pubkey, session_key = derive_ecdh_session_key(
+                instance.rint_pubkey, instance.rint_nonce
+            )
+            instance.rint_session_key = session_key
+            logger.info(
+                f"Derived ECDH session key for TEE instance {instance.instance_id} "
+                f"validator_pubkey={validator_pubkey[:16]}..."
+            )
+        except Exception as exc:
+            logger.error(f"ECDH session key derivation failed for TEE: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"ECDH session key derivation failed: {exc}",
+            )
+
+    # Store the launch config
+    await db.commit()
+    await db.refresh(launch_config)
+
+    async with get_session() as session:
+        await session.execute(
+            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
+            {"config_id": config_id},
+        )
+
+    # Send event.
+    await db.refresh(instance)
+    gpu_count = len(nodes)
+    gpu_type = nodes[0].gpu_identifier
+    asyncio.create_task(notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type))
+
+    await verify_gpu_evidence(args.gpu_evidence, expected_nonce)
+
+    request_body = await request.json()
+
+    # Reload instance with chute relationship for filesystem validation
+    # Lazy load fails
+    stmt = (
+        select(Instance)
+        .where(Instance.instance_id == instance.instance_id)
+        .options(
+            joinedload(Instance.chute).joinedload(Chute.image),
+            joinedload(Instance.job),
+        )
+    )
+    instance = (await db.execute(stmt)).scalar_one()
+
+    # Filesystem integrity checks for < 0.3.1
+    await _validate_legacy_filesystem(db, instance, launch_config, request_body)
+
+    # Everything checks out.
+    launch_config.verified_at = func.now()
+    await _verify_job_ports(db, instance)
+    await _mark_instance_verified(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
+    return_value["symmetric_key"] = instance.symmetric_key
+
+    # Include validator pubkey if ECDH was used (for miner to derive session key)
+    if validator_pubkey:
+        return_value["validator_pubkey"] = validator_pubkey
+
+    await db.refresh(instance)
+    asyncio.create_task(notify_verified(instance))
+    return return_value
 
 
 @router.post("/launch_config/{config_id}/graval")
@@ -1957,6 +2066,70 @@ async def get_instance_nonce(request: Request):
 async def get_token(salt: str = None, request: Request = None):
     origin_ip = request.headers.get("x-forwarded-for", "").split(",")[0]
     return {"token": generate_ip_token(origin_ip, extra_salt=salt)}
+
+
+@router.get("/{instance_id}/evidence", response_model=TeeInstanceEvidence)
+async def get_tee_instance_evidence(
+    instance_id: str,
+    nonce: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(purpose="chutes")),
+):
+    """
+    Get TEE evidence for a specific instance (TDX quote, GPU evidence, certificate).
+
+    Args:
+        instance_id: Instance ID
+        nonce: User-provided nonce (64 hex characters, 32 bytes)
+
+    Returns:
+        TeeInstanceEvidence with quote, gpu_evidence, and certificate
+
+    Raises:
+        404: Instance not found
+        400: Invalid nonce format or instance not TEE-enabled
+        403: User cannot access instance
+        500: Server attestation failures
+    """
+    # Load instance with chute for authorization check
+    instance = (
+        (
+            await db.execute(
+                select(Instance)
+                .where(Instance.instance_id == instance_id)
+                .options(joinedload(Instance.chute))
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+
+    if not instance:
+        raise InstanceNotFoundError(instance_id)
+
+    # Check authorization: user must own chute, have it shared, or chute must be public
+    if (
+        instance.chute.user_id != current_user.user_id
+        and not await is_shared(instance.chute.chute_id, current_user.user_id)
+        and not instance.chute.public
+    ):
+        if not subnet_role_accessible(instance.chute, current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this instance",
+            )
+
+    try:
+        evidence = await get_instance_evidence(db, instance_id, nonce)
+        return evidence
+    except (InstanceNotFoundError, ChuteNotTeeError, NonceError) as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except GetEvidenceError as e:
+        logger.error(f"Failed to get evidence for instance {instance_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve TEE evidence from server",
+        )
 
 
 @router.get("/{instance_id}/logs")

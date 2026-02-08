@@ -39,6 +39,8 @@ from api.server.exceptions import (
     NonceError,
     ServerNotFoundError,
     ServerRegistrationError,
+    ChuteNotTeeError,
+    InstanceNotFoundError,
 )
 from api.server.util import (
     _track_server,
@@ -51,9 +53,17 @@ from api.server.util import (
     verify_result,
     sync_server_luks_passphrases,
     delete_luks_passphrases_for_server,
+    get_public_key_hash,
+    cert_to_base64_der,
+    validate_user_nonce,
 )
+from api.instance.schemas import Instance
+from api.chute.schemas import Chute
+from api.node.schemas import Node
+from sqlalchemy.orm import joinedload
+from api.server.schemas import TeeInstanceEvidence
 from api.node.schemas import NodeArgs
-from api.util import extract_ip
+from api.util import extract_ip, semcomp
 
 
 async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
@@ -422,7 +432,8 @@ async def verify_server(
         logger.info(
             f"Verifying server server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} with nonce {nonce}"
         )
-        quote, gpu_evidence, expected_cert_hash = await client.get_evidence(nonce)
+        quote, gpu_evidence, cert = await client.get_server_evidence(nonce)
+        expected_cert_hash = get_public_key_hash(cert)
 
         # Verify quote measurements (matches by full MRTD + RTMRs; multiple configs may share RTMR0)
         await verify_quote(quote, nonce, expected_cert_hash)
@@ -868,3 +879,149 @@ async def process_luks_passphrase_request(
     )
     await _consume_boot_token(boot_token)
     return result
+
+
+async def get_instance_server(db: AsyncSession, instance_id: str) -> tuple[Server, Instance]:
+    """
+    Get the TEE server and instance for evidence/attestation (instance has chute, nodes, server loaded).
+
+    Args:
+        db: Database session
+        instance_id: Instance ID
+
+    Returns:
+        (Server, Instance). Use instance.deployment_id or instance.instance_id for proxy routing.
+
+    Raises:
+        InstanceNotFoundError: If instance not found
+        ChuteNotTeeError: If the instance's chute is not TEE-enabled
+    """
+    # Load instance with chute, nodes and their servers
+    query = (
+        select(Instance)
+        .where(Instance.instance_id == instance_id)
+        .options(joinedload(Instance.chute), joinedload(Instance.nodes).joinedload(Node.server))
+    )
+    result = await db.execute(query)
+    instance = result.unique().scalar_one_or_none()
+
+    if not instance:
+        raise InstanceNotFoundError(instance_id)
+
+    # Check if chute is TEE-enabled (TEE chutes can only run on TEE servers)
+    if not instance.chute.tee:
+        raise ChuteNotTeeError(instance.chute.chute_id)
+
+    # Instance always has nodes, get server from first node
+    node = instance.nodes[0]
+    server = node.server
+
+    return (server, instance)
+
+
+async def _get_instance_evidence(
+    server: Server, deployment_id: str, nonce: str
+) -> TeeInstanceEvidence:
+    """
+    Get TEE instance evidence via the chute's evidence endpoint (third-party flow).
+    Caller supplies nonce; we call chute-service-{deployment_id}/evidence?nonce=...
+    Verification flow (no caller nonce) uses get_chute_evidence(deployment_id) → verify endpoint.
+    """
+    client = TeeServerClient(server)
+    quote, gpu_evidence, cert = await client.get_chute_evidence(deployment_id, nonce=nonce)
+
+    quote_base64 = base64.b64encode(quote.raw_bytes).decode("utf-8")
+    cert_base64 = cert_to_base64_der(cert)
+
+    return TeeInstanceEvidence(
+        quote=quote_base64, gpu_evidence=gpu_evidence, certificate=cert_base64
+    )
+
+
+async def get_instance_evidence(
+    db: AsyncSession, instance_id: str, nonce: str
+) -> TeeInstanceEvidence:
+    """
+    Get TEE evidence for a specific instance (instance evidence endpoint flow).
+    Requires instance.deployment_id (set when TEE launch config is claimed and verified).
+    Runtime evidence is only supported for chutes_version >= 0.6.0.
+    """
+    validate_user_nonce(nonce)
+    server, instance = await get_instance_server(db, instance_id)
+    if semcomp(instance.chutes_version or "0.0.0", "0.6.0") < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Instances requires chutes_version >= 0.6.0 to retrieve evidence.",
+        )
+    if not instance.deployment_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Instance has no deployment_id; evidence is only available after TEE verification",
+        )
+    return await _get_instance_evidence(server, instance.deployment_id, nonce)
+
+
+async def get_chute_instances_evidence(
+    db: AsyncSession, chute_id: str, nonce: str
+) -> tuple[list[TeeInstanceEvidence], list[str]]:
+    """
+    Get TEE evidence for all instances of a chute (chute evidence endpoint flow).
+    Returns (evidence_list, failed_instance_ids). Failed instance IDs are included
+    so the user knows those instances still exist; access is already enforced at this point.
+    Runtime evidence is only supported for chutes_version >= 0.6.0.
+    """
+    validate_user_nonce(nonce)
+
+    query = select(Chute).where(Chute.chute_id == chute_id)
+    result = await db.execute(query)
+    chute = result.scalar_one_or_none()
+
+    if not chute:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Chute {chute_id} not found"
+        )
+
+    if not chute.tee:
+        raise ChuteNotTeeError(chute_id)
+
+    if semcomp(chute.chutes_version or "0.0.0", "0.6.0") < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Instances requires chutes_version >= 0.6.0 to retrieve evidence.",
+        )
+
+    instances_query = (
+        select(Instance)
+        .where(
+            Instance.chute_id == chute_id,
+            Instance.active.is_(True),
+            Instance.verified.is_(True),
+        )
+        .options(joinedload(Instance.nodes).joinedload(Node.server))
+    )
+    instances_result = await db.execute(instances_query)
+    instances = instances_result.unique().scalars().all()
+
+    evidence_list: list[TeeInstanceEvidence] = []
+    failed_instance_ids: list[str] = []
+    for instance in instances:
+        if not instance.deployment_id:
+            failed_instance_ids.append(instance.instance_id)
+            continue
+        try:
+            node = instance.nodes[0]
+            server = node.server
+            evidence = await _get_instance_evidence(server, instance.deployment_id, nonce)
+            evidence_list.append(
+                TeeInstanceEvidence(
+                    quote=evidence.quote,
+                    gpu_evidence=evidence.gpu_evidence,
+                    instance_id=instance.instance_id,
+                    certificate=evidence.certificate,
+                )
+            )
+        except GetEvidenceError as e:
+            logger.error(f"Failed to get evidence for instance {instance.instance_id}: {str(e)}")
+            failed_instance_ids.append(instance.instance_id)
+
+    return (evidence_list, failed_instance_ids)
