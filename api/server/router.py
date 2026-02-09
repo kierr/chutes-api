@@ -113,39 +113,33 @@ def _validate_luks_request(
 ) -> None:
     """Validate LUKS POST request: boot token, hotkey, volumes, rekey. Raises HTTPException on invalid."""
     if not boot_token:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Boot token is required (X-Boot-Token header)",
-        )
+        detail = "Boot token is required (X-Boot-Token header)"
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     if not hotkey:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Hotkey is required",
-        )
+        detail = "Hotkey is required"
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     if not body.volumes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="volumes is required and must be non-empty",
-        )
+        detail = "volumes is required and must be non-empty"
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     invalid_volumes = [v for v in body.volumes if v not in SUPPORTED_LUKS_VOLUMES]
     if invalid_volumes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid volume name(s): {invalid_volumes}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}",
-        )
+        detail = f"Invalid volume name(s): {invalid_volumes}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     if body.rekey is not None:
         not_in_volumes = [v for v in body.rekey if v not in body.volumes]
         if not_in_volumes:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"rekey must be a subset of volumes; not in volumes: {not_in_volumes}",
-            )
+            detail = f"rekey must be a subset of volumes; not in volumes: {not_in_volumes}"
+            logger.warning(f"LUKS request validation failed: {detail}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
         invalid_rekey = [v for v in body.rekey if v not in SUPPORTED_LUKS_VOLUMES]
         if invalid_rekey:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid rekey volume name(s): {invalid_rekey}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}",
-            )
+            detail = f"Invalid rekey volume name(s): {invalid_rekey}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
+            logger.warning(f"LUKS request validation failed: {detail}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
 
 @router.post("/{vm_name}/luks", response_model=Dict[str, str])
