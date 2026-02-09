@@ -714,7 +714,7 @@ async def _get_chute_hf_info(chute_id: str):
     repo_id = extract_hf_model_name(chute.chute_id, chute.code)
     if not repo_id:
         return None
-    revision = await asyncio.to_thread(get_current_hf_commit, repo_id)
+    revision = chute.revision if chute.revision else await asyncio.to_thread(get_current_hf_commit, repo_id)
     return {"repo_id": repo_id, "revision": revision}
 
 
