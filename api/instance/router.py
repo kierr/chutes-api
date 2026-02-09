@@ -1436,6 +1436,20 @@ async def validate_tee_launch_config_instance(
     asyncio.create_task(notify_verified(instance))
     return return_value
 
+@router.post("/launch_config/{config_id}")
+async def claim_launch_config(
+    config_id: str,
+    args: LaunchConfigArgs,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
+):
+    # Backwards compatibility for older client libs; delegates to graval endpoint.
+    # TODO: Remove this once all chutes are upgraded to 0.6.0 or later
+    return await claim_graval_launch_config(
+        config_id, args, request, db, authorization
+    )
+
 
 @router.post("/launch_config/{config_id}/graval")
 async def claim_graval_launch_config(
@@ -1885,6 +1899,17 @@ async def _build_launch_config_verified_response(
     )
 
     return return_value
+
+@router.put("/launch_config/{config_id}")
+async def verify_launch_config_instance(
+    config_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
+):
+    # Backwards compatibility for older client libs; delegates to graval endpoint.
+    # TODO: Remove this once all chutes are upgraded to 0.6.0 or later
+    return await verify_graval_launch_config_instance(config_id, request, db, authorization)
 
 
 @router.put("/launch_config/{config_id}/graval")
