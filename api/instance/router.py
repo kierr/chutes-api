@@ -74,6 +74,7 @@ from api.server.service import (
     verify_gpu_evidence,
 )
 from api.server.schemas import TeeInstanceEvidence
+from api.rate_limit import rate_limit
 from api.server.exceptions import (
     InstanceNotFoundError,
     ChuteNotTeeError,
@@ -2101,6 +2102,7 @@ async def get_tee_instance_evidence(
     nonce: str,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(purpose="chutes")),
+    _: None = Depends(rate_limit("tee_evidence", 60)),
 ):
     """
     Get TEE evidence for a specific instance (TDX quote, GPU evidence, certificate).
@@ -2116,6 +2118,7 @@ async def get_tee_instance_evidence(
         404: Instance not found
         400: Invalid nonce format or instance not TEE-enabled
         403: User cannot access instance
+        429: Rate limit exceeded
         500: Server attestation failures
     """
     # Load instance with chute for authorization check

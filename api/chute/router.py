@@ -54,6 +54,7 @@ from api.chute.util import (
 from api.server.service import get_chute_instances_evidence
 from api.server.schemas import TeeChuteEvidence
 from api.server.exceptions import ChuteNotTeeError, GetEvidenceError
+from api.rate_limit import rate_limit
 from api.bounty.util import (
     get_bounty_info,
     get_bounty_infos,
@@ -841,6 +842,7 @@ async def get_tee_chute_evidence(
     nonce: str,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(purpose="chutes", raise_not_found=False)),
+    _: None = Depends(rate_limit("tee_evidence", 60)),
 ):
     """
     Get TEE evidence for all instances of a chute (TDX quote, GPU evidence, certificate per instance).
@@ -856,6 +858,7 @@ async def get_tee_chute_evidence(
         404: Chute not found
         400: Invalid nonce format or chute not TEE-enabled
         403: User cannot access chute
+        429: Rate limit exceeded
         500: Server attestation failures
     """
     chute = await get_one(chute_id_or_name)
