@@ -249,7 +249,9 @@ def get_matching_measurement_config(quote: TdxQuote) -> TeeMeasurementConfig:
         if quote.matches_measurement(config):
             return config
 
-    logger.info(f"No measurement config matched quote (MRTD + RTMRs)\n{quote.mrtd=}\n{quote.rtmrs=}")
+    logger.info(
+        f"No measurement config matched quote (MRTD + RTMRs)\n{quote.mrtd=}\n{quote.rtmrs=}"
+    )
     raise MeasurementMismatchError(
         "Quote does not match expected measurements. Ensure you are running a supported VM."
     )

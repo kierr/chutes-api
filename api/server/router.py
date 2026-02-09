@@ -126,7 +126,9 @@ def _validate_luks_request(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     invalid_volumes = [v for v in body.volumes if v not in SUPPORTED_LUKS_VOLUMES]
     if invalid_volumes:
-        detail = f"Invalid volume name(s): {invalid_volumes}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
+        detail = (
+            f"Invalid volume name(s): {invalid_volumes}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
+        )
         logger.warning(f"LUKS request validation failed: {detail}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     if body.rekey is not None:

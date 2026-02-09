@@ -25,6 +25,7 @@ def rate_limit(endpoint_key: str, requests_per_minute: int) -> Callable:
         ):
             ...
     """
+
     async def _rate_limit() -> None:
         if requests_per_minute <= 0:
             return

@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 import pybase64 as base64
 import binascii
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import struct
