@@ -1353,7 +1353,7 @@ async def validate_tee_launch_config_instance(
 ):
     # TODO: Remove endpoint once all TEE VMs are upgraded to 0.2.0
     # and once all TEE chutes are upgraded to 0.6.0
-    launch_config, nodes, instance, _ = await _validate_tee_launch_config_instance(
+    launch_config, nodes, instance, validator_pubkey = await _validate_tee_launch_config_instance(
         config_id, args, request, db, authorization
     )
 
@@ -1365,25 +1365,6 @@ async def validate_tee_launch_config_instance(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="rint_pubkey and rint_nonce required for chutes >= 0.5.1",
-            )
-
-    # Generate ECDH session key if miner provided rint_pubkey
-    validator_pubkey = None
-    if instance.rint_pubkey and instance.rint_nonce:
-        try:
-            validator_pubkey, session_key = derive_ecdh_session_key(
-                instance.rint_pubkey, instance.rint_nonce
-            )
-            instance.rint_session_key = session_key
-            logger.info(
-                f"Derived ECDH session key for TEE instance {instance.instance_id} "
-                f"validator_pubkey={validator_pubkey[:16]}..."
-            )
-        except Exception as exc:
-            logger.error(f"ECDH session key derivation failed for TEE: {exc}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"ECDH session key derivation failed: {exc}",
             )
 
     # Store the launch config
