@@ -197,7 +197,9 @@ def sample_verification_result():
         rtmr3="e" * 96,
         user_data="test_data",
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
 
@@ -440,7 +442,9 @@ async def test_process_boot_attestation_success(
             rtmr3="e" * 96,
             user_data="test",
             parsed_at=datetime.now(timezone.utc),
-            is_valid=True,
+            status="UpToDate",
+            advisory_ids=[],
+            td_attributes="0000001000000000",
         )
 
         # Mock database refresh to set attestation_id
@@ -535,7 +539,9 @@ async def test_process_runtime_attestation_success(
                     rtmr3="0" * 96,
                     user_data="test",
                     parsed_at=datetime.now(timezone.utc),
-                    is_valid=True,
+                    status="UpToDate",
+                    advisory_ids=[],
+                    td_attributes="0000001000000000",
                 )
 
                 def mock_refresh(obj):
@@ -617,7 +623,9 @@ async def test_register_server_success(
                 rtmr3="0" * 96,
                 user_data="test",
                 parsed_at=datetime.now(timezone.utc),
-                is_valid=True,
+                status="UpToDate",
+                advisory_ids=[],
+                td_attributes="0000001000000000",
             )
             await verify_server(mock_db_session, sample_server, miner_hotkey, server_args.gpus)
 
@@ -655,7 +663,9 @@ async def test_register_server_integrity_error(
                         rtmr3="0" * 96,
                         user_data="test",
                         parsed_at=datetime.now(timezone.utc),
-                        is_valid=True,
+                        status="UpToDate",
+                        advisory_ids=[],
+                        td_attributes="0000001000000000",
                     )
                     with pytest.raises(ServerRegistrationError):
                         await register_server(mock_db_session, server_args, miner_hotkey)
@@ -1005,7 +1015,9 @@ async def test_register_server_general_exception(
                         rtmr3="0" * 96,
                         user_data="test",
                         parsed_at=datetime.now(timezone.utc),
-                        is_valid=True,
+                        status="UpToDate",
+                        advisory_ids=[],
+                        td_attributes="0000001000000000",
                     )
                     with pytest.raises(ServerRegistrationError):
                         await register_server(mock_db_session, server_args, miner_hotkey)
@@ -1080,7 +1092,9 @@ async def test_full_boot_flow_end_to_end(mock_db_session, mock_settings, mock_ve
                 rtmr3="e" * 96,
                 user_data="test",
                 parsed_at=datetime.now(timezone.utc),
-                is_valid=True,
+                status="UpToDate",
+                advisory_ids=[],
+                td_attributes="0000001000000000",
             )
 
             def mock_refresh(obj):
@@ -1151,7 +1165,9 @@ async def test_full_runtime_flow_end_to_end(
                     rtmr3="0" * 96,
                     user_data="test",
                     parsed_at=datetime.now(timezone.utc),
-                    is_valid=True,
+                    status="UpToDate",
+                    advisory_ids=[],
+                    td_attributes="0000001000000000",
                 )
 
                 def mock_refresh(obj):
@@ -1209,7 +1225,9 @@ async def test_server_lifecycle_flow(
                         rtmr3="0" * 96,
                         user_data="test",
                         parsed_at=datetime.now(timezone.utc),
-                        is_valid=True,
+                        status="UpToDate",
+                        advisory_ids=[],
+                        td_attributes="0000001000000000",
                     )
                     await register_server(mock_db_session, server_args, miner_hotkey)
     mock_db_session.add.assert_called()
@@ -1401,7 +1419,9 @@ async def test_verify_quote_boot_vs_runtime_different_settings(mock_settings):
         rtmr3="e" * 96,
         user_data="test",
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
     runtime_dcap_result = TdxVerificationResult(
         mrtd="a" * 96,
@@ -1411,7 +1431,9 @@ async def test_verify_quote_boot_vs_runtime_different_settings(mock_settings):
         rtmr3="i" * 96,
         user_data="test",
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     with patch("api.server.service.verify_quote_signature") as mock_sig:
@@ -1473,7 +1495,9 @@ async def test_boot_attestation_database_rollback_on_error(
                 rtmr3="e" * 96,
                 user_data="test",
                 parsed_at=datetime.now(timezone.utc),
-                is_valid=True,
+                status="UpToDate",
+                advisory_ids=[],
+                td_attributes="0000001000000000",
             )
 
             # Mock commit to fail after add
@@ -1515,7 +1539,9 @@ async def test_runtime_attestation_database_rollback_on_error(
                     rtmr3="0" * 96,
                     user_data="test",
                     parsed_at=datetime.now(timezone.utc),
-                    is_valid=True,
+                    status="UpToDate",
+                    advisory_ids=[],
+                    td_attributes="0000001000000000",
                 )
 
                 # Mock refresh to fail
@@ -1550,7 +1576,9 @@ async def test_verify_quote_with_different_quote_types(mock_verify_measurements)
         rtmr3="e" * 96,
         user_data="test",
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
     runtime_result = TdxVerificationResult(
         mrtd="a" * 96,
@@ -1560,7 +1588,9 @@ async def test_verify_quote_with_different_quote_types(mock_verify_measurements)
         rtmr3="0" * 96,
         user_data="test",
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     # Test with BootTdxQuote

@@ -220,7 +220,9 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
         if result.is_valid:
             logger.success("TDX quote signature verification successful")
         else:
-            error_msg = verified_report.get("error", "Unknown verification error")
+            error_msg = f"Verification status: {result.status}"
+            if result.advisory_ids:
+                error_msg += f"; advisory_ids: {result.advisory_ids}"
             logger.error(f"TDX quote signature verification failed: {error_msg}")
             raise InvalidSignatureError("TDX quote signature verification failed")
 

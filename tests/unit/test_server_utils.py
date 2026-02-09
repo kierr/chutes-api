@@ -183,7 +183,9 @@ def test_tdx_verification_result_creation():
         rtmr3="e" * 96,
         user_data="test_data",
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     assert result.mrtd == "a" * 96
@@ -202,7 +204,9 @@ def test_tdx_verification_result_rtmrs_property():
         rtmr3="3" * 96,
         user_data=None,
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     rtmrs = result.rtmrs
@@ -224,7 +228,9 @@ def test_tdx_verification_result_to_dict():
         rtmr3="e" * 96,
         user_data="test",
         parsed_at=now,
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     dict_result = result.to_dict()
@@ -442,7 +448,9 @@ def _sample_verification_result():
         rtmr3="e" * 96,
         user_data=None,
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
 
@@ -463,7 +471,9 @@ def test_verify_result_raises_when_mrtd_differs_from_dcap_result(sample_boot_quo
         rtmr3=result.rtmr3,
         user_data=result.user_data,
         parsed_at=result.parsed_at,
-        is_valid=result.is_valid,
+        status=result.status,
+        td_attributes=result.td_attributes,
+        advisory_ids=result.advisory_ids,
     )
     with pytest.raises(MeasurementMismatchError):
         verify_result(sample_boot_quote, result)
@@ -480,7 +490,9 @@ def test_verify_result_raises_when_rtmr_differs_from_dcap_result(sample_boot_quo
         rtmr3=result.rtmr3,
         user_data=result.user_data,
         parsed_at=result.parsed_at,
-        is_valid=result.is_valid,
+        status=result.status,
+        td_attributes=result.td_attributes,
+        advisory_ids=result.advisory_ids,
     )
     with pytest.raises(MeasurementMismatchError):
         verify_result(sample_boot_quote, result)
@@ -492,7 +504,11 @@ async def test_verify_quote_signature_success(sample_boot_quote):
     """Test successful quote signature verification."""
     mock_verified_report = Mock()
     mock_verified_report.status = "UpToDate"
-    mock_verified_report.to_json.return_value = '{"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", "rt_mr3": "e", "report_data": "test"}}}'
+    mock_verified_report.to_json.return_value = (
+        '{"status": "UpToDate", "advisory_ids": [], '
+        '"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", '
+        '"rt_mr3": "e", "report_data": "test", "td_attributes": "0000001000000000"}}}'
+    )
 
     with patch(
         "api.server.util.get_collateral_and_verify", return_value=mock_verified_report
@@ -508,8 +524,11 @@ async def test_verify_quote_signature_success(sample_boot_quote):
 async def test_verify_quote_signature_failure(sample_boot_quote):
     """Test failed quote signature verification (util wraps in InvalidQuoteError)."""
     mock_verified_report = Mock()
-    mock_verified_report.status = "Invalid"
-    mock_verified_report.to_json.return_value = '{"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", "rt_mr3": "e", "report_data": "test"}}}'
+    mock_verified_report.to_json.return_value = (
+        '{"status": "Unknown", "advisory_ids": [], '
+        '"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", '
+        '"rt_mr3": "e", "report_data": "test", "td_attributes": "0000001000000000"}}}'
+    )
 
     with patch("api.server.util.get_collateral_and_verify", return_value=mock_verified_report):
         with pytest.raises(InvalidQuoteError, match="Unable to parse provided quote"):
@@ -825,6 +844,8 @@ def test_verification_result_from_report():
     mock_report.status = "UpToDate"
     mock_report.to_json.return_value = """
     {
+        "status": "UpToDate",
+        "advisory_ids": [],
         "report": {
             "TD10": {
                 "mr_td": "test_mrtd",
@@ -832,7 +853,8 @@ def test_verification_result_from_report():
                 "rt_mr1": "test_rtmr1",
                 "rt_mr2": "test_rtmr2",
                 "rt_mr3": "test_rtmr3",
-                "report_data": "test_report_data"
+                "report_data": "test_report_data",
+                "td_attributes": "0000001000000000"
             }
         }
     }
@@ -855,9 +877,10 @@ def test_verification_result_from_report_invalid():
     from unittest.mock import Mock
 
     mock_report = Mock()
-    mock_report.status = "Invalid"
     mock_report.to_json.return_value = """
     {
+        "status": "Unknown",
+        "advisory_ids": [],
         "report": {
             "TD10": {
                 "mr_td": "test_mrtd",
@@ -865,7 +888,8 @@ def test_verification_result_from_report_invalid():
                 "rt_mr1": "test_rtmr1",
                 "rt_mr2": "test_rtmr2",
                 "rt_mr3": "test_rtmr3",
-                "report_data": "test_report_data"
+                "report_data": "test_report_data",
+                "td_attributes": "0000001000000000"
             }
         }
     }
