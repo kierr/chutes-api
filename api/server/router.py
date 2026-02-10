@@ -38,7 +38,7 @@ from api.server.service import (
     validate_request_nonce,
     process_luks_passphrase_request,
 )
-from api.server.util import extract_client_cert_hash, get_luks_passphrase, _get_vm_cache_config
+from api.server.util import decrypt_passphrase, extract_client_cert_hash, get_luks_passphrase, _get_vm_cache_config
 from api.server.exceptions import (
     AttestationError,
     NonceError,
@@ -141,7 +141,7 @@ async def get_cache_luks_passphrase(
             )
             
         #Legacy passphrase stored under storage key
-        passphrase = vm_config.get("storage")
+        passphrase = decrypt_passphrase(vm_config.volume_passphrases.get("storage"))
 
         return {
             "passphrase": passphrase
