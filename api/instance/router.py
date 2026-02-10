@@ -21,7 +21,7 @@ from typing import Optional, Tuple
 from datetime import datetime, timedelta
 from fastapi.responses import PlainTextResponse
 from fastapi import APIRouter, Depends, HTTPException, Response, status, Header, Request
-from sqlalchemy import select, text, func, update, and_
+from sqlalchemy import select, text, func, update, and_, desc
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
@@ -73,7 +73,7 @@ from api.server.service import (
     get_instance_evidence,
     verify_gpu_evidence,
 )
-from api.server.schemas import TeeInstanceEvidence
+from api.server.schemas import TeeInstanceEvidence, BootAttestation
 from api.rate_limit import rate_limit
 from api.server.exceptions import (
     InstanceNotFoundError,
@@ -1109,9 +1109,36 @@ async def _validate_tee_launch_config_instance(
             detail="Can not claim a TEE launch config for a non-TEE chute.",
         )
 
-    return await _validate_launch_config_instance(
+    launch_config, nodes, instance, validator_pubkey = await _validate_launch_config_instance(
         db, request, args, launch_config, chute, log_prefix
     )
+
+    # Reject new chutes (>= 0.6.0) on old VMs (latest boot attestation measurement_version < 0.2.0).
+    # Newer 0.2.0+ VMs can run both old and new chutes.
+    # TODO: Remove this once TEE servers are upgraded to 0.2.0 or later
+    if semcomp(instance.chutes_version or "0.0.0", "0.6.0") >= 0:
+        stmt = (
+            select(BootAttestation)
+            .where(BootAttestation.server_ip == instance.host)
+            .order_by(desc(BootAttestation.created_at))
+            .limit(1)
+        )
+        boot_result = await db.execute(stmt)
+        latest_boot = boot_result.scalar_one_or_none()
+        if (
+            latest_boot is None
+            or latest_boot.measurement_version is None
+            or semcomp(latest_boot.measurement_version, "0.2.0") < 0
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Chutes version >= 0.6.0 requires VM measurement version >= 0.2.0. "
+                    "Upgrade the VM image to run this chute."
+                ),
+            )
+
+    return launch_config, nodes, instance, validator_pubkey
 
 
 @router.get("/launch_config")
