@@ -354,6 +354,10 @@ async def process_boot_attestation(
             measurement_version = measurement_config.version
         except (InvalidQuoteError, MeasurementMismatchError):
             pass
+        if measurement_version is None:
+            logger.warning(
+                "Boot attestation failed with no matching measurement config (measurement_version will be NULL). "
+            )
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
@@ -370,6 +374,11 @@ async def process_boot_attestation(
 
 
 async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str):
+    """
+    Register a TEE server: create Server, verify attestation (creating a ServerAttestation
+    record on success or failure), then track nodes. ServerAttestation is always inserted
+    by verify_server for audit trail.
+    """
     try:
         server = await _track_server(db, args.id, args.name, args.host, miner_hotkey, is_tee=True)
 
@@ -425,6 +434,7 @@ async def verify_server(
     """
     failure_reason = ""
     quote = None
+    measurement_config = None
     try:
         client = TeeServerClient(server)
 
@@ -433,6 +443,7 @@ async def verify_server(
             f"Verifying server server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} with nonce {nonce}"
         )
         quote, gpu_evidence, cert = await client.get_server_evidence(nonce)
+        measurement_config = get_matching_measurement_config(quote)
         expected_cert_hash = get_public_key_hash(cert)
 
         # Verify quote measurements (matches by full MRTD + RTMRs; multiple configs may share RTMR0)
@@ -444,7 +455,7 @@ async def verify_server(
         # Validate GPUs match measurement configuration
         validate_gpus_for_measurements(quote, gpus)
 
-        measurement_config = get_matching_measurement_config(quote)
+        
 
         logger.success(
             f"Verified server server_id={server.server_id} ip={server.ip} for miner: {miner_hotkey}"
@@ -495,13 +506,7 @@ async def verify_server(
         raise e
     finally:
         if failure_reason:
-            measurement_version = None
-            if quote:
-                try:
-                    measurement_config = get_matching_measurement_config(quote)
-                    measurement_version = measurement_config.version
-                except MeasurementMismatchError:
-                    pass
+            measurement_version = measurement_config.version if measurement_config else None
             server_attestation = ServerAttestation(
                 quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8") if quote else None,
                 server_id=server.server_id,
@@ -510,9 +515,20 @@ async def verify_server(
                 measurement_version=measurement_version,
             )
 
-            db.add(server_attestation)
-            await db.commit()
-            await db.refresh(server_attestation)
+            try:
+                db.add(server_attestation)
+                await db.commit()
+                await db.refresh(server_attestation)
+                logger.info(
+                    f"Persisted failed server attestation for server_id={server.server_id} (reason: {failure_reason})"
+                )
+            except Exception:
+                logger.exception(
+                    f"Failed to persist failed attestation record for server_id={server.server_id}; "
+                    "attestation history will be incomplete",
+                    exc_info=True,
+                )
+                raise
 
 
 async def check_server_ownership(db: AsyncSession, server_id: str, miner_hotkey: str) -> Server:
