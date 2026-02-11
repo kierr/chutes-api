@@ -101,7 +101,7 @@ class ServerArgs(BaseModel):
 
     host: str = Field(..., description="Public IP address or DNS Name of the server")
     id: str = Field(..., description="Server ID (e.g. k8s node uid)")
-    name: str = Field(..., description="Server name ")
+    name: Optional[str] = Field(None, description="Server name (defaults to server id if omitted)")
     gpus: list[NodeArgs] = Field(..., description="GPU info for this server")
 
 
