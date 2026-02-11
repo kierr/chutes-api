@@ -380,7 +380,9 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
     by verify_server for audit trail.
     """
     try:
-        server = await _track_server(db, args.id, args.name or args.id, args.host, miner_hotkey, is_tee=True)
+        server = await _track_server(
+            db, args.id, args.name or args.id, args.host, miner_hotkey, is_tee=True
+        )
 
         # Set the attributes we can't get from pynvml
         for gpu in args.gpus:
