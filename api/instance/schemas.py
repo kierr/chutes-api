@@ -63,6 +63,9 @@ class LaunchConfigArgs(BaseModel):
     rint_commitment: Optional[str] = None
     rint_nonce: Optional[str] = None
     rint_pubkey: Optional[str] = None
+    tls_cert: Optional[str] = None
+    tls_cert_sig: Optional[str] = None
+    e2e_pubkey: Optional[str] = None
 
 
 class GravalLaunchConfigArgs(LaunchConfigArgs):
@@ -119,6 +122,9 @@ class Instance(Base):
     # ECDH session encryption: miner's pubkey and derived session key
     rint_pubkey = Column(String, nullable=True)
     rint_session_key = Column(String, nullable=True)
+
+    # Flexible extra data (aegis v4 fields, future extensions)
+    extra = Column(JSONB, nullable=True)
 
     # Hourly rate charged to customer, which may differ from the hourly rate of the actual
     # GPUs used for this instance due to node selector. For example, if a chute supports

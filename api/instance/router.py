@@ -78,6 +78,7 @@ from api.util import (
     generate_ip_token,
     aes_decrypt,
     derive_ecdh_session_key,
+    derive_x25519_session_key,
     decrypt_instance_response,
     notify_created,
     notify_deleted,
@@ -101,9 +102,74 @@ NETNANNY = ctypes.CDLL("/usr/local/lib/chutes-nnverify.so")
 NETNANNY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 NETNANNY.verify.restype = ctypes.c_int
 
+# Aegis v4 verification library (optional — may not be deployed yet)
+AEGIS_VERIFY = None
+try:
+    AEGIS_VERIFY = ctypes.CDLL("/usr/local/lib/chutes-aegis-verify.so")
+    AEGIS_VERIFY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
+    AEGIS_VERIFY.verify.restype = ctypes.c_int
+    logger.info("Loaded chutes-aegis-verify.so")
+except OSError:
+    logger.warning(
+        "chutes-aegis-verify.so not found, v4 netnanny verification will fall back to commitment-only"
+    )
+
+
+def _verify_rint_commitment_v4(commitment_hex: str) -> bool:
+    """Verify a v4 runtime integrity commitment (aegis/Ed25519)."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        if len(commitment_hex) != 292:
+            logger.error(f"RUNINT v4: commitment length mismatch: {len(commitment_hex)} != 292")
+            return False
+
+        commitment_bytes = bytes.fromhex(commitment_hex)
+        if len(commitment_bytes) != 146:
+            logger.error(
+                f"RUNINT v4: decoded commitment length mismatch: {len(commitment_bytes)} != 146"
+            )
+            return False
+
+        prefix = commitment_bytes[0]
+        if prefix != 0x04:
+            logger.error(f"RUNINT v4: invalid prefix: {prefix} != 0x04")
+            return False
+
+        version = commitment_bytes[1]
+        if version != 0x04:
+            logger.error(f"RUNINT v4: invalid version: {version} != 0x04")
+            return False
+
+        pubkey_bytes = commitment_bytes[2:34]  # Ed25519 pubkey (32 bytes)
+        nonce_bytes = commitment_bytes[34:50]  # nonce (16 bytes)
+        lib_proof_bytes = commitment_bytes[50:82]  # lib_proof HMAC-SHA256 (32 bytes)
+        sig_bytes = commitment_bytes[82:146]  # Ed25519 signature (64 bytes)
+
+        # Verify: Ed25519_verify(pubkey, version||pubkey||nonce||lib_proof, signature)
+        msg_to_verify = bytes([version]) + pubkey_bytes + nonce_bytes + lib_proof_bytes
+        pk = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+
+        try:
+            pk.verify(sig_bytes, msg_to_verify)
+            logger.info("RUNINT v4: commitment verification successful")
+            return True
+        except Exception:
+            logger.error("RUNINT v4: signature verification failed")
+            return False
+
+    except Exception as e:
+        logger.error(f"RUNINT v4: commitment verification error: {e}")
+        return False
+
 
 def _verify_rint_commitment(commitment_hex: str, expected_nonce: str) -> bool:
-    """Verify the runtime integrity commitment (mini-cert)."""
+    """Verify the runtime integrity commitment (mini-cert). Auto-detects v3/v4."""
+    # v4 commitments start with "04" prefix
+    if commitment_hex[:2] == "04":
+        return _verify_rint_commitment_v4(commitment_hex)
+
+    # v3 (SECP256k1) path
     try:
         from ecdsa import VerifyingKey, SECP256k1, BadSignatureError
         import hashlib
@@ -288,8 +354,8 @@ async def _check_scalable_private(db, chute, miner):
           AND ia.activated_at <= NOW() - INTERVAL '7 days'
     """)
     public_result = (
-        await db.execute(public_history_query, {"hotkey": miner.hotkey})
-    ).mappings().first()
+        (await db.execute(public_history_query, {"hotkey": miner.hotkey})).mappings().first()
+    )
     if not public_result or public_result["public_count"] == 0:
         logger.warning(
             f"PRIVATE_GATE: miner {miner.hotkey} denied private chute {chute_id}: "
@@ -770,9 +836,32 @@ async def _validate_launch_config_instance(
                 detail=launch_config.verification_error,
             )
 
-        # NetNanny (match egress config and hash).
+        # NetNanny / Aegis verification (match egress config and hash).
         nn_valid = True
-        if chute.allow_external_egress != args.egress or not args.netnanny_hash:
+        if semcomp(chute.chutes_version or "0.0.0", "0.5.5") >= 0:
+            # v4 (aegis): netnanny_hash comes from aegis-verify
+            if not args.netnanny_hash:
+                nn_valid = False
+            elif AEGIS_VERIFY is not None:
+                if not AEGIS_VERIFY.verify(
+                    launch_config.config_id.encode(),
+                    args.netnanny_hash.encode(),
+                    1,
+                ):
+                    logger.error(
+                        f"{log_prefix} aegis-verify hash mismatch for {launch_config.config_id=}"
+                    )
+                    nn_valid = False
+                else:
+                    logger.success(
+                        f"{log_prefix} aegis-verify hash challenge success: {launch_config.config_id=} {args.netnanny_hash=}"
+                    )
+            else:
+                # aegis-verify .so not available, allow through (commitment already verified)
+                logger.warning(
+                    f"{log_prefix} aegis-verify not available, skipping hash verification"
+                )
+        elif chute.allow_external_egress != args.egress or not args.netnanny_hash:
             nn_valid = False
         else:
             if not NETNANNY.verify(
@@ -888,6 +977,16 @@ async def _validate_launch_config_instance(
         rint_commitment=getattr(args, "rint_commitment", None),
         rint_nonce=getattr(args, "rint_nonce", None),
         rint_pubkey=getattr(args, "rint_pubkey", None),
+        extra={
+            k: v
+            for k, v in {
+                "tls_cert": getattr(args, "tls_cert", None),
+                "tls_cert_sig": getattr(args, "tls_cert_sig", None),
+                "e2e_pubkey": getattr(args, "e2e_pubkey", None),
+            }.items()
+            if v is not None
+        }
+        or None,
     )
     if launch_config.job_id or (
         not chute.public
@@ -1278,23 +1377,28 @@ async def validate_tee_launch_config_instance(
                 detail="rint_pubkey and rint_nonce required for chutes >= 0.5.1",
             )
 
-    # Generate ECDH session key if miner provided rint_pubkey
+    # Generate session key if miner provided rint_pubkey
     validator_pubkey = None
     if instance.rint_pubkey and instance.rint_nonce:
         try:
-            validator_pubkey, session_key = derive_ecdh_session_key(
-                instance.rint_pubkey, instance.rint_nonce
-            )
+            if semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
+                validator_pubkey, session_key = derive_x25519_session_key(
+                    instance.rint_pubkey, instance.rint_nonce
+                )
+            else:
+                validator_pubkey, session_key = derive_ecdh_session_key(
+                    instance.rint_pubkey, instance.rint_nonce
+                )
             instance.rint_session_key = session_key
             logger.info(
-                f"Derived ECDH session key for TEE instance {instance.instance_id} "
+                f"Derived session key for TEE instance {instance.instance_id} "
                 f"validator_pubkey={validator_pubkey[:16]}..."
             )
         except Exception as exc:
-            logger.error(f"ECDH session key derivation failed for TEE: {exc}")
+            logger.error(f"Session key derivation failed for TEE: {exc}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"ECDH session key derivation failed: {exc}",
+                detail=f"Session key derivation failed: {exc}",
             )
 
     # Store the launch config
@@ -1368,23 +1472,28 @@ async def claim_launch_config(
                 detail="rint_pubkey and rint_nonce required for chutes >= 0.5.1",
             )
 
-    # Generate ECDH session key if miner provided rint_pubkey
+    # Generate session key if miner provided rint_pubkey
     validator_pubkey = None
     if instance.rint_pubkey and instance.rint_nonce:
         try:
-            validator_pubkey, session_key = derive_ecdh_session_key(
-                instance.rint_pubkey, instance.rint_nonce
-            )
+            if semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
+                validator_pubkey, session_key = derive_x25519_session_key(
+                    instance.rint_pubkey, instance.rint_nonce
+                )
+            else:
+                validator_pubkey, session_key = derive_ecdh_session_key(
+                    instance.rint_pubkey, instance.rint_nonce
+                )
             instance.rint_session_key = session_key
             logger.info(
-                f"Derived ECDH session key for {instance.instance_id} "
+                f"Derived session key for {instance.instance_id} "
                 f"validator_pubkey={validator_pubkey[:16]}..."
             )
         except Exception as exc:
-            logger.error(f"ECDH session key derivation failed: {exc}")
+            logger.error(f"Session key derivation failed: {exc}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"ECDH session key derivation failed: {exc}",
+                detail=f"Session key derivation failed: {exc}",
             )
 
     # Generate a ciphertext for this instance to decrypt.

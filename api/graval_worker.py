@@ -3,6 +3,7 @@ GraVal node validation worker.
 """
 
 import api.database.orms  # noqa
+import ctypes
 import os
 import subprocess
 import tempfile
@@ -609,7 +610,9 @@ async def generate_fs_hash(
         )
 
     bin_name = "cfsv"
-    if semcomp(chutes_version or "0.0.0", "0.5.2") >= 0:
+    if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
+        bin_name = "cfsv_v4"
+    elif semcomp(chutes_version or "0.0.0", "0.5.2") >= 0:
         bin_name = "cfsv_v3"
     elif semcomp(chutes_version or "0.0.0", "0.4.7") >= 0:
         bin_name = "cfsv_v2"
@@ -670,3 +673,76 @@ async def generate_fs_hash(
         )
         raise Exception("No RESULT line found in cfsv output: {stdout.decode()}")
     return fsv_hash
+
+
+ENVVERIFY_LIB_PATH = "/usr/local/lib/libenvverify.so"
+
+
+@broker.task
+async def verify_bytecode_integrity(
+    image_id: str,
+    patch_version: str,
+    challenge: str,
+    modules_csv: str = "",
+) -> dict:
+    """
+    Download bytecode manifest from S3, parse it via libenvverify.so,
+    and return expected hashes for the given modules so the caller can
+    compare against the miner's response.
+    """
+    # Download manifest from S3 (cached locally like CFSV data).
+    cache_path = f"/tmp/{image_id}.{patch_version}.manifest"
+    if not os.path.exists(cache_path):
+        logger.info(f"Downloading bytecode manifest for {image_id=}, {patch_version=}")
+        s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest"
+        try:
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir="/tmp", prefix=f"{image_id}.{patch_version}.manifest."
+            )
+            os.close(temp_fd)
+            try:
+                async with settings.s3_client() as s3:
+                    await s3.download_file(settings.storage_bucket, s3_key, temp_path)
+                os.rename(temp_path, cache_path)
+                logger.info(
+                    f"Cached bytecode manifest to {cache_path} for {image_id=} {patch_version=}"
+                )
+            except Exception:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise
+        except Exception as e:
+            logger.error(f"Failed to download bytecode manifest from S3: {e}")
+            raise Exception(f"Failed to download bytecode manifest from S3: {e}")
+    else:
+        logger.info(f"Using cached bytecode manifest at {cache_path}")
+
+    # Parse manifest via libenvverify.so on the validator side.
+    if not os.path.exists(ENVVERIFY_LIB_PATH):
+        raise Exception(f"libenvverify.so not found at {ENVVERIFY_LIB_PATH}")
+
+    verify_lib = ctypes.CDLL(ENVVERIFY_LIB_PATH)
+    verify_lib.integrity_query_manifest_entries.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    verify_lib.integrity_query_manifest_entries.restype = ctypes.c_int
+
+    result_buf = ctypes.create_string_buffer(65536)
+    rc = verify_lib.integrity_query_manifest_entries(
+        cache_path.encode(),
+        (modules_csv or "").encode(),
+        result_buf,
+        65536,
+    )
+    if rc != 0:
+        logger.error(f"integrity_query_manifest_entries returned {rc}")
+        raise Exception(f"Failed to parse bytecode manifest (rc={rc})")
+
+    try:
+        return json.loads(result_buf.value)
+    except Exception as e:
+        logger.error(f"Failed to parse manifest entries JSON: {e}")
+        raise Exception(f"Failed to parse manifest entries JSON: {e}")

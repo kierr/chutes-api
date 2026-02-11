@@ -41,7 +41,8 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
 # NN verification lib.
 ADD data/chutes-nnverify.so /usr/local/lib/chutes-nnverify.so
-RUN chmod 755 /usr/local/lib/chutes-nnverify.so
+ADD data/chutes-aegis-verify.so /usr/local/lib/chutes-aegis-verify.so
+RUN chmod 755 /usr/local/lib/chutes-*.so
 
 ###
 # FORGE

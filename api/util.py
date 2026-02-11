@@ -43,8 +43,10 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from scalecodec.utils.ss58 import is_valid_ss58_address, ss58_decode
 from async_substrate_interface.async_substrate import AsyncSubstrateInterface
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, x25519
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 ALLOWED_HOST_RE = re.compile(r"(?!-)[a-z\d-]{1,63}(?<!-)$")
 ALLOWED_CHUTE_BUILDERS = {"build_sglang_chute", "build_vllm_chute"}
@@ -454,6 +456,91 @@ def derive_ecdh_session_key(miner_pubkey_hex: str, rint_nonce_hex: str) -> tuple
     return validator_pubkey_hex, session_key.hex()
 
 
+def derive_x25519_session_key(miner_x25519_pubkey_hex: str, rint_nonce_hex: str) -> tuple[str, str]:
+    """
+    Generate an ephemeral X25519 keypair and derive session key with miner's X25519 pubkey.
+
+    Args:
+        miner_x25519_pubkey_hex: Miner's X25519 public key as 64 hex chars (32 bytes)
+        rint_nonce_hex: The rint_nonce from instance (32 hex chars = 16 bytes)
+
+    Returns:
+        (validator_pubkey_hex, session_key_hex): Validator's X25519 pubkey to send back,
+        and the derived 32-byte session key for ChaCha20-Poly1305.
+
+    Session key derivation (v4):
+        HKDF-SHA256(
+            ikm=X25519_DH(validator_priv, miner_pub),
+            salt=miner_pub || validator_pub || nonce,
+            info=b"runint-session-v4",
+            length=32
+        )
+    """
+    miner_pubkey_bytes = bytes.fromhex(miner_x25519_pubkey_hex)
+    if len(miner_pubkey_bytes) != 32:
+        raise ValueError(f"Invalid miner X25519 pubkey length: {len(miner_pubkey_bytes)}")
+
+    rint_nonce_bytes = bytes.fromhex(rint_nonce_hex)
+    if len(rint_nonce_bytes) != 16:
+        raise ValueError(f"Invalid rint_nonce length: {len(rint_nonce_bytes)}")
+
+    miner_public_key = x25519.X25519PublicKey.from_public_bytes(miner_pubkey_bytes)
+
+    validator_private_key = x25519.X25519PrivateKey.generate()
+    validator_public_key = validator_private_key.public_key()
+    validator_pubkey_bytes = validator_public_key.public_bytes_raw()
+    validator_pubkey_hex = validator_pubkey_bytes.hex()
+
+    shared_secret = validator_private_key.exchange(miner_public_key)
+
+    salt = miner_pubkey_bytes + validator_pubkey_bytes + rint_nonce_bytes
+    session_key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        info=b"runint-session-v4",
+        backend=default_backend(),
+    ).derive(shared_secret)
+
+    return validator_pubkey_hex, session_key.hex()
+
+
+def chacha20_poly1305_encrypt(plaintext: bytes, key_hex: str) -> bytes:
+    """
+    Encrypt with ChaCha20-Poly1305.
+    Format: nonce (12 bytes) || ciphertext || tag (16 bytes)
+    """
+    if isinstance(plaintext, str):
+        plaintext = plaintext.encode()
+    key = bytes.fromhex(key_hex)
+    nonce = secrets.token_bytes(12)
+    aead = ChaCha20Poly1305(key)
+    ct = aead.encrypt(nonce, plaintext, None)
+    return nonce + ct
+
+
+def chacha20_poly1305_decrypt(ciphertext: bytes, key_hex: str) -> bytes:
+    """
+    Decrypt ChaCha20-Poly1305 ciphertext.
+    Format: nonce (12 bytes) || ciphertext || tag (16 bytes)
+    Ciphertext may be base64-encoded.
+    """
+    key = bytes.fromhex(key_hex)
+    if isinstance(ciphertext, str):
+        ciphertext = ciphertext.encode()
+    # Try base64 decode if it looks like base64
+    try:
+        raw = base64.b64decode(ciphertext)
+    except Exception:
+        raw = ciphertext
+    if len(raw) < 28:  # 12 nonce + 16 tag minimum
+        raise ValueError("Ciphertext too short for ChaCha20-Poly1305")
+    nonce = raw[:12]
+    ct_and_tag = raw[12:]
+    aead = ChaCha20Poly1305(key)
+    return aead.decrypt(nonce, ct_and_tag, None)
+
+
 def aes_gcm_encrypt(plaintext: bytes, key: bytes) -> bytes:
     """
     Encrypt with AES-256-GCM.
@@ -503,6 +590,12 @@ def decrypt_instance_response(
             raise ValueError("iv required for legacy AES-CBC decryption")
         return aes_decrypt(ciphertext, instance.symmetric_key, iv)
 
+    # chutes >= 0.5.5 uses ChaCha20-Poly1305 with X25519-derived session key
+    if semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
+        if not instance.rint_session_key:
+            raise ValueError("chutes >= 0.5.5 requires rint_session_key")
+        return chacha20_poly1305_decrypt(ciphertext, instance.rint_session_key)
+
     # chutes >= 0.5.1 uses AES-256-GCM with ECDH-derived session key
     if semcomp(instance.chutes_version or "0.0.0", "0.5.1") >= 0:
         if not instance.rint_session_key:
@@ -536,6 +629,15 @@ def encrypt_instance_request(
     """
     if isinstance(plaintext, str):
         plaintext = plaintext.encode()
+
+    # chutes >= 0.5.5 uses ChaCha20-Poly1305 with X25519-derived session key
+    if semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
+        if not instance.rint_session_key:
+            raise ValueError("chutes >= 0.5.5 requires rint_session_key")
+        encrypted = chacha20_poly1305_encrypt(plaintext, instance.rint_session_key)
+        if hex_encode:
+            return encrypted.hex(), None
+        return base64.b64encode(encrypted).decode(), None
 
     # chutes >= 0.5.1 uses AES-256-GCM with ECDH-derived session key
     if semcomp(instance.chutes_version or "0.0.0", "0.5.1") >= 0:
