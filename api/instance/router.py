@@ -2190,8 +2190,8 @@ async def get_tee_instance_evidence(
     except GetEvidenceError as e:
         logger.error(f"Failed to get evidence for instance {instance_id}: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve TEE evidence from server",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Attestation service unavailable. The attestation proxy could not be reached or returned an error.",
         )
 
 

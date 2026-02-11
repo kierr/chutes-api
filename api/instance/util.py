@@ -922,8 +922,8 @@ async def verify_tee_chute(
     except GetEvidenceError as exc:
         logger.error(f"Failed to get evidence from chute proxy for {instance.host}: {exc}")
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to retrieve attestation evidence from chute proxy",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Attestation service unavailable. The chute attestation proxy could not be reached or returned an error. Please ensure the server is accessible and the attestation service is running.",
         )
     except HTTPException:
         raise
