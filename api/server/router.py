@@ -38,7 +38,12 @@ from api.server.service import (
     validate_request_nonce,
     process_luks_passphrase_request,
 )
-from api.server.util import decrypt_passphrase, extract_client_cert_hash, get_luks_passphrase, _get_vm_cache_config
+from api.server.util import (
+    decrypt_passphrase,
+    extract_client_cert_hash,
+    get_luks_passphrase,
+    _get_vm_cache_config,
+)
 from api.server.exceptions import (
     AttestationError,
     NonceError,
@@ -105,6 +110,7 @@ async def verify_boot_attestation(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Boot attestation failed"
         )
 
+
 @router.get("/{vm_name}/luks", response_model=Dict[str, str])
 async def get_cache_luks_passphrase(
     vm_name: str,
@@ -139,13 +145,11 @@ async def get_cache_luks_passphrase(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
             )
-            
-        #Legacy passphrase stored under storage key
+
+        # Legacy passphrase stored under storage key
         passphrase = decrypt_passphrase(vm_config.volume_passphrases.get("storage"))
 
-        return {
-            "passphrase": passphrase
-        }
+        return {"passphrase": passphrase}
 
     except NonceError as e:
         logger.warning(f"Boot token validation error: {str(e)}")

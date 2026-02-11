@@ -455,8 +455,6 @@ async def verify_server(
         # Validate GPUs match measurement configuration
         validate_gpus_for_measurements(quote, gpus)
 
-        
-
         logger.success(
             f"Verified server server_id={server.server_id} ip={server.ip} for miner: {miner_hotkey}"
         )
