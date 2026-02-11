@@ -1141,7 +1141,7 @@ async def manage_rolling_updates(
             instance_ids = [instance.instance_id for instance in to_delete]
             await session.execute(
                 text(
-                    "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = ANY(:instance_ids)"
+                    "UPDATE instance_audit SET deletion_reason = :reason, valid_termination = true WHERE instance_id = ANY(:instance_ids)"
                 ),
                 {"reason": reason, "instance_ids": instance_ids},
             )
@@ -1514,6 +1514,11 @@ async def _perform_autoscale_impl(
     previous_smoothed = {}
     if not dry_run:
         previous_smoothed = await get_smoothed_metrics(all_chute_ids)
+
+    # Load sponsored chute IDs (no demand boost for sponsored chutes)
+    from api.invocation.util import get_all_sponsored_chute_ids
+
+    sponsored_chute_ids = await get_all_sponsored_chute_ids()
 
     # 1. Initialize Contexts and Calculate Urgency
     contexts: Dict[str, AutoScaleContext] = {}
@@ -1929,7 +1934,11 @@ async def _perform_autoscale_impl(
         max_urgency = 0
 
     for ctx in contexts.values():
-        if ctx.upscale_amount > 0:
+        if ctx.chute_id in sponsored_chute_ids:
+            ctx.boost = 1.0
+        elif not ctx.public and ctx.current_count >= ctx.max_instances:
+            ctx.boost = 1.0
+        elif ctx.upscale_amount > 0:
             # Base boost from SMOOTHED individual urgency (stable across runs)
             normalized_urgency = min(ctx.smoothed_urgency / URGENCY_MAX_FOR_BOOST, 1.0)
             base_boost = URGENCY_BOOST_MIN + (

@@ -1885,7 +1885,7 @@ async def teeify_chute(
     current_user: User = Depends(get_current_user()),
 ):
     """
-    Convert an affine chute to a TEE-enabled version.
+    Create a new TEE-enabled chute from an existing affine chute.
     """
     # Validate chute_id is a UUID
     try:
@@ -1896,7 +1896,7 @@ async def teeify_chute(
             detail="Must use chute UUID for teeify.",
         )
 
-    # Find the chute
+    # Find the original chute
     chute = (
         (
             await db.execute(
@@ -1929,16 +1929,26 @@ async def teeify_chute(
             detail="Only chutes with 'affine' in the name can be TEE-ified",
         )
 
-    # Check if already TEE-ified
-    if chute.tee:
+    # Check if a TEE version of this chute already exists
+    tee_name = f"{chute.name}-TEE"
+    existing_tee = (
+        (
+            await db.execute(
+                select(Chute).where(Chute.name == tee_name).where(Chute.user_id == chute.user_id)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    if existing_tee:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Chute already has TEE enabled",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"TEE version already exists: {existing_tee.chute_id}",
         )
 
     # Transform the code and node_selector for TEE
     try:
-        new_code, new_node_selector = transform_for_tee(chute.code, chute.node_selector)
+        new_code, new_node_selector = transform_for_tee(chute.code, chute.node_selector, tee_name)
     except Exception as exc:
         logger.error(f"Failed to transform code for TEE: {exc}")
         raise HTTPException(
@@ -1946,57 +1956,98 @@ async def teeify_chute(
             detail=f"Failed to transform code for TEE: {str(exc)}",
         )
 
-    # Delete existing instances
-    for inst in chute.instances:
-        logger.info(
-            f"Deleting instance for TEE promotion: {inst.instance_id=} {inst.miner_hotkey=}"
-        )
-        await db.delete(inst)
-        await notify_deleted(inst, "promoted to TEE")
-        await db.execute(
-            text(
-                "UPDATE instance_audit SET deletion_reason = :reason, valid_termination = true WHERE instance_id = :instance_id"
-            ),
-            {"instance_id": inst.instance_id, "reason": "promoted to TEE"},
-        )
-
-    # Update the chute
-    chute.code = new_code
-    chute.node_selector = new_node_selector
-    chute.tee = True
-    chute.immutable = True
-    chute.version = str(
+    # Generate new chute_id and version for the TEE clone
+    new_chute_id = str(
+        uuid.uuid5(uuid.NAMESPACE_OID, f"{current_user.username}::chute::{tee_name}")
+    )
+    new_version = str(
         uuid.uuid5(uuid.NAMESPACE_OID, f"{chute.image_id}:{chute.image.patch_version}:{new_code}")
     )
-    chute.updated_at = func.now()
 
+    # Create the new TEE chute
+    try:
+        tee_chute = Chute(
+            chute_id=new_chute_id,
+            user_id=chute.user_id,
+            name=tee_name,
+            tagline=chute.tagline,
+            readme=chute.readme,
+            tool_description=chute.tool_description,
+            logo_id=chute.logo_id,
+            image_id=chute.image_id,
+            code=new_code,
+            filename=chute.filename,
+            ref_str=chute.ref_str,
+            version=new_version,
+            public=chute.public,
+            cords=chute.cords,
+            jobs=chute.jobs,
+            node_selector=new_node_selector,
+            standard_template=chute.standard_template,
+            chutes_version=chute.chutes_version,
+            concurrency=chute.concurrency,
+            revision=chute.revision,
+            scaling_threshold=chute.scaling_threshold,
+            max_instances=chute.max_instances,
+            shutdown_after_seconds=chute.shutdown_after_seconds,
+            allow_external_egress=chute.allow_external_egress,
+            encrypted_fs=chute.encrypted_fs,
+            tee=True,
+            immutable=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Validation failure: {exc}",
+        )
+
+    # Generate a unique slug for the new chute
+    tee_chute.slug = re.sub(
+        r"[^a-z0-9-]+$",
+        "-",
+        slugify(f"{current_user.username}-{tee_name}", max_length=58).lower(),
+    )
+    base_slug = tee_chute.slug
+    already_exists = (
+        await db.execute(select(exists().where(Chute.slug == tee_chute.slug)))
+    ).scalar()
+    while already_exists:
+        suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(5))
+        tee_chute.slug = f"{base_slug}-{suffix}"
+        already_exists = (
+            await db.execute(select(exists().where(Chute.slug == tee_chute.slug)))
+        ).scalar()
+
+    db.add(tee_chute)
     await db.commit()
-    await db.refresh(chute)
+    await db.refresh(tee_chute)
 
-    # Notify miners about the update
+    # Notify miners about the new chute
     await settings.redis_client.publish(
         "miner_broadcast",
         json.dumps(
             {
-                "reason": "chute_updated",
+                "reason": "chute_created",
                 "data": {
-                    "chute_id": chute.chute_id,
-                    "version": chute.version,
-                    "job_only": not chute.cords,
+                    "chute_id": tee_chute.chute_id,
+                    "version": tee_chute.version,
+                    "job_only": not tee_chute.cords,
                 },
             }
         ).decode(),
     )
 
-    logger.success(f"TEE-ified chute: {chute.chute_id} {chute.name}")
-    response = ChuteResponse.from_orm(chute)
-    await _inject_current_estimated_price(chute, response)
-    await create_bounty_if_not_exists(chute.chute_id)
-    amount = await get_bounty_amount(chute_id)
+    logger.success(
+        f"TEE-ified chute created: {tee_chute.chute_id} {tee_chute.name} (from {chute.chute_id})"
+    )
+    response = ChuteResponse.from_orm(tee_chute)
+    await _inject_current_estimated_price(tee_chute, response)
+    await create_bounty_if_not_exists(tee_chute.chute_id)
+    amount = await get_bounty_amount(tee_chute.chute_id)
     if amount:
-        await send_bounty_notification(chute_id, amount)
-    bounty_info = await get_bounty_info(chute.chute_id)
-    await _inject_effective_compute_multiplier(chute, response, bounty_info=bounty_info)
+        await send_bounty_notification(tee_chute.chute_id, amount)
+    bounty_info = await get_bounty_info(tee_chute.chute_id)
+    await _inject_effective_compute_multiplier(tee_chute, response, bounty_info=bounty_info)
     return response
 
 
