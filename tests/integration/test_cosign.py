@@ -150,12 +150,12 @@ exit 0
 
 @pytest.fixture(autouse=True)
 def mock_extract_cfsv(mock_cfsv):
-    async def mock_extract_cfsv_data(verification_tag: str, build_dir: str) -> str:
+    async def mock_extract_cfsv_data(verification_tag: str, build_dir: str):
         """Mock CFSV data extraction without container mounting."""
         data_file_path = os.path.join(build_dir, "chutesfs.data")
         with open(data_file_path, "w") as f:
             f.write("mock cfsv verification data")
-        return data_file_path
+        return data_file_path, None, None, None, None
 
     with patch(
         "api.image.forge.extract_cfsv_data_from_verification_image",

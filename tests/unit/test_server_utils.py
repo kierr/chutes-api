@@ -10,11 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, Mock
 
+from api.config import TeeMeasurementConfig
 from api.server.util import (
     generate_nonce,
     get_nonce_expiry_seconds,
     verify_quote_signature,
     verify_measurements,
+    verify_result,
+    get_matching_measurement_config,
     extract_nonce,
     get_luks_passphrase,
 )
@@ -26,8 +29,8 @@ from api.server.quote import (
 )
 from api.server.exceptions import (
     InvalidQuoteError,
+    InvalidTdxConfiguration,
     MeasurementMismatchError,
-    InvalidSignatureError,
 )
 
 
@@ -38,27 +41,43 @@ def test_nonce():
     return "test_nonce_123"
 
 
+def _tee_measurements_for_quotes():
+    """TeeMeasurementConfig list matching sample_boot_quote and sample_runtime_quote."""
+    return [
+        TeeMeasurementConfig(
+            version="1",
+            mrtd="a" * 96,
+            name="test-boot",
+            boot_rtmrs={"RTMR0": "b" * 96, "RTMR1": "c" * 96, "RTMR2": "d" * 96, "RTMR3": "e" * 96},
+            runtime_rtmrs={
+                "RTMR0": "d" * 96,
+                "RTMR1": "e" * 96,
+                "RTMR2": "f" * 96,
+                "RTMR3": "0" * 96,
+            },
+            expected_gpus=["h200"],
+            gpu_count=8,
+        ),
+    ]
+
+
 @pytest.fixture
 def mock_settings():
     """Mock settings for testing."""
     settings = Mock()
-    settings.expected_mrtd = "a" * 96  # 48 bytes = 96 hex chars
-    settings.expected_boot_rmtrs = {
-        "rtmr0": "b" * 96,
-        "rtmr1": "c" * 96,
-    }
-    settings.exepected_runtime_rmtrs = {
-        "rtmr0": "d" * 96,
-        "rtmr1": "e" * 96,
-    }
+    settings.tee_measurements = _tee_measurements_for_quotes()
     settings.luks_passphrase = "test_luks_passphrase"
     return settings
+
+
+# report_data: first 64 hex chars = nonce, next 64 = cert hash (extract_nonce uses report_data[:64])
+BOOT_NONCE_HEX = (b"test_nonce_123".ljust(32, b"\x00")).hex()
+RUNTIME_NONCE_HEX = (b"runtime_nonce_456".ljust(32, b"\x00")).hex()
 
 
 @pytest.fixture
 def sample_boot_quote():
     """Create a sample BootTdxQuote for testing."""
-
     return BootTdxQuote(
         version=4,
         att_key_type=2,
@@ -68,7 +87,9 @@ def sample_boot_quote():
         rtmr1="c" * 96,
         rtmr2="d" * 96,
         rtmr3="e" * 96,
-        user_data="746573745f6e6f6e63655f31323300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",  # test_nonce_123 as hex
+        report_data=BOOT_NONCE_HEX + "0" * 64,
+        user_data="746573745f6e6f6e63655f31323300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"dummy_quote_bytes",
@@ -78,17 +99,18 @@ def sample_boot_quote():
 @pytest.fixture
 def sample_runtime_quote():
     """Create a sample RuntimeTdxQuote for testing."""
-
     return RuntimeTdxQuote(
         version=4,
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="d" * 96,  # Different from boot
-        rtmr1="e" * 96,  # Different from boot
+        rtmr0="d" * 96,
+        rtmr1="e" * 96,
         rtmr2="f" * 96,
         rtmr3="0" * 96,
-        user_data="72756e74696d655f6e6f6e63655f34353600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",  # runtime_nonce_456 as hex
+        report_data=RUNTIME_NONCE_HEX + "0" * 64,
+        user_data="72756e74696d655f6e6f6e63655f34353600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"dummy_runtime_quote_bytes",
@@ -161,7 +183,9 @@ def test_tdx_verification_result_creation():
         rtmr3="e" * 96,
         user_data="test_data",
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     assert result.mrtd == "a" * 96
@@ -180,7 +204,9 @@ def test_tdx_verification_result_rtmrs_property():
         rtmr3="3" * 96,
         user_data=None,
         parsed_at=datetime.now(timezone.utc),
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     rtmrs = result.rtmrs
@@ -202,7 +228,9 @@ def test_tdx_verification_result_to_dict():
         rtmr3="e" * 96,
         user_data="test",
         parsed_at=now,
-        is_valid=True,
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
     )
 
     dict_result = result.to_dict()
@@ -311,13 +339,14 @@ def test_parse_quote_with_user_data(valid_quote_bytes, test_nonce):
     for i, byte in enumerate(nonce_bytes[:64]):
         quote_bytes[user_data_offset + i] = byte
 
-    # Parse both types
+    # Parse both types (nonce written into report_data region at offset 568)
     boot_quote = BootTdxQuote.from_bytes(bytes(quote_bytes))
     runtime_quote = RuntimeTdxQuote.from_bytes(bytes(quote_bytes))
 
-    # Both should extract the same nonce
-    assert extract_nonce(boot_quote) == test_nonce
-    assert extract_nonce(runtime_quote) == test_nonce
+    # extract_nonce returns first 64 hex chars of report_data
+    expected_nonce_hex = (test_nonce.encode("utf-8").ljust(32, b"\x00")).hex()
+    assert extract_nonce(boot_quote) == expected_nonce_hex
+    assert extract_nonce(runtime_quote) == expected_nonce_hex
 
 
 # Quote parsing tests - Invalid cases
@@ -339,8 +368,8 @@ def test_parse_invalid_version(valid_quote_bytes):
     """Test parsing with invalid quote version."""
     quote_bytes = bytearray(valid_quote_bytes)
 
-    # Modify version (first 2 bytes, little endian)
-    quote_bytes[0] = 5  # Invalid version
+    # Modify version (first 2 bytes, little endian) to an unsupported value
+    quote_bytes[0] = 99  # Invalid version (parser accepts 4 and 5 only)
     quote_bytes[1] = 0
 
     with pytest.raises(InvalidQuoteError, match="Invalid quote version"):
@@ -375,21 +404,19 @@ def test_parse_invalid_att_key_type(valid_quote_bytes):
 
 # Extract nonce tests
 def test_extract_nonce_valid(sample_boot_quote):
-    """Test extracting valid nonce from quote."""
-    # The sample quote has test_nonce_123 encoded in user_data
+    """Test extracting valid nonce from quote (first 64 hex chars of report_data)."""
     extracted = extract_nonce(sample_boot_quote)
-    assert extracted == "test_nonce_123"
+    assert extracted == BOOT_NONCE_HEX
 
 
 def test_extract_nonce_runtime_quote(sample_runtime_quote):
     """Test extracting nonce from runtime quote."""
     extracted = extract_nonce(sample_runtime_quote)
-    assert extracted == "runtime_nonce_456"
+    assert extracted == RUNTIME_NONCE_HEX
 
 
 def test_extract_nonce_empty_user_data():
-    """Test extracting nonce when user data is empty."""
-
+    """Test extracting nonce when report_data is empty (zeros)."""
     quote = BootTdxQuote(
         version=4,
         att_key_type=2,
@@ -399,14 +426,76 @@ def test_extract_nonce_empty_user_data():
         rtmr1="c" * 96,
         rtmr2="d" * 96,
         rtmr3="e" * 96,
-        user_data="00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",  # All zeros
+        report_data="0" * 128,
+        user_data="0" * 128,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"test",
     )
-
     extracted = extract_nonce(quote)
-    assert extracted == ""
+    assert extracted == "0" * 64
+
+
+# Verification result consistency (quote vs DCAP result) tests
+def _sample_verification_result():
+    """TdxVerificationResult matching sample_boot_quote measurements."""
+    return TdxVerificationResult(
+        mrtd="a" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
+        user_data=None,
+        parsed_at=datetime.now(timezone.utc),
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes="0000001000000000",
+    )
+
+
+def test_verify_result_success_when_quote_matches_dcap(sample_boot_quote):
+    """verify_result succeeds when quote and DCAP result measurements match."""
+    result = _sample_verification_result()
+    assert verify_result(sample_boot_quote, result) is True
+
+
+def test_verify_result_raises_when_mrtd_differs_from_dcap_result(sample_boot_quote):
+    """verify_result raises MeasurementMismatchError when quote MRTD != DCAP result MRTD."""
+    result = _sample_verification_result()
+    result = TdxVerificationResult(
+        mrtd="f" * 96,  # differs from quote
+        rtmr0=result.rtmr0,
+        rtmr1=result.rtmr1,
+        rtmr2=result.rtmr2,
+        rtmr3=result.rtmr3,
+        user_data=result.user_data,
+        parsed_at=result.parsed_at,
+        status=result.status,
+        td_attributes=result.td_attributes,
+        advisory_ids=result.advisory_ids,
+    )
+    with pytest.raises(MeasurementMismatchError):
+        verify_result(sample_boot_quote, result)
+
+
+def test_verify_result_raises_when_rtmr_differs_from_dcap_result(sample_boot_quote):
+    """verify_result raises MeasurementMismatchError when quote RTMR != DCAP result RTMR."""
+    result = _sample_verification_result()
+    result = TdxVerificationResult(
+        mrtd=result.mrtd,
+        rtmr0="x" * 96,  # differs from quote
+        rtmr1=result.rtmr1,
+        rtmr2=result.rtmr2,
+        rtmr3=result.rtmr3,
+        user_data=result.user_data,
+        parsed_at=result.parsed_at,
+        status=result.status,
+        td_attributes=result.td_attributes,
+        advisory_ids=result.advisory_ids,
+    )
+    with pytest.raises(MeasurementMismatchError):
+        verify_result(sample_boot_quote, result)
 
 
 # Quote signature verification tests
@@ -415,7 +504,11 @@ async def test_verify_quote_signature_success(sample_boot_quote):
     """Test successful quote signature verification."""
     mock_verified_report = Mock()
     mock_verified_report.status = "UpToDate"
-    mock_verified_report.to_json.return_value = '{"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", "rt_mr3": "e", "report_data": "test"}}}'
+    mock_verified_report.to_json.return_value = (
+        '{"status": "UpToDate", "advisory_ids": [], '
+        '"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", '
+        '"rt_mr3": "e", "report_data": "test", "td_attributes": "0000001000000000"}}}'
+    )
 
     with patch(
         "api.server.util.get_collateral_and_verify", return_value=mock_verified_report
@@ -429,13 +522,16 @@ async def test_verify_quote_signature_success(sample_boot_quote):
 
 @pytest.mark.asyncio
 async def test_verify_quote_signature_failure(sample_boot_quote):
-    """Test failed quote signature verification."""
+    """Test failed quote signature verification (util wraps in InvalidQuoteError)."""
     mock_verified_report = Mock()
-    mock_verified_report.status = "Invalid"
-    mock_verified_report.to_json.return_value = '{"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", "rt_mr3": "e", "report_data": "test"}}}'
+    mock_verified_report.to_json.return_value = (
+        '{"status": "Unknown", "advisory_ids": [], '
+        '"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", '
+        '"rt_mr3": "e", "report_data": "test", "td_attributes": "0000001000000000"}}}'
+    )
 
     with patch("api.server.util.get_collateral_and_verify", return_value=mock_verified_report):
-        with pytest.raises(InvalidSignatureError):
+        with pytest.raises(InvalidQuoteError, match="Unable to parse provided quote"):
             await verify_quote_signature(sample_boot_quote)
 
 
@@ -443,11 +539,7 @@ async def test_verify_quote_signature_failure(sample_boot_quote):
 @patch("api.server.util.settings")
 def test_verify_measurements_boot_success(mock_settings, sample_boot_quote):
     """Test successful boot measurement verification."""
-    mock_settings.expected_mrtd = sample_boot_quote.mrtd
-    mock_settings.expected_boot_rmtrs = {
-        "rtmr0": sample_boot_quote.rtmr0,
-        "rtmr1": sample_boot_quote.rtmr1,
-    }
+    mock_settings.tee_measurements = _tee_measurements_for_quotes()
 
     result = verify_measurements(sample_boot_quote)
     assert result is True
@@ -456,11 +548,7 @@ def test_verify_measurements_boot_success(mock_settings, sample_boot_quote):
 @patch("api.server.util.settings")
 def test_verify_measurements_runtime_success(mock_settings, sample_runtime_quote):
     """Test successful runtime measurement verification."""
-    mock_settings.expected_mrtd = sample_runtime_quote.mrtd
-    mock_settings.exepected_runtime_rmtrs = {
-        "rtmr0": sample_runtime_quote.rtmr0,
-        "rtmr1": sample_runtime_quote.rtmr1,
-    }
+    mock_settings.tee_measurements = _tee_measurements_for_quotes()
 
     result = verify_measurements(sample_runtime_quote)
     assert result is True
@@ -468,31 +556,61 @@ def test_verify_measurements_runtime_success(mock_settings, sample_runtime_quote
 
 @patch("api.server.util.settings")
 def test_verify_measurements_mrtd_mismatch(mock_settings, sample_boot_quote):
-    """Test measurement verification with MRTD mismatch."""
-    mock_settings.expected_mrtd = "different" + "0" * 88
-    mock_settings.expected_boot_rmtrs = {}
+    """Test measurement verification with MRTD mismatch (no matching config)."""
+    mock_settings.tee_measurements = [
+        TeeMeasurementConfig(
+            version="1",
+            mrtd="different" + "0" * 88,
+            name="other",
+            boot_rtmrs={"RTMR0": "b" * 96, "RTMR1": "c" * 96, "RTMR2": "d" * 96, "RTMR3": "e" * 96},
+            runtime_rtmrs={
+                "RTMR0": "d" * 96,
+                "RTMR1": "e" * 96,
+                "RTMR2": "f" * 96,
+                "RTMR3": "0" * 96,
+            },
+            expected_gpus=[],
+            gpu_count=None,
+        ),
+    ]
 
-    with pytest.raises(MeasurementMismatchError, match="MRTD verification failed"):
+    with pytest.raises(MeasurementMismatchError):
         verify_measurements(sample_boot_quote)
 
 
 @patch("api.server.util.settings")
 def test_verify_measurements_rtmr_mismatch(mock_settings, sample_boot_quote):
-    """Test measurement verification with RTMR mismatch."""
-    mock_settings.expected_mrtd = sample_boot_quote.mrtd
-    mock_settings.expected_boot_rmtrs = {
-        "rtmr0": "different" + "0" * 88,
-    }
+    """Test measurement verification with RTMR mismatch (no matching config)."""
+    mock_settings.tee_measurements = [
+        TeeMeasurementConfig(
+            version="1",
+            mrtd=sample_boot_quote.mrtd,
+            name="other",
+            boot_rtmrs={
+                "RTMR0": "different" + "0" * 88,
+                "RTMR1": "c" * 96,
+                "RTMR2": "d" * 96,
+                "RTMR3": "e" * 96,
+            },
+            runtime_rtmrs={
+                "RTMR0": "d" * 96,
+                "RTMR1": "e" * 96,
+                "RTMR2": "f" * 96,
+                "RTMR3": "0" * 96,
+            },
+            expected_gpus=[],
+            gpu_count=None,
+        ),
+    ]
 
-    with pytest.raises(MeasurementMismatchError, match="RTMR rtmr0 verification failed"):
+    with pytest.raises(MeasurementMismatchError):
         verify_measurements(sample_boot_quote)
 
 
 @patch("api.server.util.settings")
-def test_verify_measurements_no_expected_mrtd(mock_settings, sample_boot_quote):
-    """Test measurement verification with no expected MRTD configured."""
-    mock_settings.expected_mrtd = None
-    mock_settings.expected_boot_rmtrs = {}
+def test_verify_measurements_no_matching_config(mock_settings, sample_boot_quote):
+    """Test measurement verification with no matching config (empty list)."""
+    mock_settings.tee_measurements = []
 
     with pytest.raises(MeasurementMismatchError):
         verify_measurements(sample_boot_quote)
@@ -500,14 +618,88 @@ def test_verify_measurements_no_expected_mrtd(mock_settings, sample_boot_quote):
 
 @patch("api.server.util.settings")
 def test_verify_measurements_partial_rtmrs(mock_settings, sample_runtime_quote):
-    """Test measurement verification with partial RTMR checking."""
-    mock_settings.expected_mrtd = sample_runtime_quote.mrtd
-    mock_settings.exepected_runtime_rmtrs = {
-        "rtmr1": sample_runtime_quote.rtmr1,  # Only check RTMR1
-    }
+    """Test measurement verification with config that has all RTMRs."""
+    mock_settings.tee_measurements = _tee_measurements_for_quotes()
 
     result = verify_measurements(sample_runtime_quote)
     assert result is True
+
+
+@patch("api.server.util.settings")
+def test_get_matching_measurement_config_returns_config(mock_settings, sample_boot_quote):
+    """Test get_matching_measurement_config returns the matching config."""
+    mock_settings.tee_measurements = _tee_measurements_for_quotes()
+
+    config = get_matching_measurement_config(sample_boot_quote)
+    assert config.version == "1"
+    assert config.name == "test-boot"
+    assert config.mrtd == "a" * 96
+
+
+@patch("api.server.util.settings")
+def test_get_matching_measurement_config_no_match_raises(mock_settings, sample_boot_quote):
+    """Test get_matching_measurement_config raises when no config matches."""
+    mock_settings.tee_measurements = []
+
+    with pytest.raises(MeasurementMismatchError):
+        get_matching_measurement_config(sample_boot_quote)
+
+
+# TdxQuote.matches_measurement tests
+def test_tdx_quote_matches_measurement_boot(sample_boot_quote):
+    """TdxQuote.matches_measurement returns True when MRTD and boot RTMRs match."""
+    config = _tee_measurements_for_quotes()[0]
+    assert sample_boot_quote.matches_measurement(config) is True
+
+
+def test_tdx_quote_matches_measurement_runtime(sample_runtime_quote):
+    """TdxQuote.matches_measurement returns True when MRTD and runtime RTMRs match."""
+    config = _tee_measurements_for_quotes()[0]
+    assert sample_runtime_quote.matches_measurement(config) is True
+
+
+def test_tdx_quote_matches_measurement_mrtd_mismatch():
+    """TdxQuote.matches_measurement returns False when MRTD differs."""
+    config = _tee_measurements_for_quotes()[0]
+    quote_wrong_mrtd = BootTdxQuote(
+        version=4,
+        att_key_type=2,
+        tee_type=0x81,
+        mrtd="f" * 96,  # wrong MRTD
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
+        report_data=None,
+        user_data="",
+        platform_id="0" * 32,
+        raw_quote_size=4096,
+        parsed_at=datetime.now(timezone.utc).isoformat(),
+        raw_bytes=b"",
+    )
+    assert quote_wrong_mrtd.matches_measurement(config) is False
+
+
+def test_tdx_quote_matches_measurement_rtmr_mismatch():
+    """TdxQuote.matches_measurement returns False when an RTMR differs."""
+    config = _tee_measurements_for_quotes()[0]
+    quote_wrong_rtmr = BootTdxQuote(
+        version=4,
+        att_key_type=2,
+        tee_type=0x81,
+        mrtd="a" * 96,
+        rtmr0="x" * 96,  # wrong RTMR0
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
+        report_data=None,
+        user_data="",
+        platform_id="0" * 32,
+        raw_quote_size=4096,
+        parsed_at=datetime.now(timezone.utc).isoformat(),
+        raw_bytes=b"",
+    )
+    assert quote_wrong_rtmr.matches_measurement(config) is False
 
 
 # LUKS passphrase tests
@@ -522,11 +714,11 @@ def test_get_luks_passphrase_configured(mock_settings):
 
 @patch("api.server.util.settings")
 def test_get_luks_passphrase_not_configured(mock_settings):
-    """Test getting LUKS passphrase when not configured."""
+    """Test getting LUKS passphrase when not configured raises."""
     mock_settings.luks_passphrase = None
 
-    passphrase = get_luks_passphrase()
-    assert passphrase == "placeholder_luks_passphrase"
+    with pytest.raises(InvalidTdxConfiguration, match="LUKS passphrase"):
+        get_luks_passphrase()
 
 
 # Test different quote types with different RTMRs
@@ -542,7 +734,9 @@ def test_boot_vs_runtime_quote_differences():
         rtmr1="boot_rtmr1",
         rtmr2="d" * 96,
         rtmr3="e" * 96,
+        report_data=None,
         user_data=None,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"boot",
@@ -557,7 +751,9 @@ def test_boot_vs_runtime_quote_differences():
         rtmr1="runtime_rtmr1",
         rtmr2="d" * 96,
         rtmr3="e" * 96,
+        report_data=None,
         user_data=None,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"runtime",
@@ -584,7 +780,9 @@ def test_quote_with_mixed_case_hex():
         rtmr1="fedcba" * 16,
         rtmr2="d" * 96,
         rtmr3="e" * 96,
+        report_data=None,
         user_data=None,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"test",
@@ -627,14 +825,14 @@ def test_extract_nonce_with_binary_data():
         rtmr1="c" * 96,
         rtmr2="d" * 96,
         rtmr3="e" * 96,
+        report_data=user_data_hex[:64].ljust(64, "0") + "0" * 64,
         user_data=user_data_hex,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"test",
     )
-
     extracted = extract_nonce(quote)
-    # Should extract the printable portion or handle binary gracefully
     assert extracted is not None
 
 
@@ -646,6 +844,8 @@ def test_verification_result_from_report():
     mock_report.status = "UpToDate"
     mock_report.to_json.return_value = """
     {
+        "status": "UpToDate",
+        "advisory_ids": [],
         "report": {
             "TD10": {
                 "mr_td": "test_mrtd",
@@ -653,7 +853,8 @@ def test_verification_result_from_report():
                 "rt_mr1": "test_rtmr1",
                 "rt_mr2": "test_rtmr2",
                 "rt_mr3": "test_rtmr3",
-                "report_data": "test_report_data"
+                "report_data": "test_report_data",
+                "td_attributes": "0000001000000000"
             }
         }
     }
@@ -666,7 +867,7 @@ def test_verification_result_from_report():
     assert result.rtmr1 == "test_rtmr1"
     assert result.rtmr2 == "test_rtmr2"
     assert result.rtmr3 == "test_rtmr3"
-    assert result.report_data == "test_report_data"
+    assert result.user_data == "test_report_data"
     assert result.is_valid is True
     assert isinstance(result.parsed_at, datetime)
 
@@ -676,9 +877,10 @@ def test_verification_result_from_report_invalid():
     from unittest.mock import Mock
 
     mock_report = Mock()
-    mock_report.status = "Invalid"
     mock_report.to_json.return_value = """
     {
+        "status": "Unknown",
+        "advisory_ids": [],
         "report": {
             "TD10": {
                 "mr_td": "test_mrtd",
@@ -686,7 +888,8 @@ def test_verification_result_from_report_invalid():
                 "rt_mr1": "test_rtmr1",
                 "rt_mr2": "test_rtmr2",
                 "rt_mr3": "test_rtmr3",
-                "report_data": "test_report_data"
+                "report_data": "test_report_data",
+                "td_attributes": "0000001000000000"
             }
         }
     }
@@ -767,21 +970,27 @@ def test_measurement_verification_with_actual_config(mock_settings):
         EXPECTED_RMTR3,
     )
 
-    # Configure settings with test fixture values
-    mock_settings.expected_mrtd = EXPECTED_MRTD
-    mock_settings.expected_boot_rmtrs = {
-        "rtmr0": EXPECTED_RMTR0,
-        "rtmr1": EXPECTED_RMTR1,
-        "rtmr2": EXPECTED_RMTR2,
-        "rtmr3": EXPECTED_RMTR3,
-    }
-    mock_settings.exepected_runtime_rmtrs = {
-        "rtmr0": EXPECTED_RMTR0,
-        "rtmr1": EXPECTED_RMTR1,
-        # Runtime might have different RTMR2/3
-        "rtmr2": "0" * 96,  # Different from boot
-        "rtmr3": "0" * 96,
-    }
+    mock_settings.tee_measurements = [
+        TeeMeasurementConfig(
+            version="1",
+            mrtd=EXPECTED_MRTD,
+            name="fixture",
+            boot_rtmrs={
+                "RTMR0": EXPECTED_RMTR0,
+                "RTMR1": EXPECTED_RMTR1,
+                "RTMR2": EXPECTED_RMTR2,
+                "RTMR3": EXPECTED_RMTR3,
+            },
+            runtime_rtmrs={
+                "RTMR0": EXPECTED_RMTR0,
+                "RTMR1": EXPECTED_RMTR1,
+                "RTMR2": "0" * 96,
+                "RTMR3": "0" * 96,
+            },
+            expected_gpus=[],
+            gpu_count=None,
+        ),
+    ]
 
     boot_quote = BootTdxQuote(
         version=4,
@@ -792,7 +1001,9 @@ def test_measurement_verification_with_actual_config(mock_settings):
         rtmr1=EXPECTED_RMTR1,
         rtmr2=EXPECTED_RMTR2,
         rtmr3=EXPECTED_RMTR3,
+        report_data=None,
         user_data=None,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"boot",
@@ -807,7 +1018,9 @@ def test_measurement_verification_with_actual_config(mock_settings):
         rtmr1=EXPECTED_RMTR1,
         rtmr2="0" * 96,
         rtmr3="0" * 96,  # Different runtime values
+        report_data=None,
         user_data=None,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"runtime",
@@ -857,7 +1070,7 @@ def test_all_quote_validation_errors():
 def test_nonce_edge_cases():
     """Test nonce extraction edge cases."""
 
-    # Nonce with only null bytes
+    # report_data None -> extract_nonce raises InvalidQuoteError
     quote_null = BootTdxQuote(
         version=4,
         att_key_type=2,
@@ -867,16 +1080,17 @@ def test_nonce_edge_cases():
         rtmr1="c" * 96,
         rtmr2="d" * 96,
         rtmr3="e" * 96,
-        user_data="0" * 128,  # All null bytes
+        report_data=None,
+        user_data="0" * 128,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"test",
     )
+    with pytest.raises(InvalidQuoteError, match="no report data"):
+        extract_nonce(quote_null)
 
-    extracted = extract_nonce(quote_null)
-    assert extracted == ""
-
-    # Nonce with non-printable characters
+    # Nonce with non-printable (binary) hex in report_data
     non_printable_hex = "01020304050607080910111213141516" + "0" * 96
     quote_binary = BootTdxQuote(
         version=4,
@@ -887,18 +1101,19 @@ def test_nonce_edge_cases():
         rtmr1="c" * 96,
         rtmr2="d" * 96,
         rtmr3="e" * 96,
+        report_data=non_printable_hex[:64].ljust(64, "0") + "0" * 64,
         user_data=non_printable_hex,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"test",
     )
 
     extracted = extract_nonce(quote_binary)
-    assert extracted == ""  # Should stop at first non-printable
+    assert extracted == non_printable_hex[:64].lower()
 
-    # Nonce exactly 64 bytes
-    max_nonce = "A" * 64
-    max_nonce_hex = max_nonce.encode("utf-8").hex().upper()
+    # Nonce exactly 64 hex chars (report_data[:64]); extract_nonce returns that (lowercased)
+    max_nonce_hex = "A" * 64
     quote_max = BootTdxQuote(
         version=4,
         att_key_type=2,
@@ -908,14 +1123,16 @@ def test_nonce_edge_cases():
         rtmr1="c" * 96,
         rtmr2="d" * 96,
         rtmr3="e" * 96,
-        user_data=max_nonce_hex,
+        report_data=max_nonce_hex + "0" * 64,
+        user_data=max_nonce_hex + "0" * 64,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"test",
     )
 
     extracted = extract_nonce(quote_max)
-    assert extracted == max_nonce
+    assert extracted == max_nonce_hex.lower()
 
 
 # Cross-type verification tests
@@ -931,7 +1148,9 @@ def test_boot_vs_runtime_verification_differences():
         rtmr1="boot_specific_rtmr1",
         rtmr2="d" * 96,
         rtmr3="e" * 96,
+        report_data=None,
         user_data=None,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"boot",
@@ -946,29 +1165,42 @@ def test_boot_vs_runtime_verification_differences():
         rtmr1="runtime_specific_rtmr1",
         rtmr2="f" * 96,
         rtmr3="0" * 96,
+        report_data=None,
         user_data=None,
+        platform_id="0" * 32,
         raw_quote_size=4096,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         raw_bytes=b"runtime",
     )
 
     with patch("api.server.util.settings") as mock_settings:
-        # Configure different expectations for boot vs runtime
-        mock_settings.expected_mrtd = "a" * 96
-        mock_settings.expected_boot_rmtrs = {
-            "rtmr0": "boot_specific_rtmr0",
-            "rtmr1": "boot_specific_rtmr1",
-        }
-        mock_settings.exepected_runtime_rmtrs = {
-            "rtmr0": "runtime_specific_rtmr0",
-            "rtmr1": "runtime_specific_rtmr1",
-        }
+        # One config: boot and runtime have different RTMR0/1; both quotes match this config
+        mock_settings.tee_measurements = [
+            TeeMeasurementConfig(
+                version="1",
+                mrtd="a" * 96,
+                name="test",
+                boot_rtmrs={
+                    "RTMR0": "boot_specific_rtmr0",
+                    "RTMR1": "boot_specific_rtmr1",
+                    "RTMR2": "d" * 96,
+                    "RTMR3": "e" * 96,
+                },
+                runtime_rtmrs={
+                    "RTMR0": "runtime_specific_rtmr0",
+                    "RTMR1": "runtime_specific_rtmr1",
+                    "RTMR2": "f" * 96,
+                    "RTMR3": "0" * 96,
+                },
+                expected_gpus=[],
+                gpu_count=None,
+            ),
+        ]
 
-        # Both should verify successfully with their respective settings
         assert verify_measurements(boot_quote) is True
         assert verify_measurements(runtime_quote) is True
 
-        # Boot quote should fail with wrong expectations
+        # Boot quote with runtime RTMRs should not match boot_rtmrs
         boot_quote_copy = BootTdxQuote(
             version=4,
             att_key_type=2,
@@ -978,15 +1210,35 @@ def test_boot_vs_runtime_verification_differences():
             rtmr1="runtime_specific_rtmr1",
             rtmr2="f" * 96,
             rtmr3="0" * 96,
+            report_data=None,
             user_data=None,
+            platform_id="0" * 32,
             raw_quote_size=4096,
             parsed_at=datetime.now(timezone.utc).isoformat(),
             raw_bytes=b"boot",
         )
 
-        mock_settings.expected_boot_rmtrs = {
-            "rtmr0": "different_boot_rtmr0",
-        }
+        mock_settings.tee_measurements = [
+            TeeMeasurementConfig(
+                version="1",
+                mrtd="a" * 96,
+                name="test",
+                boot_rtmrs={
+                    "RTMR0": "different_boot_rtmr0",
+                    "RTMR1": "c" * 96,
+                    "RTMR2": "d" * 96,
+                    "RTMR3": "e" * 96,
+                },
+                runtime_rtmrs={
+                    "RTMR0": "d" * 96,
+                    "RTMR1": "e" * 96,
+                    "RTMR2": "f" * 96,
+                    "RTMR3": "0" * 96,
+                },
+                expected_gpus=[],
+                gpu_count=None,
+            ),
+        ]
 
         with pytest.raises(MeasurementMismatchError):
             verify_measurements(boot_quote_copy)

@@ -7,15 +7,15 @@ import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
 import tempfile
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
-from sqlalchemy import select, func
+from sqlalchemy import or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from api.config import settings
-from api.constants import NONCE_HEADER
+from api.constants import NONCE_HEADER, NoncePurpose
 from api.gpu import SUPPORTED_GPUS
 from api.node.util import _track_nodes
 from api.server.client import TeeServerClient
@@ -39,28 +39,40 @@ from api.server.exceptions import (
     NonceError,
     ServerNotFoundError,
     ServerRegistrationError,
+    ChuteNotTeeError,
+    InstanceNotFoundError,
 )
 from api.server.util import (
     _track_server,
     extract_report_data,
     verify_measurements,
+    get_matching_measurement_config,
     generate_nonce,
     get_nonce_expiry_seconds,
     verify_quote_signature,
     verify_result,
-    get_cache_passphrase,
-    create_or_update_cache_passphrase,
+    sync_server_luks_passphrases,
+    delete_luks_passphrases_for_server,
+    get_public_key_hash,
+    cert_to_base64_der,
+    validate_user_nonce,
 )
-from api.util import extract_ip
+from api.instance.schemas import Instance
+from api.chute.schemas import Chute
+from api.node.schemas import Node
+from sqlalchemy.orm import joinedload
+from api.server.schemas import TeeInstanceEvidence
+from api.node.schemas import NodeArgs
+from api.util import extract_ip, semcomp
 
 
-async def create_nonce(server_ip: str) -> Dict[str, str]:
+async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
     """
     Create a new attestation nonce using Redis.
 
     Args:
-        attestation_type: 'boot' or 'runtime'
-        server_id: Optional server ID for runtime attestations
+        server_ip: IP address of the server/instance requesting the nonce
+        purpose: Purpose of the nonce (NoncePurpose enum value)
 
     Returns:
         Dictionary with nonce and expiry info
@@ -69,8 +81,9 @@ async def create_nonce(server_ip: str) -> Dict[str, str]:
     expiry_seconds = get_nonce_expiry_seconds()
 
     # Use Redis to store nonce with TTL
+    # Store as JSON to include both server_ip and purpose
     redis_key = f"nonce:{nonce}"
-    redis_value = f"{server_ip}"
+    redis_value = json.dumps({"server_ip": server_ip, "purpose": purpose.value})
 
     await settings.redis_client.setex(redis_key, expiry_seconds, redis_value)
 
@@ -78,22 +91,24 @@ async def create_nonce(server_ip: str) -> Dict[str, str]:
         seconds=expiry_seconds
     )
 
-    logger.info(f"Created nonce: {nonce[:8]}... for server {server_ip}")
+    logger.info(f"Created nonce: {nonce[:8]}... for server {server_ip} with purpose {purpose}")
 
     return {"nonce": nonce, "expires_at": expires_at.isoformat()}
 
 
-async def validate_and_consume_nonce(nonce_value: str, server_ip: str) -> None:
+async def validate_and_consume_nonce(
+    nonce_value: str, server_ip: str, purpose: NoncePurpose
+) -> None:
     """
     Validate and consume a nonce using Redis.
 
     Args:
         nonce_value: Nonce to validate
-        attestation_type: Expected attestation type
-        server_id: Expected server ID (for runtime attestations)
+        server_ip: Expected server IP address
+        purpose: Expected purpose for the nonce (NoncePurpose enum value)
 
     Raises:
-        NonceError: If nonce is invalid, expired, or already used
+        NonceError: If nonce is invalid, expired, already used, or purpose/server mismatch
     """
     redis_key = f"nonce:{nonce_value}"
 
@@ -105,31 +120,55 @@ async def validate_and_consume_nonce(nonce_value: str, server_ip: str) -> None:
 
     # Parse the stored value
     try:
-        stored_server = redis_value.decode()
-    except (ValueError, AttributeError):
+        stored_data = json.loads(redis_value.decode())
+
+        # Handle legacy format (just server_ip as string) for backward compatibility
+        if isinstance(stored_data, str):
+            stored_server = stored_data
+            stored_purpose = None
+        else:
+            stored_server = stored_data.get("server_ip")
+            stored_purpose = stored_data.get("purpose")
+    except (ValueError, AttributeError, json.JSONDecodeError):
         raise NonceError("Invalid nonce format")
 
-    # Validate server ID
-    expected_server = server_ip
-    if stored_server != expected_server:
-        raise NonceError(f"Nonce server mismatch: expected {expected_server}, got {stored_server}")
+    # Validate server IP
+    if stored_server != server_ip:
+        raise NonceError(f"Nonce server mismatch: expected {server_ip}, got {stored_server}")
+
+    # Validate purpose (if stored nonce has a purpose, it must match)
+    if stored_purpose and stored_purpose != purpose.value:
+        raise NonceError(
+            f"Nonce purpose mismatch: expected {purpose.value}, got {stored_purpose}. "
+            f"Nonces are purpose-specific and cannot be reused across different operations."
+        )
 
     # Consume the nonce by deleting it
     deleted = await settings.redis_client.delete(redis_key)
     if not deleted:
         raise NonceError("Nonce was already consumed")
 
-    logger.info(f"Validated and consumed nonce: {nonce_value[:8]}...")
+    logger.info(f"Validated and consumed nonce: {nonce_value[:8]}... for purpose {purpose}")
 
 
-def validate_request_nonce():
+def validate_request_nonce(purpose: NoncePurpose):
+    """
+    Create a nonce validator dependency that validates nonces for a specific purpose.
+
+    Args:
+        purpose: The expected purpose for the nonce (NoncePurpose enum value)
+
+    Returns:
+        A FastAPI dependency function that validates the nonce
+    """
+
     async def _validate_request_nonce(
         request: Request, nonce: str | None = Header(None, alias=NONCE_HEADER)
     ):
         server_ip = extract_ip(request)
 
         try:
-            await validate_and_consume_nonce(nonce, server_ip)
+            await validate_and_consume_nonce(nonce, server_ip, purpose)
 
             return nonce
         except NonceError as e:
@@ -162,6 +201,47 @@ async def verify_quote(
     verify_measurements(quote)
 
     return result
+
+
+def validate_gpus_for_measurements(quote: TdxQuote, gpus: list[NodeArgs]) -> None:
+    """
+    Validate that the provided GPUs match the expected GPUs for this measurement configuration.
+
+    Looks up the measurement configuration using the quote's RTMR0.
+
+    Args:
+        quote: Verified TDX quote (must have been verified via verify_quote)
+        gpus: List of GPU nodes being registered
+
+    Raises:
+        MeasurementMismatchError: If GPUs don't match measurement configuration expectations
+    """
+    # Look up measurement configuration by full MRTD + RTMRs (same as verify_measurements)
+    measurement_config = get_matching_measurement_config(quote)
+
+    # Extract GPU identifiers
+    provided_gpu_ids = {gpu.gpu_identifier.lower() for gpu in gpus}
+    expected_gpu_ids = set(measurement_config.expected_gpus)
+
+    # Check that all provided GPUs are in expected list
+    unexpected_gpus = provided_gpu_ids - expected_gpu_ids
+    if unexpected_gpus:
+        raise MeasurementMismatchError(
+            f"GPU mismatch for measurement config '{measurement_config.name}': "
+            f"Expected GPUs {expected_gpu_ids}, but got {unexpected_gpus}"
+        )
+
+    # Check GPU count if specified
+    if measurement_config.gpu_count and len(gpus) != measurement_config.gpu_count:
+        raise MeasurementMismatchError(
+            f"GPU count mismatch for measurement config '{measurement_config.name}': "
+            f"Expected {measurement_config.gpu_count} GPUs, but got {len(gpus)}"
+        )
+
+    logger.info(
+        f"GPU validation passed for measurement config '{measurement_config.name}': "
+        f"{len(gpus)} GPUs of types {provided_gpu_ids}"
+    )
 
 
 async def verify_gpu_evidence(evidence: list[Dict[str, str]], expected_nonce: str) -> None:
@@ -244,10 +324,12 @@ async def process_boot_attestation(
         quote = BootTdxQuote.from_base64(args.quote)
         await verify_quote(quote, nonce, expected_cert_hash)
 
+        measurement_config = get_matching_measurement_config(quote)
         # Create boot attestation record
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
+            measurement_version=measurement_config.version,
             created_at=func.now(),
             verified_at=func.now(),
         )
@@ -264,11 +346,23 @@ async def process_boot_attestation(
         return boot_token
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
-        # Create failed attestation record
+        # Create failed attestation record; set measurement_version if quote matched a config
+        measurement_version = None
+        try:
+            quote = BootTdxQuote.from_base64(args.quote)
+            measurement_config = get_matching_measurement_config(quote)
+            measurement_version = measurement_config.version
+        except (InvalidQuoteError, MeasurementMismatchError):
+            pass
+        if measurement_version is None:
+            logger.warning(
+                "Boot attestation failed with no matching measurement config (measurement_version will be NULL). "
+            )
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
             verification_error=str(e.detail),
+            measurement_version=measurement_version,
             created_at=func.now(),
         )
 
@@ -280,8 +374,15 @@ async def process_boot_attestation(
 
 
 async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str):
+    """
+    Register a TEE server: create Server, verify attestation (creating a ServerAttestation
+    record on success or failure), then track nodes. ServerAttestation is always inserted
+    by verify_server for audit trail.
+    """
     try:
-        server = await _track_server(db, args.id, args.host, miner_hotkey, is_tee=True)
+        server = await _track_server(
+            db, args.id, args.name or args.id, args.host, miner_hotkey, is_tee=True
+        )
 
         # Set the attributes we can't get from pynvml
         for gpu in args.gpus:
@@ -289,61 +390,85 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
             for key in ["processors", "max_threads_per_processor"]:
                 setattr(gpu, key, gpu_info.get(key))
 
-        # Start verification process
-        await verify_server(db, server, miner_hotkey)
+        # Start verification process (pass GPUs for validation)
+        await verify_server(db, server, miner_hotkey, gpus=args.gpus)
 
         # Track nodes once verified
         await _track_nodes(db, miner_hotkey, server.server_id, args.gpus, "0", func.now())
 
-    except AttestationError:
-        logger.error(f"Attestation failed for server {args.host}")
-        raise ServerRegistrationError("Server registration failed - attestation failed.")
+    except AttestationError as e:
+        # Preserve the specific error message from the AttestationError
+        error_detail = e.detail if hasattr(e, "detail") else str(e)
+        logger.error(
+            f"Server registration failed - attestation error: name={args.name or args.id} host={args.host} miner_hotkey={miner_hotkey} error={error_detail}"
+        )
+        raise ServerRegistrationError(f"Server registration failed - {error_detail}")
     except IntegrityError as e:
         await db.rollback()
-        logger.error(f"Server registration failed: {str(e)}")
-        raise ServerRegistrationError("Server registration failed - constraint violation")
+        logger.error(
+            f"Server registration failed - IntegrityError: name={args.name or args.id} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}"
+        )
+        raise ServerRegistrationError(
+            "Server registration failed - database constraint violation. This may indicate a duplicate server ID, invalid miner configuration, or other database conflict. Please contact support with your server ID and miner hotkey."
+        )
     except Exception as e:
         await db.rollback()
-        logger.error(f"Unexpected error during server registration: {str(e)}")
-        raise ServerRegistrationError(f"Server registration failed: {str(e)}")
+        logger.error(
+            f"Unexpected error during server registration: name={args.name or args.id} host={args.host} miner_hotkey={miner_hotkey} error={str(e)}",
+            exc_info=True,
+        )
+        raise ServerRegistrationError(
+            "Server registration failed - unexpected error occurred. Please contact support with your server ID and miner hotkey."
+        )
 
 
-async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> None:
+async def verify_server(
+    db: AsyncSession, server: Server, miner_hotkey: str, gpus: list[NodeArgs]
+) -> None:
     """
-    Register a new server.
+    Verify server attestation and validate GPUs match measurement configuration.
 
     Args:
         db: Database session
-        args: Server registration arguments
-        miner_hotkey: Miner hotkey from authentication
-
-    Returns:
-        Created server object
-
-    Raises:
-        ServerRegistrationError: If registration fails
+        server: Server to verify
+        miner_hotkey: Miner hotkey
+        gpus: List of GPUs to validate against measurement configuration
     """
     failure_reason = ""
     quote = None
+    measurement_config = None
     try:
         client = TeeServerClient(server)
 
         nonce = generate_nonce()
-        logger.info(f"Verifying server {server.ip} with nonce {nonce}")
-        quote, gpu_evidence, expected_cert_hash = await client.get_evidence(nonce)
+        logger.info(
+            f"Verifying server server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} with nonce {nonce}"
+        )
+        quote, gpu_evidence, cert = await client.get_server_evidence(nonce)
+        measurement_config = get_matching_measurement_config(quote)
+        expected_cert_hash = get_public_key_hash(cert)
 
+        # Verify quote measurements (matches by full MRTD + RTMRs; multiple configs may share RTMR0)
         await verify_quote(quote, nonce, expected_cert_hash)
 
+        # Verify GPU evidence
         await verify_gpu_evidence(gpu_evidence, nonce)
 
-        logger.success(f"Verified server {server.server_id} for miner: {miner_hotkey}")
+        # Validate GPUs match measurement configuration
+        validate_gpus_for_measurements(quote, gpus)
 
-        # Create attestation record
+        logger.success(
+            f"Verified server server_id={server.server_id} ip={server.ip} for miner: {miner_hotkey}"
+        )
+
+        # Create attestation record (measurement_version for audit trail; server version = latest attestation).
+        # Commit here so we have a durable record for this run even if _track_nodes or later steps fail.
         server_attestation = ServerAttestation(
             quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8"),
             server_id=server.server_id,
             created_at=func.now(),
             verified_at=func.now(),
+            measurement_version=measurement_config.version,
         )
 
         db.add(server_attestation)
@@ -352,36 +477,59 @@ async def verify_server(db: AsyncSession, server: Server, miner_hotkey: str) -> 
 
     except GetEvidenceError as e:
         failure_reason = "Failed to get attestation evidence."
+        logger.error(
+            f"Server verification failed - GetEvidenceError: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         raise e
     except (InvalidQuoteError, MeasurementMismatchError) as e:
-        logger.error(f"Server verification failed for {server.ip}:\n{e}")
+        logger.error(
+            f"Server verification failed - quote error: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         failure_reason = "Server verification failed: invalid quote"
         raise e
     except InvalidGpuEvidenceError as e:
-        logger.error(f"Failed to verify GPU evidence for {server.ip}.  Invalid GPU evidence.")
+        logger.error(
+            f"Server verification failed - invalid GPU evidence: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         failure_reason = "Server verification failed: invalid GPU evidence"
         raise e
     except GpuEvidenceError as e:
-        logger.error(f"Failed to verify GPU evidence for {server.ip}")
+        logger.error(
+            f"Server verification failed - GPU evidence error: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
         failure_reason = "Server verification failed: Failed to verify GPU evidence"
         raise e
     except Exception as e:
-        logger.error(f"Unexpected error during server verification for {server.ip}: {str(e)}")
+        logger.error(
+            f"Unexpected error during server verification: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={str(e)}"
+        )
         failure_reason = "Unexpected error during server verification."
         raise e
     finally:
         if failure_reason:
-            # Create attestation record
+            measurement_version = measurement_config.version if measurement_config else None
             server_attestation = ServerAttestation(
                 quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8") if quote else None,
                 server_id=server.server_id,
                 verification_error=failure_reason,
                 created_at=func.now(),
+                measurement_version=measurement_version,
             )
 
-            db.add(server_attestation)
-            await db.commit()
-            await db.refresh(server_attestation)
+            try:
+                db.add(server_attestation)
+                await db.commit()
+                await db.refresh(server_attestation)
+                logger.info(
+                    f"Persisted failed server attestation for server_id={server.server_id} (reason: {failure_reason})"
+                )
+            except Exception:
+                logger.exception(
+                    f"Failed to persist failed attestation record for server_id={server.server_id}; "
+                    "attestation history will be incomplete",
+                    exc_info=True,
+                )
+                raise
 
 
 async def check_server_ownership(db: AsyncSession, server_id: str, miner_hotkey: str) -> Server:
@@ -407,6 +555,97 @@ async def check_server_ownership(db: AsyncSession, server_id: str, miner_hotkey:
     if not server:
         raise ServerNotFoundError(server_id)
 
+    return server
+
+
+async def get_server_by_name(db: AsyncSession, miner_hotkey: str, server_name: str) -> Server:
+    """
+    Get a server by miner hotkey and VM name (stable identity for API paths).
+
+    Args:
+        db: Database session
+        miner_hotkey: Miner hotkey (must match authenticated user)
+        vm_name: VM name
+
+    Returns:
+        Server object
+
+    Raises:
+        ServerNotFoundError: If server not found
+    """
+    query = select(Server).where(Server.miner_hotkey == miner_hotkey, Server.name == server_name)
+    result = await db.execute(query)
+    server = result.scalar_one_or_none()
+    if not server:
+        raise ServerNotFoundError(f"{server_name}")
+    return server
+
+
+async def get_server_by_name_or_id(
+    db: AsyncSession, miner_hotkey: str, server_name_or_id: str
+) -> Server:
+    """
+    Get a server by miner hotkey and either VM name or server id.
+
+    Args:
+        db: Database session
+        miner_hotkey: Miner hotkey (must match authenticated user)
+        server_name_or_id: VM name or server_id
+
+    Returns:
+        Server object
+
+    Raises:
+        ServerNotFoundError: If server not found
+    """
+    query = select(Server).where(
+        Server.miner_hotkey == miner_hotkey,
+        or_(
+            Server.name == server_name_or_id,
+            Server.server_id == server_name_or_id,
+        ),
+    )
+    result = await db.execute(query)
+    server = result.scalar_one_or_none()
+    if not server:
+        raise ServerNotFoundError(server_name_or_id)
+    return server
+
+
+async def update_server_name(
+    db: AsyncSession, miner_hotkey: str, server_id: str, server_name: str
+) -> Server:
+    """
+    Update name for an existing server (by server_id). Used to sync names for
+    servers that existed before the name schema change.
+
+    Args:
+        db: Database session
+        miner_hotkey: Authenticated miner hotkey (must own the server)
+        server_id: Server ID (e.g. k8s node uid)
+        server_name: New VM name to set (unique per miner)
+
+    Returns:
+        Updated Server
+
+    Raises:
+        ServerNotFoundError: If server not found or not owned by miner
+        HTTPException 409: If new_vm_name is already used by another server of this miner
+    """
+    server = await check_server_ownership(db, server_id, miner_hotkey)
+    if server.name == server_name:
+        return server
+    server.name = server_name
+    try:
+        await db.commit()
+        await db.refresh(server)
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"name '{server_name}' already in use by another server for this miner",
+        )
+    logger.info(f"Updated server {server_id} name to {server_name}")
     return server
 
 
@@ -449,17 +688,15 @@ async def process_runtime_attestation(
     try:
         # Verify quote signature
         quote = RuntimeTdxQuote.from_base64(args.quote)
-        result = await verify_quote(quote, expected_nonce, expected_cert_hash)
+        await verify_quote(quote, expected_nonce, expected_cert_hash)
 
         # Create runtime attestation record
+        measurement_config = get_matching_measurement_config(quote)
         attestation = ServerAttestation(
             server_id=server_id,
             quote_data=args.quote,
-            mrtd=quote.mrtd,
-            rtmrs=quote.rtmrs,
-            verification_result=result.to_dict(),
-            verified=True,
-            nonce_used=expected_nonce,
+            verification_error=None,
+            measurement_version=measurement_config.version,
             verified_at=func.now(),
         )
 
@@ -477,12 +714,18 @@ async def process_runtime_attestation(
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         # Create failed attestation record
+        measurement_version = None
+        try:
+            quote_parsed = RuntimeTdxQuote.from_base64(args.quote)
+            measurement_config = get_matching_measurement_config(quote_parsed)
+            measurement_version = measurement_config.version
+        except (InvalidQuoteError, MeasurementMismatchError):
+            pass
         attestation = ServerAttestation(
             server_id=server_id,
             quote_data=args.quote,
-            verified=False,
             verification_error=str(e.detail),
-            nonce_used=expected_nonce,
+            measurement_version=measurement_version,
         )
 
         db.add(attestation)
@@ -527,16 +770,17 @@ async def get_server_attestation_status(
     }
 
     if latest_attestation:
+        verified = latest_attestation.verification_error is None
         status["last_attestation"] = {
             "attestation_id": latest_attestation.attestation_id,
-            "verified": latest_attestation.verified,
+            "verified": verified,
             "created_at": latest_attestation.created_at.isoformat(),
             "verified_at": latest_attestation.verified_at.isoformat()
             if latest_attestation.verified_at
             else None,
             "verification_error": latest_attestation.verification_error,
         }
-        status["attestation_status"] = "verified" if latest_attestation.verified else "failed"
+        status["attestation_status"] = "verified" if verified else "failed"
 
     return status
 
@@ -580,6 +824,7 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
     """
     server = await check_server_ownership(db, server_id, miner_hotkey)
 
+    await delete_luks_passphrases_for_server(db, server.miner_hotkey, server.name)
     await db.delete(server)
     await db.commit()
 
@@ -587,7 +832,7 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
     return True
 
 
-async def validate_boot_token_and_get_vm_identity(boot_token: str) -> tuple[str, str]:
+async def _get_boot_token_context(boot_token: str) -> tuple[str, str]:
     """
     Validate boot token and return the VM identity (miner_hotkey, vm_name).
 
@@ -615,36 +860,14 @@ async def validate_boot_token_and_get_vm_identity(boot_token: str) -> tuple[str,
         logger.error(f"Failed to parse boot token value: {e}")
         raise NonceError("Invalid boot token format")
 
-    logger.info(f"Validated boot token for VM {vm_name} (miner: {miner_hotkey})")
+    logger.info(f"Retrieved boot token for VM {vm_name} (miner: {miner_hotkey})")
 
     return miner_hotkey, vm_name
 
 
-async def get_cache_passphrase_with_token(
-    db: AsyncSession, boot_token: str, hotkey: str, vm_name: str
-) -> str:
-    """
-    Validate boot token and retrieve existing cache passphrase.
-
-    This is called when the cache volume is already encrypted and needs the passphrase.
-
-    Args:
-        db: Database session
-        boot_token: Boot token from initial attestation
-        hotkey: Miner hotkey (must match boot token)
-        vm_name: VM name (must match boot token)
-
-    Returns:
-        Cache volume passphrase (decrypted)
-
-    Raises:
-        NonceError: If boot token is invalid or expired, or if hotkey/vm_name don't match
-        ValueError: If no passphrase exists (shouldn't happen for encrypted volumes)
-    """
-    # Validate token and get VM identity from boot token
-    token_hotkey, token_vm_name = await validate_boot_token_and_get_vm_identity(boot_token)
-
-    # Verify that the provided hotkey and vm_name match what's in the boot token
+async def _validate_boot_token_for_luks(boot_token: str, hotkey: str, vm_name: str) -> None:
+    """Validate boot token and verify hotkey/vm_name match. Raises NonceError on failure."""
+    token_hotkey, token_vm_name = await _get_boot_token_context(boot_token)
     if token_hotkey != hotkey:
         logger.warning(f"Hotkey mismatch: expected {token_hotkey}, got {hotkey}")
         raise NonceError("Hotkey does not match boot token")
@@ -652,52 +875,170 @@ async def get_cache_passphrase_with_token(
         logger.warning(f"VM name mismatch: expected {token_vm_name}, got {vm_name}")
         raise NonceError("VM name does not match boot token")
 
-    # Get existing passphrase
-    passphrase = await get_cache_passphrase(db, hotkey, vm_name)
 
-    # Consume the boot token after successful retrieval
+async def _consume_boot_token(boot_token: str) -> None:
     redis_key = f"boot_token:{boot_token}"
     await settings.redis_client.delete(redis_key)
 
-    return passphrase
+
+async def process_luks_passphrase_request(
+    db: AsyncSession,
+    boot_token: str,
+    hotkey: str,
+    vm_name: str,
+    volume_names: list,
+    rekey_volume_names: Optional[list] = None,
+) -> Dict[str, str]:
+    """Validate boot token and run LUKS sync (ensure keys for volumes, prune others, rekey optional). Consumes token."""
+    await _validate_boot_token_for_luks(boot_token, hotkey, vm_name)
+    result = await sync_server_luks_passphrases(
+        db, hotkey, vm_name, volume_names, rekey_volume_names=rekey_volume_names
+    )
+    await _consume_boot_token(boot_token)
+    return result
 
 
-async def create_cache_passphrase_with_token(
-    db: AsyncSession, boot_token: str, hotkey: str, vm_name: str
-) -> str:
+async def get_instance_server(db: AsyncSession, instance_id: str) -> tuple[Server, Instance]:
     """
-    Validate boot token and create/override cache passphrase.
-
-    This is called when the cache volume is unencrypted (new or wiped).
+    Get the TEE server and instance for evidence/attestation (instance has chute, nodes, server loaded).
 
     Args:
         db: Database session
-        boot_token: Boot token from initial attestation
-        hotkey: Miner hotkey (must match boot token)
-        vm_name: VM name (must match boot token)
+        instance_id: Instance ID
 
     Returns:
-        Cache volume passphrase (decrypted)
+        (Server, Instance). Use instance.deployment_id or instance.instance_id for proxy routing.
 
     Raises:
-        NonceError: If boot token is invalid or expired, or if hotkey/vm_name don't match
+        InstanceNotFoundError: If instance not found
+        ChuteNotTeeError: If the instance's chute is not TEE-enabled
     """
-    # Validate token and get VM identity from boot token
-    token_hotkey, token_vm_name = await validate_boot_token_and_get_vm_identity(boot_token)
+    # Load instance with chute, nodes and their servers
+    query = (
+        select(Instance)
+        .where(Instance.instance_id == instance_id)
+        .options(joinedload(Instance.chute), joinedload(Instance.nodes).joinedload(Node.server))
+    )
+    result = await db.execute(query)
+    instance = result.unique().scalar_one_or_none()
 
-    # Verify that the provided hotkey and vm_name match what's in the boot token
-    if token_hotkey != hotkey:
-        logger.warning(f"Hotkey mismatch: expected {token_hotkey}, got {hotkey}")
-        raise NonceError("Hotkey does not match boot token")
-    if token_vm_name != vm_name:
-        logger.warning(f"VM name mismatch: expected {token_vm_name}, got {vm_name}")
-        raise NonceError("VM name does not match boot token")
+    if not instance:
+        raise InstanceNotFoundError(instance_id)
 
-    # Create or override passphrase
-    passphrase = await create_or_update_cache_passphrase(db, hotkey, vm_name)
+    # Check if chute is TEE-enabled (TEE chutes can only run on TEE servers)
+    if not instance.chute.tee:
+        raise ChuteNotTeeError(instance.chute.chute_id)
 
-    # Consume the boot token after successful creation
-    redis_key = f"boot_token:{boot_token}"
-    await settings.redis_client.delete(redis_key)
+    # Instance always has nodes, get server from first node
+    node = instance.nodes[0]
+    server = node.server
 
-    return passphrase
+    return (server, instance)
+
+
+async def _get_instance_evidence(
+    server: Server, deployment_id: str, nonce: str
+) -> TeeInstanceEvidence:
+    """
+    Get TEE instance evidence via the chute's evidence endpoint (third-party flow).
+    Caller supplies nonce; we call chute-service-{deployment_id}/evidence?nonce=...
+    Verification flow (no caller nonce) uses get_chute_evidence(deployment_id) → verify endpoint.
+    """
+    client = TeeServerClient(server)
+    quote, gpu_evidence, cert = await client.get_chute_evidence(deployment_id, nonce=nonce)
+
+    quote_base64 = base64.b64encode(quote.raw_bytes).decode("utf-8")
+    cert_base64 = cert_to_base64_der(cert)
+
+    return TeeInstanceEvidence(
+        quote=quote_base64, gpu_evidence=gpu_evidence, certificate=cert_base64
+    )
+
+
+async def get_instance_evidence(
+    db: AsyncSession, instance_id: str, nonce: str
+) -> TeeInstanceEvidence:
+    """
+    Get TEE evidence for a specific instance (instance evidence endpoint flow).
+    Requires instance.deployment_id (set when TEE launch config is claimed and verified).
+    Runtime evidence is only supported for chutes_version >= 0.6.0.
+    """
+    validate_user_nonce(nonce)
+    server, instance = await get_instance_server(db, instance_id)
+    if semcomp(instance.chutes_version or "0.0.0", "0.6.0") < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Instances requires chutes_version >= 0.6.0 to retrieve evidence.",
+        )
+    if not instance.deployment_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Instance has no deployment_id; evidence is only available after TEE verification",
+        )
+    return await _get_instance_evidence(server, instance.deployment_id, nonce)
+
+
+async def get_chute_instances_evidence(
+    db: AsyncSession, chute_id: str, nonce: str
+) -> tuple[list[TeeInstanceEvidence], list[str]]:
+    """
+    Get TEE evidence for all instances of a chute (chute evidence endpoint flow).
+    Returns (evidence_list, failed_instance_ids). Failed instance IDs are included
+    so the user knows those instances still exist; access is already enforced at this point.
+    Runtime evidence is only supported for chutes_version >= 0.6.0.
+    """
+    validate_user_nonce(nonce)
+
+    query = select(Chute).where(Chute.chute_id == chute_id)
+    result = await db.execute(query)
+    chute = result.scalar_one_or_none()
+
+    if not chute:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Chute {chute_id} not found"
+        )
+
+    if not chute.tee:
+        raise ChuteNotTeeError(chute_id)
+
+    if semcomp(chute.chutes_version or "0.0.0", "0.6.0") < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Instances requires chutes_version >= 0.6.0 to retrieve evidence.",
+        )
+
+    instances_query = (
+        select(Instance)
+        .where(
+            Instance.chute_id == chute_id,
+            Instance.active.is_(True),
+            Instance.verified.is_(True),
+        )
+        .options(joinedload(Instance.nodes).joinedload(Node.server))
+    )
+    instances_result = await db.execute(instances_query)
+    instances = instances_result.unique().scalars().all()
+
+    evidence_list: list[TeeInstanceEvidence] = []
+    failed_instance_ids: list[str] = []
+    for instance in instances:
+        if not instance.deployment_id:
+            failed_instance_ids.append(instance.instance_id)
+            continue
+        try:
+            node = instance.nodes[0]
+            server = node.server
+            evidence = await _get_instance_evidence(server, instance.deployment_id, nonce)
+            evidence_list.append(
+                TeeInstanceEvidence(
+                    quote=evidence.quote,
+                    gpu_evidence=evidence.gpu_evidence,
+                    instance_id=instance.instance_id,
+                    certificate=evidence.certificate,
+                )
+            )
+        except GetEvidenceError as e:
+            logger.error(f"Failed to get evidence for instance {instance.instance_id}: {str(e)}")
+            failed_instance_ids.append(instance.instance_id)
+
+    return (evidence_list, failed_instance_ids)

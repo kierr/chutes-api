@@ -3,16 +3,17 @@ import hashlib
 import json
 import ssl
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urljoin
 
 import aiohttp
 from loguru import logger
+from cryptography.x509 import Certificate
 from api.constants import HOTKEY_HEADER, NONCE_HEADER, SIGNATURE_HEADER
 from api.server.exceptions import GetEvidenceError
 from api.server.quote import RuntimeTdxQuote, TdxQuote
 from api.server.schemas import Server
-from api.server.util import extract_server_cert_hash
+from api.server.util import _get_server_certificate
 from api.config import settings
 
 
@@ -73,7 +74,7 @@ class TeeServerClient:
         async with aiohttp.ClientSession(connector=connector, raise_for_status=True) as session:
             yield session
 
-    async def get_evidence(self, nonce: str) -> Tuple[TdxQuote, Dict[str, str], str]:
+    async def get_server_evidence(self, nonce: str) -> Tuple[TdxQuote, Dict[str, str], Certificate]:
         try:
             url = urljoin(self._url, "server/attest")
             headers, _ = self._sign_request(purpose="attest")
@@ -85,12 +86,46 @@ class TeeServerClient:
                         "nonce": nonce,
                     },
                 ) as resp:
-                    expected_cert_hash = extract_server_cert_hash(resp)
+                    cert = _get_server_certificate(resp)
                     data = await resp.json()
                     quote = RuntimeTdxQuote.from_base64(data["tdx_quote"])
                     gpu_evidence = json.loads(data["nvtrust_evidence"])
 
-                    return quote, gpu_evidence, expected_cert_hash
+                    return quote, gpu_evidence, cert
         except Exception as exc:
             logger.error(f"Failed to get attestation evidence from {self._url}: {exc}")
             raise GetEvidenceError(f"Failed to get evidence for attestation: {str(exc)}")
+
+    async def get_chute_evidence(
+        self, deployment_id: str, nonce: Optional[str] = None
+    ) -> Tuple[TdxQuote, Dict[str, str], Certificate]:
+        """Get attestation evidence for a specific chute deployment.
+
+        Two flows:
+        - Verification (claim_tee_launch_config): call with no nonce. Hits chute's
+          verify endpoint; chute uses its stored nonce to prove it is the same instance.
+        - Third-party runtime evidence: call with nonce=caller_nonce. Hits chute's
+          evidence endpoint with ?nonce=...; chute returns evidence bound to that nonce.
+
+        Args:
+            deployment_id: The chute deployment ID (or instance identifier for the chute service).
+            nonce: Optional. If set, request goes to evidence endpoint with this nonce as query param.
+
+        Returns:
+            Tuple of (quote, gpu_evidence, cert). Callers can hash cert if needed.
+        """
+        try:
+            target_endpoint = "evidence" if nonce else "verify"
+            url = urljoin(self._url, f"service/chute-service-{deployment_id}/{target_endpoint}")
+            headers, _ = self._sign_request(purpose="attest")
+            params = {"nonce": nonce} if nonce else None
+            async with self._attestation_session() as session:
+                async with session.get(url, headers=headers, params=params) as resp:
+                    cert = _get_server_certificate(resp)
+                    data = await resp.json()
+                    quote = RuntimeTdxQuote.from_base64(data["evidence"]["tdx_quote"])
+                    gpu_evidence = json.loads(data["evidence"]["nvtrust_evidence"])
+                    return quote, gpu_evidence, cert
+        except Exception as exc:
+            logger.error(f"Failed to get chute evidence from {self._url}: {exc}")
+            raise GetEvidenceError()

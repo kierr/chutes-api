@@ -3,8 +3,9 @@ FastAPI routes for server management and TDX attestation.
 """
 
 from typing import List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Request, status, Header
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Header, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError, DatabaseError
 from loguru import logger
 
 from api.database import get_db_session
@@ -12,7 +13,7 @@ from api.config import settings
 from api.node.util import check_node_inventory
 from api.user.schemas import User
 from api.user.service import get_current_user
-from api.constants import HOTKEY_HEADER
+from api.constants import HOTKEY_HEADER, NoncePurpose, SUPPORTED_LUKS_VOLUMES
 
 from api.server.schemas import (
     BootAttestationArgs,
@@ -21,22 +22,28 @@ from api.server.schemas import (
     NonceResponse,
     BootAttestationResponse,
     RuntimeAttestationResponse,
-    CacheLuksPassphraseResponse,
+    LuksPassphraseRequest,
 )
 from api.server.service import (
     create_nonce,
     process_boot_attestation,
     register_server,
     check_server_ownership,
+    get_server_by_name_or_id,
+    update_server_name,
     process_runtime_attestation,
     get_server_attestation_status,
     list_servers,
     delete_server,
     validate_request_nonce,
-    get_cache_passphrase_with_token,
-    create_cache_passphrase_with_token,
+    process_luks_passphrase_request,
 )
-from api.server.util import extract_client_cert_hash, get_luks_passphrase
+from api.server.util import (
+    decrypt_passphrase,
+    extract_client_cert_hash,
+    get_luks_passphrase,
+    _get_vm_cache_config,
+)
 from api.server.exceptions import (
     AttestationError,
     NonceError,
@@ -62,7 +69,7 @@ async def get_nonce(request: Request):
     """
     try:
         server_ip = extract_ip(request)
-        nonce_info = await create_nonce(server_ip)
+        nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.BOOT)
 
         return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
     except Exception as e:
@@ -77,7 +84,7 @@ async def verify_boot_attestation(
     request: Request,
     args: BootAttestationArgs,
     db: AsyncSession = Depends(get_db_session),
-    nonce=Depends(validate_request_nonce()),
+    nonce=Depends(validate_request_nonce(NoncePurpose.BOOT)),
     expected_cert_hash=Depends(extract_client_cert_hash()),
 ):
     """
@@ -104,7 +111,7 @@ async def verify_boot_attestation(
         )
 
 
-@router.get("/{vm_name}/luks", response_model=CacheLuksPassphraseResponse)
+@router.get("/{vm_name}/luks", response_model=Dict[str, str])
 async def get_cache_luks_passphrase(
     vm_name: str,
     hotkey: str,
@@ -121,6 +128,7 @@ async def get_cache_luks_passphrase(
     The hotkey must be provided as a query parameter.
     The boot token must be provided in the X-Boot-Token header.
     """
+    # TODO: Remove this once all VMs are upgraded to 0.2.0 or later
     try:
         if not boot_token:
             raise HTTPException(
@@ -132,9 +140,17 @@ async def get_cache_luks_passphrase(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Hotkey is required"
             )
 
-        passphrase = await get_cache_passphrase_with_token(db, boot_token, hotkey, vm_name)
+        vm_config = await _get_vm_cache_config(db, hotkey, vm_name)
+        if vm_config is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
 
-        return CacheLuksPassphraseResponse(passphrase=passphrase)
+        # Legacy passphrase stored under storage key
+        passphrase = decrypt_passphrase(vm_config.volume_passphrases.get("storage"))
+
+        return {"passphrase": passphrase}
+
     except NonceError as e:
         logger.warning(f"Boot token validation error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
@@ -152,46 +168,78 @@ async def get_cache_luks_passphrase(
         )
 
 
-@router.put("/{vm_name}/luks", response_model=CacheLuksPassphraseResponse)
-async def create_cache_luks_passphrase(
+def _validate_luks_request(
+    boot_token: str | None,
+    hotkey: str | None,
+    body: LuksPassphraseRequest,
+) -> None:
+    """Validate LUKS POST request: boot token, hotkey, volumes, rekey. Raises HTTPException on invalid."""
+    if not boot_token:
+        detail = "Boot token is required (X-Boot-Token header)"
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    if not hotkey:
+        detail = "Hotkey is required"
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    if not body.volumes:
+        detail = "volumes is required and must be non-empty"
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    invalid_volumes = [v for v in body.volumes if v not in SUPPORTED_LUKS_VOLUMES]
+    if invalid_volumes:
+        detail = (
+            f"Invalid volume name(s): {invalid_volumes}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
+        )
+        logger.warning(f"LUKS request validation failed: {detail}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    if body.rekey is not None:
+        not_in_volumes = [v for v in body.rekey if v not in body.volumes]
+        if not_in_volumes:
+            detail = f"rekey must be a subset of volumes; not in volumes: {not_in_volumes}"
+            logger.warning(f"LUKS request validation failed: {detail}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        invalid_rekey = [v for v in body.rekey if v not in SUPPORTED_LUKS_VOLUMES]
+        if invalid_rekey:
+            detail = f"Invalid rekey volume name(s): {invalid_rekey}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
+            logger.warning(f"LUKS request validation failed: {detail}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+@router.post("/{vm_name}/luks", response_model=Dict[str, str])
+async def sync_luks_passphrases(
     vm_name: str,
-    hotkey: str,
+    body: LuksPassphraseRequest,
     db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     boot_token: str | None = Header(None, alias="X-Boot-Token"),
 ):
     """
-    Create or override LUKS passphrase for cache volume encryption.
-
-    This endpoint is called when the initramfs detects that the cache volume
-    is unencrypted (new or wiped). It generates a new passphrase and stores it,
-    overriding any existing passphrase for this VM configuration.
-
-    The hotkey must be provided as a query parameter.
-    The boot token must be provided in the X-Boot-Token header.
-    Returns the newly created passphrase.
+    Sync LUKS passphrases: VM sends volume list; API returns keys for existing volumes,
+    creates keys for new volumes, rekeys volumes in rekey list, and prunes stored keys
+    for volumes not in the list. Boot token is consumed after successful POST.
     """
     try:
-        if not boot_token:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Boot token is required (X-Boot-Token header)",
-            )
-        if not hotkey:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Hotkey is required"
-            )
-
-        passphrase = await create_cache_passphrase_with_token(db, boot_token, hotkey, vm_name)
-
-        return CacheLuksPassphraseResponse(passphrase=passphrase)
+        _validate_luks_request(boot_token, hotkey, body)
+        result = await process_luks_passphrase_request(
+            db,
+            boot_token,
+            hotkey,
+            vm_name,
+            body.volumes,
+            rekey_volume_names=body.rekey,
+        )
+        return result
     except NonceError as e:
         logger.warning(f"Boot token validation error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Unexpected error creating cache passphrase: {str(e)}")
+        logger.error(f"Unexpected error in LUKS POST: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create cache passphrase",
+            detail="Failed to sync/create LUKS passphrases",
         )
 
 
@@ -238,10 +286,29 @@ async def create_server(
         return {"message": "Server registered successfully."}
 
     except ServerRegistrationError as e:
-        logger.error(f"Server registration failed: {str(e)}")
+        logger.error(
+            f"Server registration failed: server_id={args.id} host={args.host} miner_hotkey={hotkey} error={e.detail}"
+        )
         raise e
+    except HTTPException:
+        # Re-raise HTTPExceptions (like blacklist, node conflicts, invalid host) as-is
+        raise
+    except (IntegrityError, DatabaseError) as e:
+        # Handle database errors that might occur before register_server is called
+        # (e.g., in check_node_inventory)
+        logger.error(
+            f"Database error in server registration: server_id={args.id} host={args.host} miner_hotkey={hotkey} error={str(e)}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server registration failed - database error. Please contact support with your server ID and miner hotkey.",
+        )
     except Exception as e:
-        logger.error(f"Unexpected error in server registration: {str(e)}")
+        logger.error(
+            f"Unexpected error in server registration: server_id={args.id} host={args.host} miner_hotkey={hotkey} error={str(e)}",
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server registration failed"
         )
@@ -265,6 +332,7 @@ async def list_user_servers(
         return [
             {
                 "server_id": server.server_id,
+                "name": server.name,
                 "ip": server.ip,
                 "created_at": server.created_at.isoformat(),
                 "updated_at": server.updated_at.isoformat() if server.updated_at else None,
@@ -279,6 +347,45 @@ async def list_user_servers(
         )
 
 
+@router.patch("/{server_id}", response_model=Dict[str, Any])
+async def patch_server_name(
+    server_id: str,
+    server_name: str = Query(..., description="New VM name to set"),
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User = Depends(
+        get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
+    ),
+):
+    """
+    Update name for an existing server. Path is server_id; query param is the new name.
+    The server row is updated when hotkey and server_id match.
+    """
+    if not hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Hotkey header required",
+        )
+    try:
+        server = await update_server_name(db, hotkey, server_id, server_name)
+        return {
+            "name": server.name,
+            "ip": server.ip,
+            "created_at": server.created_at.isoformat(),
+            "updated_at": server.updated_at.isoformat() if server.updated_at else None,
+        }
+    except ServerNotFoundError as e:
+        raise e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to patch server name: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to patch server name",
+        )
+
+
 @router.get("/{server_id}", response_model=Dict[str, Any])
 async def get_server_details(
     server_id: str,
@@ -289,13 +396,14 @@ async def get_server_details(
     ),
 ):
     """
-    Get details for a specific server.
+    Get details for a specific server by miner hotkey and server id.
     """
     try:
         server = await check_server_ownership(db, server_id, hotkey)
 
         return {
             "server_id": server.server_id,
+            "name": server.name,
             "ip": server.ip,
             "created_at": server.created_at.isoformat(),
             "updated_at": server.updated_at.isoformat() if server.updated_at else None,
@@ -303,6 +411,8 @@ async def get_server_details(
 
     except ServerNotFoundError as e:
         raise e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get server details: {str(e)}")
         raise HTTPException(
@@ -310,9 +420,9 @@ async def get_server_details(
         )
 
 
-@router.delete("/{server_id}", response_model=Dict[str, str])
+@router.delete("/{server_name_or_id}", response_model=Dict[str, str])
 async def remove_server(
-    server_id: str,
+    server_name_or_id: str,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User = Depends(
@@ -320,15 +430,18 @@ async def remove_server(
     ),
 ):
     """
-    Remove a server.
+    Remove a server by miner hotkey and server id or VM name (path param server_name_or_id).
     """
     try:
-        await delete_server(db, server_id, hotkey)
+        server = await get_server_by_name_or_id(db, hotkey, server_name_or_id)
+        await delete_server(db, server.server_id, hotkey)
 
-        return {"server_id": server_id, "message": "Server removed successfully"}
+        return {"name": server.name, "message": "Server removed successfully"}
 
     except ServerNotFoundError as e:
         raise e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to remove server: {str(e)}")
         raise HTTPException(
@@ -353,19 +466,20 @@ async def get_runtime_nonce(
     Generate a nonce for runtime attestation.
     """
     try:
-        # Verify server ownership
         server = await check_server_ownership(db, server_id, hotkey)
 
         actual_ip = extract_ip(request)
         if server.ip != actual_ip:
             raise Exception()
 
-        nonce_info = await create_nonce(server.ip)
+        nonce_info = await create_nonce(server.ip, purpose=NoncePurpose.RUNTIME)
 
         return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
 
     except ServerNotFoundError as e:
         raise e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to generate runtime nonce: {str(e)}")
         raise HTTPException(
@@ -383,16 +497,17 @@ async def verify_runtime_attestation(
     _: User = Depends(
         get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
     ),
-    nonce=Depends(validate_request_nonce()),
+    nonce=Depends(validate_request_nonce(NoncePurpose.RUNTIME)),
     expected_cert_hash=Depends(extract_client_cert_hash()),
 ):
     """
     Verify runtime attestation with full measurement validation.
     """
     try:
+        server = await check_server_ownership(db, server_id, hotkey)
         actual_ip = extract_ip(request)
         result = await process_runtime_attestation(
-            db, server_id, actual_ip, args, hotkey, nonce, expected_cert_hash
+            db, server.server_id, actual_ip, args, hotkey, nonce, expected_cert_hash
         )
 
         return RuntimeAttestationResponse(
@@ -403,6 +518,8 @@ async def verify_runtime_attestation(
 
     except ServerNotFoundError as e:
         raise e
+    except HTTPException:
+        raise
     except NonceError as e:
         logger.warning(f"Runtime attestation nonce error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -427,14 +544,18 @@ async def get_attestation_status(
     ),
 ):
     """
-    Get current attestation status for a server.
+    Get current attestation status for a server by miner hotkey and server id.
     """
     try:
-        status_info = await get_server_attestation_status(db, server_id, hotkey)
+        server = await check_server_ownership(db, server_id, hotkey)
+        status_info = await get_server_attestation_status(db, server.server_id, hotkey)
+        status_info["name"] = server.name
         return status_info
 
     except ServerNotFoundError as e:
         raise e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get attestation status: {str(e)}")
         raise HTTPException(

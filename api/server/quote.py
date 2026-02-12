@@ -5,11 +5,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from dcap_qvl import VerifiedReport
 from loguru import logger
 
+from api.config import TeeMeasurementConfig
 from api.server.exceptions import InvalidQuoteError
+
+# RTMR dict keys; use these when building or iterating over rtmrs.
+RTMR0 = "rtmr0"
+RTMR1 = "rtmr1"
+RTMR2 = "rtmr2"
+RTMR3 = "rtmr3"
+RTMR_KEYS = (RTMR0, RTMR1, RTMR2, RTMR3)
 
 
 @dataclass
@@ -37,15 +45,33 @@ class TdxQuote(ABC):
     def rtmrs(self) -> Dict[str, str]:
         """Get RTMRs as a dictionary."""
         return {
-            "rtmr0": self.rtmr0,
-            "rtmr1": self.rtmr1,
-            "rtmr2": self.rtmr2,
-            "rtmr3": self.rtmr3,
+            RTMR0: self.rtmr0,
+            RTMR1: self.rtmr1,
+            RTMR2: self.rtmr2,
+            RTMR3: self.rtmr3,
         }
 
     @property
     @abstractmethod
     def quote_type(self): ...
+
+    def matches_measurement(self, config: TeeMeasurementConfig) -> bool:
+        """
+        Return True if this quote's measurements match the given measurement config.
+
+        Compares MRTD (case-insensitive) and the appropriate RTMR set for
+        this quote's type ("boot" -> config.boot_rtmrs, "runtime" -> config.runtime_rtmrs).
+        """
+        if self.mrtd.upper() != config.mrtd.upper():
+            return False
+        expected = config.boot_rtmrs if self.quote_type == "boot" else config.runtime_rtmrs
+        if not expected:
+            return False
+        for rtmr_name, expected_value in expected.items():
+            actual = self.rtmrs.get(rtmr_name.lower()) or self.rtmrs.get(rtmr_name)
+            if not actual or actual.upper() != expected_value.upper():
+                return False
+        return True
 
     @classmethod
     def from_base64(cls, quote_base64: str) -> "TdxQuote":
@@ -159,10 +185,18 @@ class RuntimeTdxQuote(TdxQuote):
         return "runtime"
 
 
+# Intel TDX: debug attribute is bit 0 of td_attributes (Linux kernel TDX_ATTR_DEBUG_BIT).
+# When set, the TD is in debug mode; we reject such quotes.
+TDX_ATTR_DEBUG_BIT = 0
+
+
 @dataclass
 class TdxVerificationResult:
     """
-    Parsed TDX quote with extracted measurements.
+    Parsed verification report: raw fields from the report with computed properties.
+
+    Store status, advisory_ids, td_attributes, and measurements; is_valid and
+    debug_enabled are derived from this raw data.
     """
 
     mrtd: str
@@ -172,32 +206,58 @@ class TdxVerificationResult:
     rtmr3: str
     user_data: Optional[str]
     parsed_at: datetime
-    is_valid: bool
+    status: str
+    advisory_ids: List[str]
+    td_attributes: str
 
     @property
     def rtmrs(self) -> Dict[str, str]:
         """Get RTMRs as a dictionary."""
         return {
-            "rtmr0": self.rtmr0,
-            "rtmr1": self.rtmr1,
-            "rtmr2": self.rtmr2,
-            "rtmr3": self.rtmr3,
+            RTMR0: self.rtmr0,
+            RTMR1: self.rtmr1,
+            RTMR2: self.rtmr2,
+            RTMR3: self.rtmr3,
         }
 
+    @property
+    def debug_enabled(self) -> bool:
+        """True if the TD has debug mode enabled (bit 0 set in td_attributes)."""
+        if not self.td_attributes:
+            return True  # treat missing as unsafe
+        try:
+            value = int(self.td_attributes, 16)
+            return bool(value & (1 << TDX_ATTR_DEBUG_BIT))
+        except (ValueError, TypeError):
+            return True  # treat unparseable as unsafe
+
+    @property
+    def is_valid(self) -> bool:
+        """True if signature status is UpToDate and TD debug mode is disabled."""
+        return self.status == "UpToDate" and not self.debug_enabled
+
     @classmethod
-    def from_report(cls, verified_report: VerifiedReport) -> "TdxQuote":
+    def from_report(cls, verified_report: VerifiedReport) -> "TdxVerificationResult":
         _json = json.loads(verified_report.to_json())
-        _report = _json.get("report").get("TD10")
-        return TdxVerificationResult(
-            mrtd=_report.get("mr_td"),
-            rtmr0=_report.get("rt_mr0"),
-            rtmr1=_report.get("rt_mr1"),
-            rtmr2=_report.get("rt_mr2"),
-            rtmr3=_report.get("rt_mr3"),
+        _report = _json.get("report", {}).get("TD10", {})
+        status = _json.get("status", "Unknown")
+        advisory_ids = _json.get("advisory_ids") or []
+        td_attributes = _report.get("td_attributes", "")
+
+        result = cls(
+            mrtd=_report.get("mr_td", ""),
+            rtmr0=_report.get("rt_mr0", ""),
+            rtmr1=_report.get("rt_mr1", ""),
+            rtmr2=_report.get("rt_mr2", ""),
+            rtmr3=_report.get("rt_mr3", ""),
             user_data=_report.get("report_data"),
             parsed_at=datetime.now(timezone.utc),
-            is_valid=bool(verified_report.status == "UpToDate"),
+            status=status,
+            advisory_ids=advisory_ids,
+            td_attributes=td_attributes,
         )
+
+        return result
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary format for compatibility."""

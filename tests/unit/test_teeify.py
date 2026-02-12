@@ -95,6 +95,7 @@ from chutes.chute.template.sglang import build_sglang_chute
 chute = build_sglang_chute(
     username="dumbeldore",
     readme="rubizinho/Affine-small-model",
+    name="rubizinho/Affine-small-model",
     model_name="rubizinho/Affine-small-model",
     image="chutes/sglang:nightly-20251212000",
     concurrency=20,
@@ -109,7 +110,8 @@ chute = build_sglang_chute(
 )
 """
         node_selector = {"gpu_count": 1, "include": ["a100"]}
-        result_code, result_ns = transform_for_tee(code, node_selector)
+        tee_name = "rubizinho/Affine-small-model-TEE"
+        result_code, result_ns = transform_for_tee(code, node_selector, tee_name)
 
         # Check that tee=True is added
         assert "tee=True" in result_code
@@ -122,6 +124,15 @@ chute = build_sglang_chute(
         assert "model_name=" in result_code
         assert "concurrency=20" in result_code
         assert "revision=" in result_code
+
+        # Check that name is updated to TEE name
+        assert tee_name in result_code
+
+        # Check that chute.chute._name is set
+        assert (
+            f"chute.chute._name = '{tee_name}'" in result_code
+            or f'chute.chute._name = "{tee_name}"' in result_code
+        )
 
         # Check returned node_selector
         assert result_ns == {"gpu_count": 1, "include": ["h200"]}
@@ -152,7 +163,7 @@ chute = build_sglang_chute(
             "gpu_count": 1,
             "include": ["a100", "h100", "h100_sxm", "h100_nvl", "h200"],
         }
-        result_code, result_ns = transform_for_tee(code, node_selector)
+        result_code, result_ns = transform_for_tee(code, node_selector, "test-affine-TEE")
 
         # Check that tee=True is added
         assert "tee=True" in result_code
@@ -192,7 +203,7 @@ chute = build_sglang_chute(
             "gpu_count": 1,
             "include": ["a100", "h100", "h100_sxm", "h100_nvl", "h200"],
         }
-        result_code, _ = transform_for_tee(code, node_selector)
+        result_code, _ = transform_for_tee(code, node_selector, "test-affine-TEE")
 
         # Check preserved keywords
         assert "concurrency=24" in result_code
@@ -221,7 +232,7 @@ chute = build_vllm_chute(
 )
 """
         node_selector = {"gpu_count": 2, "include": ["h100"]}
-        result_code, result_ns = transform_for_tee(code, node_selector)
+        result_code, result_ns = transform_for_tee(code, node_selector, "test/Affine-model-TEE")
 
         assert "tee=True" in result_code
         assert 'include=["h200"]' in result_code or "include=['h200']" in result_code
@@ -247,7 +258,9 @@ chute = build_sglang_chute(
         # 4 x A100 (80GB) = 320GB total
         # H200 has 140GB, so ceil(320/140) = 3, next power of 2 = 4
         node_selector = {"gpu_count": 4, "include": ["a100"]}
-        result_code, result_ns = transform_for_tee(code, node_selector)
+        result_code, result_ns = transform_for_tee(
+            code, node_selector, "test/Affine-large-model-TEE"
+        )
 
         assert "gpu_count=4" in result_code
         assert "tee=True" in result_code
@@ -277,7 +290,7 @@ chute = build_sglang_chute(
 )
 """
         node_selector = {"gpu_count": 1, "include": ["a100"]}
-        result_code, _ = transform_for_tee(code, node_selector)
+        result_code, _ = transform_for_tee(code, node_selector, "rubizinho/Affine-small-model-TEE")
 
         # os import should be preserved
         assert "import os" in result_code
@@ -300,7 +313,7 @@ chute = build_sglang_chute(
 )
 """
         node_selector = {"gpu_count": 1, "include": ["a100"]}
-        result_code, _ = transform_for_tee(code, node_selector)
+        result_code, _ = transform_for_tee(code, node_selector, "test/Affine-model-TEE")
 
         assert "tee=True" in result_code
         assert "tee=False" not in result_code

@@ -287,6 +287,7 @@ RUN python -m cllmv.pkg_hash > /tmp/package_hashes.json
 COPY generate_manifest_driver.py /tmp/generate_manifest_driver.py
 RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
     --output /tmp/bytecode.manifest \
+    --json-output /tmp/bytecode.manifest.json \
     --lib /tmp/chutes-bcm.so \
     --extra-dirs /usr/local/lib/python3.12/site-packages
 """
@@ -334,6 +335,7 @@ RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
             package_hashes,
             inspecto_hash,
             bytecode_manifest_path,
+            bytecode_manifest_json_path,
         ) = await extract_cfsv_data_from_verification_image(verification_tag, build_dir)
         image.inspecto = inspecto_hash
         image.package_hashes = package_hashes
@@ -342,6 +344,10 @@ RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
         # Upload bytecode manifest to S3 if generated.
         if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
             await upload_bytecode_manifest(image, bytecode_manifest_path)
+
+        # Upload JSON manifest to S3 for validator (no decryption needed).
+        if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
+            await upload_bytecode_manifest_json(image, bytecode_manifest_json_path)
 
         # Build final image that combines original + index file
         logger.info(f"Building final image as {short_tag}")
@@ -756,7 +762,21 @@ async def extract_cfsv_data_from_verification_image(verification_tag: str, build
             shutil.copy2(manifest_src, bytecode_manifest_path)
             logger.info(f"Extracted bytecode manifest from {manifest_src}")
 
-        return data_file_path, package_hashes, inspecto_hash, bytecode_manifest_path
+        # Extract JSON manifest for validator (cleartext, no decryption needed).
+        bytecode_manifest_json_path = None
+        manifest_json_src = os.path.join(mount_path, "tmp", "bytecode.manifest.json")
+        if os.path.exists(manifest_json_src):
+            bytecode_manifest_json_path = os.path.join(build_dir, "bytecode.manifest.json")
+            shutil.copy2(manifest_json_src, bytecode_manifest_json_path)
+            logger.info(f"Extracted bytecode manifest JSON from {manifest_json_src}")
+
+        return (
+            data_file_path,
+            package_hashes,
+            inspecto_hash,
+            bytecode_manifest_path,
+            bytecode_manifest_json_path,
+        )
     finally:
         # Unmount if we mounted
         if mount_path and container_id:
@@ -804,6 +824,17 @@ async def upload_bytecode_manifest(image, manifest_path: str):
     async with settings.s3_client() as s3:
         await s3.upload_file(manifest_path, settings.storage_bucket, s3_key)
     logger.success(f"Uploaded bytecode manifest to {s3_key}")
+
+
+async def upload_bytecode_manifest_json(image, manifest_json_path: str):
+    """
+    Upload the cleartext JSON bytecode manifest to S3 (for validator lookups).
+    """
+    patch_version = image.patch_version if image.patch_version is not None else "initial"
+    s3_key = f"image_hash_blobs/{image.image_id}/{patch_version}.manifest.json"
+    async with settings.s3_client() as s3:
+        await s3.upload_file(manifest_json_path, settings.storage_bucket, s3_key)
+    logger.success(f"Uploaded bytecode manifest JSON to {s3_key}")
 
 
 async def get_target_image_id() -> str | None:
@@ -1099,6 +1130,7 @@ RUN python -m cllmv.pkg_hash > /tmp/package_hashes.json
 COPY generate_manifest_driver.py /tmp/generate_manifest_driver.py
 RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
     --output /tmp/bytecode.manifest \
+    --json-output /tmp/bytecode.manifest.json \
     --lib /tmp/chutes-bcm.so \
     --extra-dirs /usr/local/lib/python3.12/site-packages
 """
@@ -1153,6 +1185,7 @@ RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
                 package_hashes,
                 inspecto_hash,
                 bytecode_manifest_path,
+                bytecode_manifest_json_path,
             ) = await extract_cfsv_data_from_verification_image(verification_tag, build_dir)
             s3_key = f"image_hash_blobs/{image_id}/{patch_version}.data"
             async with settings.s3_client() as s3:
@@ -1167,6 +1200,15 @@ RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
                         bytecode_manifest_path, settings.storage_bucket, manifest_s3_key
                     )
                 logger.success(f"Uploaded bytecode manifest to {manifest_s3_key}")
+
+            # Upload JSON manifest for validator if generated.
+            if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
+                manifest_json_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest.json"
+                async with settings.s3_client() as s3:
+                    await s3.upload_file(
+                        bytecode_manifest_json_path, settings.storage_bucket, manifest_json_s3_key
+                    )
+                logger.success(f"Uploaded bytecode manifest JSON to {manifest_json_s3_key}")
 
             # Stage 3: Build final image that combines updated + index file
             logger.info(f"Stage 3: Building final image as {target_tag}")

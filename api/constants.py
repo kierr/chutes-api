@@ -1,3 +1,14 @@
+from enum import Enum
+
+
+class NoncePurpose(str, Enum):
+    """Purpose values for attestation nonces to prevent cross-purpose reuse."""
+
+    BOOT = "boot"
+    RUNTIME = "runtime"
+    INSTANCE_VERIFICATION = "instance_verification"
+
+
 ZERO_ADDRESS_HOTKEY = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # Public key is 0x00000...
 HOTKEY_HEADER = "X-Chutes-Hotkey"
 COLDKEY_HEADER = "X-Chutes-Coldkey"
@@ -8,6 +19,9 @@ PURPOSE_HEADER = "X-Chutes-Purpose"
 MINER_HEADER = "X-Chutes-Miner"
 VALIDATOR_HEADER = "X-Chutes-Validator"
 ENCRYPTED_HEADER = "X-Chutes-Encrypted"
+
+# LUKS volume names allowed in GET/POST (extendable)
+SUPPORTED_LUKS_VOLUMES = ("storage", "tdx-cache")
 
 # Min balance to register via the CLI (tao units)
 MIN_REG_BALANCE = 0.25
@@ -68,9 +82,9 @@ SCALE_DOWN_MAX_DROP_RATIO = 0.6
 # Thrash detection: prevents miners from gaming bounty/urgency boosts by
 # repeatedly deleting and recreating instances of the same chute.
 # Window to check for prior deleted active instances before new instance creation.
-THRASH_WINDOW_HOURS = 3
+THRASH_WINDOW_HOURS = 2
 # Duration of penalty period after activation where boosts are not applied.
-THRASH_PENALTY_HOURS = 3
+THRASH_PENALTY_HOURS = 2
 # Cooldown between bounty creations per chute to prevent race conditions.
 BOUNTY_COOLDOWN_SECONDS = 600
 

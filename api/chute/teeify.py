@@ -55,10 +55,12 @@ class TeeifyTransformer(ast.NodeTransformer):
     Transforms:
     - node_selector to include=["h200"] with calculated gpu_count
     - Adds tee=True to the builder call
+    - Updates name to include -TEE suffix
     """
 
-    def __init__(self, new_gpu_count: int):
+    def __init__(self, new_gpu_count: int, new_name: str):
         self.new_gpu_count = new_gpu_count
+        self.new_name = new_name
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
         """Transform builder calls (build_sglang_chute, build_vllm_chute, Chute)."""
@@ -101,6 +103,11 @@ class TeeifyTransformer(ast.NodeTransformer):
                 has_tee = True
                 # Force tee=True
                 new_keywords.append(ast.keyword(arg="tee", value=ast.Constant(value=True)))
+            elif keyword.arg == "name":
+                # Update name to include -TEE suffix
+                new_keywords.append(
+                    ast.keyword(arg="name", value=ast.Constant(value=self.new_name))
+                )
             else:
                 new_keywords.append(keyword)
 
@@ -133,13 +140,15 @@ class TeeifyTransformer(ast.NodeTransformer):
         return node
 
 
-def transform_for_tee(code: str, original_node_selector: dict) -> tuple[str, dict]:
+def transform_for_tee(code: str, original_node_selector: dict, new_name: str) -> tuple[str, dict]:
     """
     Transform affine chute code and node_selector for TEE deployment.
 
     Changes:
     1. node_selector becomes include=["h200"] with appropriate gpu_count
     2. tee=True is added/set
+    3. name is updated to include -TEE suffix
+    4. chute.chute._name is set to the new name
 
     Returns:
         Tuple of (transformed_code, new_node_selector_dict)
@@ -151,12 +160,15 @@ def transform_for_tee(code: str, original_node_selector: dict) -> tuple[str, dic
 
     # Parse and transform the AST
     tree = ast.parse(code)
-    transformer = TeeifyTransformer(new_gpu_count)
+    transformer = TeeifyTransformer(new_gpu_count, new_name)
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
 
     # Convert back to code
     transformed_code = ast.unparse(tree)
+
+    # Append _name override so the chute object reflects the TEE name
+    transformed_code += f"\nchute.chute._name = {new_name!r}"
 
     # Return both the code and the new node_selector
     new_node_selector = {"gpu_count": new_gpu_count, "include": ["h200"]}
