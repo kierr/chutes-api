@@ -66,6 +66,7 @@ class LaunchConfigArgs(BaseModel):
     tls_cert: Optional[str] = None
     tls_cert_sig: Optional[str] = None
     e2e_pubkey: Optional[str] = None
+    cllmv_session_init: Optional[str] = None
     env: str
     code: Optional[str] = None
     run_code: Optional[str] = None

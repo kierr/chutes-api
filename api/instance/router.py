@@ -16,6 +16,7 @@ import asyncio
 import orjson as json  # noqa
 from api.image.util import get_inspecto_hash
 import api.miner_client as miner_client
+import cllmv as _cllmv
 from loguru import logger
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
@@ -1150,6 +1151,28 @@ async def _validate_launch_config_instance(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Session key derivation failed: {exc}",
             )
+
+    # CLLMV V2: decrypt miner's ephemeral HMAC session key from init blob
+    cllmv_init = getattr(args, "cllmv_session_init", None)
+    if cllmv_init and semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
+        x25519_priv = os.environ.get("CLLMV_X25519_PRIVATE_KEY")
+        if x25519_priv:
+            try:
+                cllmv_session_key = _cllmv.decrypt_session_key(cllmv_init, x25519_priv)
+                if cllmv_session_key:
+                    if instance.extra is None:
+                        instance.extra = {}
+                    instance.extra["cllmv_session_key"] = cllmv_session_key
+                    logger.info(f"CLLMV V2 session key decrypted for {instance.instance_id}")
+                else:
+                    logger.warning(
+                        f"CLLMV V2 session key decryption failed for {instance.instance_id} "
+                        f"(invalid init blob or signature)"
+                    )
+            except Exception as exc:
+                logger.warning(f"CLLMV V2 session key decryption error: {exc}")
+        else:
+            logger.debug("CLLMV_X25519_PRIVATE_KEY not set, skipping V2 session key decrypt")
 
     return launch_config, nodes, instance, validator_pubkey
 

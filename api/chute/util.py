@@ -82,7 +82,7 @@ from api.metrics.capacity import (
     track_request_completed,
     track_request_rate_limited,
 )
-from cllmv import validate as cllmv_validate
+from cllmv import validate as cllmv_validate, validate_v2 as cllmv_validate_v2
 
 
 # Tokenizer for input/output token estimation.
@@ -842,15 +842,30 @@ async def _invoke_one(
                                     + target.rint_nonce
                                     + chute.image.package_hashes["hash"]
                                 )
-                            if not cllmv_validate(
-                                data.get("id") or "bad",
-                                data.get("created") or 0,
-                                text,
-                                verification_token,
-                                challenge_val,
-                                model_identifier,
-                                chute.revision,
-                            ):
+                            # Try V2 (HMAC-SHA256 with session key) first, fall back to V1
+                            cllmv_v2_key = (target.extra or {}).get("cllmv_session_key")
+                            if cllmv_v2_key:
+                                cllmv_ok = cllmv_validate_v2(
+                                    data.get("id") or "bad",
+                                    data.get("created") or 0,
+                                    text,
+                                    verification_token,
+                                    cllmv_v2_key,
+                                    challenge_val,
+                                    model_identifier,
+                                    chute.revision,
+                                )
+                            else:
+                                cllmv_ok = cllmv_validate(
+                                    data.get("id") or "bad",
+                                    data.get("created") or 0,
+                                    text,
+                                    verification_token,
+                                    challenge_val,
+                                    model_identifier,
+                                    chute.revision,
+                                )
+                            if not cllmv_ok:
                                 logger.warning(
                                     f"CLLMV FAILURE: STREAMED {target.instance_id=} {target.miner_hotkey=} {chute.name=}"
                                 )
@@ -1053,15 +1068,30 @@ async def _invoke_one(
                                     + target.rint_nonce
                                     + chute.image.package_hashes["hash"]
                                 )
-                            if not verification_token or not cllmv_validate(
-                                json_data.get("id") or "bad",
-                                json_data.get("created") or 0,
-                                text,
-                                verification_token,
-                                challenge_val,
-                                model_identifier,
-                                chute.revision,
-                            ):
+                            # Try V2 (HMAC-SHA256 with session key) first, fall back to V1
+                            cllmv_v2_key = (target.extra or {}).get("cllmv_session_key")
+                            if cllmv_v2_key:
+                                cllmv_ok = verification_token and cllmv_validate_v2(
+                                    json_data.get("id") or "bad",
+                                    json_data.get("created") or 0,
+                                    text,
+                                    verification_token,
+                                    cllmv_v2_key,
+                                    challenge_val,
+                                    model_identifier,
+                                    chute.revision,
+                                )
+                            else:
+                                cllmv_ok = verification_token and cllmv_validate(
+                                    json_data.get("id") or "bad",
+                                    json_data.get("created") or 0,
+                                    text,
+                                    verification_token,
+                                    challenge_val,
+                                    model_identifier,
+                                    chute.revision,
+                                )
+                            if not cllmv_ok:
                                 logger.warning(
                                     f"CLLMV FAILURE: {target.instance_id=} {target.miner_hotkey=} {chute.name=}"
                                 )
