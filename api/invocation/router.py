@@ -507,6 +507,7 @@ async def _invoke(
                 request_body["stream_options"] = {}
             if not request_body["stream_options"].get("include_usage"):
                 request_body["stream_options"]["include_usage"] = True
+            request_body["stream_options"]["continuous_usage_stats"] = True
         if request_body.get("logprobs"):
             if not request_body.get("top_logprobs"):
                 request_body["top_logprobs"] = 1

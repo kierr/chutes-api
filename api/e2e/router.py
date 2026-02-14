@@ -365,6 +365,7 @@ async def _stream_e2e_response(
     Stream E2E response chunks, extracting usage events for billing.
     """
     metrics = {}
+    chunk_count = 0
     try:
         async for raw_chunk in response.aiter_bytes():
             # Transport-decrypt each chunk.
@@ -398,6 +399,15 @@ async def _stream_e2e_response(
                         )
                 except Exception:
                     pass
+
+            # Periodic disconnect check (every 5 chunks).
+            chunk_count += 1
+            if chunk_count % 5 == 0 and await request.is_disconnected():
+                logger.info(
+                    f"E2E client disconnected mid-stream for {chute.name} {instance.instance_id=}"
+                )
+                await response.aclose()
+                break
 
             # Relay the decrypted chunk to client as-is.
             yield decrypted

@@ -673,6 +673,7 @@ async def _invoke_one(
     prefixes: list = None,
     manager: LeastConnManager = None,
     raw_payload: dict = None,
+    request: Request = None,
 ):
     """
     Try invoking a chute/cord with a single instance.
@@ -777,6 +778,8 @@ async def _invoke_one(
             any_chunks = False
             chunk_idx = 0
             cllmv_verified = False
+            last_usage = None
+            disconnect_chunk_check = 0
             async for raw_chunk in stream_response.aiter_bytes():
                 chunk = await asyncio.to_thread(decrypt_instance_response, raw_chunk, target, iv)
                 if not use_serialized:
@@ -909,9 +912,35 @@ async def _invoke_one(
                                 raise InvalidCLLMV(
                                     f"BAD_RESPONSE {target.instance_id=} {chute.name=} returned invalid chunk (failed cllmv check)"
                                 )
+                    # Track running usage from continuous_usage_stats.
+                    if isinstance(data, dict) and "usage" in data and data["usage"]:
+                        last_usage = data["usage"]
+
                     last_chunk = chunk
                 if b"data:" in chunk:
                     any_chunks = True
+
+                # Periodic disconnect check (every 5 chunks).
+                disconnect_chunk_check += 1
+                if request and disconnect_chunk_check % 5 == 0:
+                    if await request.is_disconnected():
+                        logger.info(
+                            f"Client disconnected mid-stream for {chute.name} "
+                            f"{target.instance_id=}, populating partial metrics"
+                        )
+                        if last_usage and metrics is not None:
+                            metrics["it"] = last_usage.get("prompt_tokens", 0)
+                            metrics["ot"] = last_usage.get("completion_tokens", 0)
+                            metrics["ct"] = (last_usage.get("prompt_tokens_details") or {}).get(
+                                "cached_tokens", 0
+                            )
+                            total_time = time.time() - started_at
+                            metrics["tt"] = round(total_time, 3)
+                            ot = metrics["ot"] or 1
+                            metrics["tps"] = round(ot / total_time, 3)
+                            metrics["ctps"] = round((metrics["it"] + ot) / total_time, 3)
+                        await stream_response.aclose()
+                        return
 
                 yield chunk.decode()
 
@@ -1349,6 +1378,7 @@ async def invoke(
                     prefixes,
                     manager,
                     raw_payload,
+                    request,
                 ):
                     try:
                         if "input_ids cannot be empty" in str(data):
