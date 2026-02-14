@@ -241,6 +241,103 @@ def _verify_rint_commitment(commitment_hex: str, expected_nonce: str) -> bool:
         return False
 
 
+def _validate_tls_cert(
+    tls_cert_pem: str, tls_cert_sig_hex: str, rint_commitment_hex: str, nonce: str | None = None
+) -> bool:
+    """Validate TLS cert signature against the aegis Ed25519 key from rint_commitment.
+
+    For v4 commitments, verifies sign(cert_pem || nonce) using the Ed25519 pubkey
+    embedded at bytes 2:34 of the commitment. Also verifies the nonce is embedded
+    in the cert as an X.509 extension if present.
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography import x509
+
+    try:
+        commitment_bytes = bytes.fromhex(rint_commitment_hex)
+        if commitment_bytes[0] != 0x04:
+            logger.error("TLS cert validation: not a v4 commitment")
+            return False
+        pubkey_bytes = commitment_bytes[2:34]
+
+        pk = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+        sig_bytes = bytes.fromhex(tls_cert_sig_hex)
+
+        # Verify signature over cert_pem || nonce (nonce-bound) or just cert_pem (legacy).
+        signed_data = tls_cert_pem.encode()
+        if nonce:
+            signed_data += nonce.encode()
+        pk.verify(sig_bytes, signed_data)
+
+        # If nonce provided, verify it's embedded in the cert as X.509 extension.
+        if nonce:
+            CHUTES_NONCE_OID = x509.ObjectIdentifier("1.3.6.1.4.1.59888.1")
+            cert = x509.load_pem_x509_certificate(tls_cert_pem.encode())
+            try:
+                ext = cert.extensions.get_extension_for_oid(CHUTES_NONCE_OID)
+                raw = ext.value.value
+                # Extension value is DER: UTF8String(nonce). Parse tag+length.
+                if raw[0] == 0x0C:  # UTF8String tag
+                    # Short form length
+                    if raw[1] < 0x80:
+                        cert_nonce = raw[2 : 2 + raw[1]].decode()
+                    elif raw[1] == 0x81:
+                        cert_nonce = raw[3 : 3 + raw[2]].decode()
+                    else:
+                        cert_nonce = raw.decode()  # fallback
+                else:
+                    cert_nonce = raw.decode()  # fallback for raw OCTET STRING
+                if cert_nonce != nonce:
+                    logger.error(f"TLS cert nonce mismatch: cert={cert_nonce} expected={nonce}")
+                    return False
+            except x509.ExtensionNotFound:
+                # Legacy cert without nonce extension — allow if sig verified.
+                logger.warning("TLS cert has no nonce extension, skipping nonce embedding check")
+
+        logger.info("TLS cert signature validation successful")
+        return True
+    except Exception as e:
+        logger.error(f"TLS cert validation failed: {e}")
+        return False
+
+
+async def _verify_instance_tls_live(host: str, port: int, expected_cert_pem: str) -> bool:
+    """Connect to the instance's logging port and verify the served cert matches expected."""
+    import ssl
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    try:
+        expected_cert = x509.load_pem_x509_certificate(expected_cert_pem.encode())
+        expected_fingerprint = expected_cert.fingerprint(hashes.SHA256())
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx),
+            timeout=10.0,
+        )
+        ssl_object = writer.get_extra_info("ssl_object")
+        served_der = ssl_object.getpeercert(binary_form=True)
+        served_cert = x509.load_der_x509_certificate(served_der)
+        served_fingerprint = served_cert.fingerprint(hashes.SHA256())
+        writer.close()
+        await writer.wait_closed()
+
+        if served_fingerprint != expected_fingerprint:
+            logger.warning(
+                f"TLS cert mismatch: served {served_fingerprint.hex()} != expected {expected_fingerprint.hex()}"
+            )
+            return False
+        logger.info(f"Live TLS cert verification passed for {host}:{port}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to verify TLS cert live at {host}:{port}: {e}")
+        return False
+
+
 async def _load_chute(db, chute_id: str) -> Chute:
     chute = (
         (await db.execute(select(Chute).where(Chute.chute_id == chute_id)))
@@ -871,9 +968,18 @@ async def _validate_launch_config_instance(
                         f"{log_prefix} aegis-verify hash challenge success: {launch_config.config_id=} {args.netnanny_hash=}"
                     )
             else:
-                # aegis-verify .so not available, allow through (commitment already verified)
-                logger.warning(
-                    f"{log_prefix} aegis-verify not available, skipping hash verification"
+                # aegis-verify .so must be deployed for v4 instances — hard fail.
+                logger.error(
+                    f"{log_prefix} aegis-verify library not available, cannot verify v4 instance"
+                )
+                launch_config.failed_at = func.now()
+                launch_config.verification_error = (
+                    "aegis-verify library not available for v4 verification"
+                )
+                await db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="aegis-verify library not available, cannot verify v4 instances",
                 )
         elif chute.allow_external_egress != args.egress or not args.netnanny_hash:
             nn_valid = False
@@ -965,8 +1071,62 @@ async def _validate_launch_config_instance(
                 detail=f"Job {launch_config.job_id} has already been claimed by another miner!",
             )
 
+    # Validate TLS certificate for v4 instances (>= 0.5.5).
+    validated_cacert = None
+    is_v4 = semcomp(chute.chutes_version or "0.0.0", "0.5.5") >= 0
+    tls_cert = getattr(args, "tls_cert", None)
+    tls_cert_sig = getattr(args, "tls_cert_sig", None)
+    rint_commitment = getattr(args, "rint_commitment", None)
+
+    if is_v4 and rint_commitment and rint_commitment[:2] == "04":
+        if not tls_cert or not tls_cert_sig:
+            logger.error(f"{log_prefix} v4 instance missing tls_cert or tls_cert_sig")
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "v4 instance must provide TLS certificate"
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="v4 instances must provide a TLS certificate and signature",
+            )
+        if not _validate_tls_cert(tls_cert, tls_cert_sig, rint_commitment, launch_config.nonce):
+            logger.error(f"{log_prefix} TLS cert signature validation failed")
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "TLS certificate signature validation failed"
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="TLS certificate signature validation failed",
+            )
+        validated_cacert = tls_cert
+
+        # Live TLS verification: connect to logging port and verify served cert.
+        log_port_mapping = next((p for p in args.port_mappings if p.internal_port == 8001), None)
+        if log_port_mapping:
+            live_ok = await _verify_instance_tls_live(
+                args.host, log_port_mapping.external_port, tls_cert
+            )
+            if not live_ok:
+                logger.error(f"{log_prefix} live TLS cert verification failed")
+                launch_config.failed_at = func.now()
+                launch_config.verification_error = "Live TLS certificate verification failed"
+                await db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Live TLS certificate verification failed — cert mismatch or unreachable",
+                )
+
     # Create the instance now that we've verified the envdump/k8s env.
     node_selector = NodeSelector(**chute.node_selector)
+    extra_fields = {
+        "e2e_pubkey": getattr(args, "e2e_pubkey", None),
+    }
+    # Store mTLS client cert + key for API-to-instance connections.
+    tls_client_cert = getattr(args, "tls_client_cert", None)
+    if tls_client_cert:
+        extra_fields["client_cert"] = tls_client_cert
+        extra_fields["client_key"] = getattr(args, "tls_client_key", None)
+        extra_fields["client_key_password"] = getattr(args, "tls_client_key_password", None)
+
     instance = Instance(
         instance_id=new_instance_id,
         host=args.host,
@@ -988,19 +1148,11 @@ async def _validate_launch_config_instance(
         hourly_rate=(await node_selector.current_estimated_price())["usd"]["hour"],
         inspecto=getattr(args, "inspecto", None),
         env_creation=args.model_dump(),
-        rint_commitment=getattr(args, "rint_commitment", None),
+        rint_commitment=rint_commitment,
         rint_nonce=getattr(args, "rint_nonce", None),
         rint_pubkey=getattr(args, "rint_pubkey", None),
-        extra={
-            k: v
-            for k, v in {
-                "tls_cert": getattr(args, "tls_cert", None),
-                "tls_cert_sig": getattr(args, "tls_cert_sig", None),
-                "e2e_pubkey": getattr(args, "e2e_pubkey", None),
-            }.items()
-            if v is not None
-        }
-        or None,
+        cacert=validated_cacert,
+        extra={k: v for k, v in extra_fields.items() if v is not None} or None,
     )
     if launch_config.job_id or (
         not chute.public
@@ -2375,15 +2527,38 @@ async def stream_logs(
         log_port = next(p for p in instance.port_mappings if p["internal_port"] == 8001)[
             "external_port"
         ]
-        async with miner_client.get(
-            instance.miner_hotkey,
-            f"http://{instance.host}:{log_port}/logs/stream",
-            timeout=0,
-            purpose="chutes",
-            params={"backfill": str(backfill)},
-        ) as resp:
-            async for chunk in resp.content:
-                yield chunk
+        # Build a temporary client for the log port (different from main port).
+        import httpx as _httpx
+
+        if instance.cacert:
+            from api.instance.connection import _get_ssl_and_cn, _InstanceTransport
+
+            ssl_ctx, cn = _get_ssl_and_cn(instance)
+            transport = _InstanceTransport(hostname=cn, ip=instance.host, ssl_context=ssl_ctx)
+            client = _httpx.AsyncClient(
+                transport=transport,
+                base_url=f"https://{cn}:{log_port}",
+                timeout=_httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
+                http2=True,
+            )
+        else:
+            client = _httpx.AsyncClient(
+                base_url=f"http://{instance.host}:{log_port}",
+                timeout=_httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
+            )
+
+        headers, _ = miner_client.sign_request(instance.miner_hotkey, purpose="chutes")
+        try:
+            async with client.stream(
+                "GET",
+                "/logs/stream",
+                headers=headers,
+                params={"backfill": str(backfill)},
+            ) as resp:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+        finally:
+            await client.aclose()
 
     return StreamingResponse(
         _stream(),
@@ -2475,6 +2650,11 @@ async def delete_instance(
             """),
             {"instance_id": instance_id, "penalty": compute_multiplier_penalty},
         )
+
+    # Evict cached SSL context and httpx client for this instance.
+    from api.instance.connection import evict_instance_ssl
+
+    evict_instance_ssl(instance_id)
 
     await db.delete(instance)
 

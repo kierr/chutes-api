@@ -3,7 +3,7 @@ Application logic and utilities for chutes.
 """
 
 import os
-import aiohttp
+import httpx
 import asyncio
 import re
 import uuid
@@ -234,15 +234,13 @@ async def safe_store_invocation(*args, **kwargs):
         logger.error(f"SAFE_STORE_INVOCATION: failed to insert new invocation record: {str(exc)}")
 
 
-async def get_miner_session(instance: Instance, timeout: int = 600) -> aiohttp.ClientSession:
+async def get_miner_session(instance: Instance, timeout: int = 600):
     """
-    Get or create an aiohttp session for an instance.
+    Get or create an httpx client for an instance (with TLS if available).
     """
-    return aiohttp.ClientSession(
-        base_url=f"http://{instance.host}:{instance.port}",
-        timeout=aiohttp.ClientTimeout(connect=10.0, total=timeout),
-        read_bufsize=8 * 1024 * 1024,
-    )
+    from api.instance.connection import get_instance_client
+
+    return await get_instance_client(instance, timeout=timeout)
 
 
 async def selector_hourly_price(node_selector) -> float:
@@ -698,7 +696,8 @@ async def _invoke_one(
     )
     path = encrypted_path
 
-    session, response = None, None
+    response = None
+    stream_response = None
     timeout = 1800
     if (
         semcomp(target.chutes_version or "0.0.0", "0.4.3") >= 0
@@ -715,34 +714,48 @@ async def _invoke_one(
         session = await get_miner_session(target, timeout=timeout)
         headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
         headers["X-Chutes-Serialized"] = "true"
-        response = await session.post(
-            f"/{path}",
-            data=payload_string,
-            headers=headers,
-        )
-        if response.status != 200:
+
+        if stream:
+            # Use streaming request for streaming responses.
+            stream_response = await session.send(
+                session.build_request("POST", f"/{path}", content=payload_string, headers=headers),
+                stream=True,
+            )
+            response = stream_response
+        else:
+            response = await session.post(
+                f"/{path}",
+                content=payload_string,
+                headers=headers,
+            )
+
+        if response.status_code != 200:
             logger.info(
-                f"Received response {response.status} from miner {target.miner_hotkey} instance_id={target.instance_id} of chute_id={target.chute_id}"
+                f"Received response {response.status_code} from miner {target.miner_hotkey} instance_id={target.instance_id} of chute_id={target.chute_id}"
             )
 
         # Check if the instance restarted and is using encryption V2.
-        if response.status == status.HTTP_426_UPGRADE_REQUIRED:
+        if response.status_code == status.HTTP_426_UPGRADE_REQUIRED:
             raise KeyExchangeRequired(
                 f"Instance {target.instance_id} responded with 426, new key exchange required."
             )
 
         # Check if the instance is overwhelmed.
-        if response.status == status.HTTP_429_TOO_MANY_REQUESTS:
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
             raise InstanceRateLimit(
                 f"Instance {target.instance_id=} has returned a rate limit error!"
             )
 
         # Handle bad client requests.
-        if response.status == status.HTTP_400_BAD_REQUEST:
-            raise BadRequest("Invalid request: " + await response.text())
+        if response.status_code == status.HTTP_400_BAD_REQUEST:
+            if stream_response:
+                await stream_response.aread()
+            raise BadRequest("Invalid request: " + response.text)
 
-        if response.status == 451:
-            logger.info(f"BAD ENCRYPTION: {await response.text()} from {payload=}")
+        if response.status_code == 451:
+            if stream_response:
+                await stream_response.aread()
+            logger.info(f"BAD ENCRYPTION: {response.text} from {payload=}")
 
         response.raise_for_status()
 
@@ -752,7 +765,7 @@ async def _invoke_one(
             any_chunks = False
             chunk_idx = 0
             cllmv_verified = False
-            async for raw_chunk in response.content:
+            async for raw_chunk in stream_response.aiter_bytes():
                 chunk = await asyncio.to_thread(decrypt_instance_response, raw_chunk, target, iv)
 
                 # Track time to first token and (approximate) token count; approximate
@@ -974,7 +987,7 @@ async def _invoke_one(
         else:
             # Non-streamed responses - always encrypted.
             headers = response.headers
-            body_bytes = await response.read()
+            body_bytes = response.content
             data = {}
             response_data = json.loads(body_bytes)
             if "json" in response_data:
@@ -1202,20 +1215,9 @@ async def _invoke_one(
 
             yield data
     finally:
-        if response:
+        if stream_response:
             try:
-                async for _ in response.content:
-                    pass
-            except Exception:
-                pass
-            finally:
-                try:
-                    response.close()
-                except Exception:
-                    pass
-        if session:
-            try:
-                await session.close()
+                await stream_response.aclose()
             except Exception:
                 pass
 
@@ -1584,7 +1586,7 @@ async def invoke(
                 elif isinstance(exc, InvalidResponse):
                     error_message = "INVALID_RESPONSE"
                     instant_delete = True
-                elif isinstance(exc, aiohttp.ClientResponseError) and exc.status >= 500:
+                elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
                     error_message = f"HTTP_{exc.status}: {error_message}"
                     # Server returned an error - connection worked, server is broken
                     # skip_disable_loop = True
@@ -1718,24 +1720,17 @@ async def load_llm_details(chute, target):
     }
     payload, iv = await asyncio.to_thread(encrypt_instance_request, json.dumps(payload), target)
 
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(connect=5.0, total=60.0),
-        read_bufsize=8 * 1024 * 1024,
-        raise_for_status=True,
-    ) as session:
-        headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
-        headers["X-Chutes-Serialized"] = "true"
-        async with session.post(
-            f"http://{target.host}:{target.port}/{path}", data=payload_string, headers=headers
-        ) as resp:
-            raw_data = await resp.json()
-            logger.info(
-                f"{target.chute_id=} {target.instance_id=} {target.miner_hotkey=}: {raw_data=}"
-            )
-            info = json.loads(
-                await asyncio.to_thread(decrypt_instance_response, raw_data["json"], target, iv)
-            )
-            return info["data"][0]
+    session = await get_miner_session(target, timeout=60)
+    headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
+    headers["X-Chutes-Serialized"] = "true"
+    resp = await session.post(f"/{path}", content=payload_string, headers=headers)
+    resp.raise_for_status()
+    raw_data = resp.json()
+    logger.info(f"{target.chute_id=} {target.instance_id=} {target.miner_hotkey=}: {raw_data=}")
+    info = json.loads(
+        await asyncio.to_thread(decrypt_instance_response, raw_data["json"], target, iv)
+    )
+    return info["data"][0]
 
 
 async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float, float]:

@@ -243,8 +243,9 @@ async def delete_job(
             path, _ = encrypt_instance_request("/_shutdown", instance, hex_encode=True)
             async with miner_client.post(
                 instance.miner_hotkey,
-                f"http://{instance.host}:{instance.port}/{path}",
+                f"/{path}",
                 enc_payload,
+                instance=instance,
                 timeout=30.0,
             ) as resp:
                 resp.raise_for_status()

@@ -530,8 +530,9 @@ async def check_live_code(instance: Instance) -> bool:
     path, _ = encrypt_instance_request("/_slurp", instance, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         payload,
+        instance=instance,
         timeout=15.0,
     ) as resp:
         data = await resp.json()
@@ -560,8 +561,9 @@ async def check_live_code(instance: Instance) -> bool:
     path, _ = encrypt_instance_request("/_slurp", instance, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         payload,
+        instance=instance,
         timeout=12.0,
     ) as resp:
         data = await resp.json()

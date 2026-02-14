@@ -2,9 +2,9 @@
 Helper to send requests to miners.
 """
 
-import aiohttp
 import hashlib
 import time
+import httpx
 import orjson as json
 from contextlib import asynccontextmanager
 from typing import Any, Dict
@@ -68,40 +68,131 @@ def sign_request(miner_ss58: str, payload: Dict[str, Any] | str | None = None, p
     return headers, payload_string
 
 
+class _HttpxResponseWrapper:
+    """Wraps an httpx.Response to provide aiohttp-compatible attribute access.
+
+    This enables gradual migration — callers can use either style:
+      - response.status (aiohttp) or response.status_code (httpx)
+      - await response.text() or response.text (httpx)
+      - await response.json() or response.json() (httpx)
+    """
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+
+    @property
+    def status(self) -> int:
+        return self._response.status_code
+
+    @property
+    def status_code(self) -> int:
+        return self._response.status_code
+
+    @property
+    def headers(self):
+        return self._response.headers
+
+    @property
+    def content(self):
+        return self._response.content
+
+    async def text(self) -> str:
+        return self._response.text
+
+    async def json(self):
+        return self._response.json()
+
+    async def read(self) -> bytes:
+        return self._response.content
+
+    def raise_for_status(self):
+        self._response.raise_for_status()
+
+    def close(self):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+
 @asynccontextmanager
-async def post(miner_ss58: str, url: str, payload: Dict[str, Any], **kwargs):
+async def post(miner_ss58: str, url: str, payload: Dict[str, Any], instance=None, **kwargs):
     """
     Perform a post request to a miner.
     """
-    async with aiohttp.ClientSession() as session:
-        headers = kwargs.pop("headers", {})
-        new_headers, payload_data = sign_request(miner_ss58, payload=payload)
-        headers.update(new_headers)
-        async with session.post(url, data=payload_data, headers=headers, **kwargs) as response:
-            yield response
+    headers = kwargs.pop("headers", {})
+    new_headers, payload_data = sign_request(miner_ss58, payload=payload)
+    headers.update(new_headers)
+    timeout_val = kwargs.pop("timeout", 600)
+    kwargs.pop("params", None)  # httpx uses params kwarg natively
+
+    if instance:
+        from api.instance.connection import get_instance_client
+
+        client = await get_instance_client(
+            instance, timeout=int(timeout_val) if timeout_val else 600
+        )
+        response = await client.post(url, content=payload_data, headers=headers)
+        yield _HttpxResponseWrapper(response)
+    else:
+        timeout = httpx.Timeout(
+            connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, content=payload_data, headers=headers)
+            yield _HttpxResponseWrapper(response)
 
 
 @asynccontextmanager
-async def patch(miner_ss58: str, url: str, payload: Dict[str, Any], **kwargs):
+async def patch(miner_ss58: str, url: str, payload: Dict[str, Any], instance=None, **kwargs):
     """
     Perform a patch request to a miner.
     """
-    async with aiohttp.ClientSession() as session:
-        headers = kwargs.pop("headers", {})
-        new_headers, payload_data = sign_request(miner_ss58, payload=payload)
-        headers.update(new_headers)
-        async with session.patch(url, data=payload_data, headers=headers, **kwargs) as response:
-            yield response
+    headers = kwargs.pop("headers", {})
+    new_headers, payload_data = sign_request(miner_ss58, payload=payload)
+    headers.update(new_headers)
+    timeout_val = kwargs.pop("timeout", 600)
+
+    if instance:
+        from api.instance.connection import get_instance_client
+
+        client = await get_instance_client(
+            instance, timeout=int(timeout_val) if timeout_val else 600
+        )
+        response = await client.patch(url, content=payload_data, headers=headers)
+        yield _HttpxResponseWrapper(response)
+    else:
+        timeout = httpx.Timeout(
+            connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.patch(url, content=payload_data, headers=headers)
+            yield _HttpxResponseWrapper(response)
 
 
 @asynccontextmanager
-async def get(miner_ss58: str, url: str, purpose: str, **kwargs):
+async def get(miner_ss58: str, url: str, purpose: str, instance=None, **kwargs):
     """
     Perform a get request to a miner.
     """
-    async with aiohttp.ClientSession() as session:
-        headers = kwargs.pop("headers", {})
-        new_headers, payload_data = sign_request(miner_ss58, purpose=purpose)
-        headers.update(new_headers)
-        async with session.get(url, headers=headers, **kwargs) as response:
-            yield response
+    headers = kwargs.pop("headers", {})
+    new_headers, _ = sign_request(miner_ss58, purpose=purpose)
+    headers.update(new_headers)
+    timeout_val = kwargs.pop("timeout", 600)
+    params = kwargs.pop("params", None)
+
+    if instance:
+        from api.instance.connection import get_instance_client
+
+        client = await get_instance_client(
+            instance, timeout=int(timeout_val) if timeout_val else 600
+        )
+        response = await client.get(url, headers=headers, params=params)
+        yield _HttpxResponseWrapper(response)
+    else:
+        timeout = httpx.Timeout(
+            connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url, headers=headers, params=params)
+            yield _HttpxResponseWrapper(response)
