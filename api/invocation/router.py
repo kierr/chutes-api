@@ -555,7 +555,16 @@ async def _invoke(
         # Load prompt prefixes so we can do more intelligent routing.
         prefix_hashes = get_prompt_prefix_hashes(request_body)
 
-    if chute.standard_template in ("vllm", "tei") or selected_cord.get("passthrough", False):
+    is_passthrough = chute.standard_template in ("vllm", "tei") or selected_cord.get(
+        "passthrough", False
+    )
+    if is_passthrough:
+        raw_payload = {"json": request_body, "params": request_params}
+    else:
+        raw_payload = request_body
+
+    # Keep pickle for < 0.5.5 backwards compat
+    if is_passthrough:
         request_body = {"json": request_body, "params": request_params}
         args = base64.b64encode(gzip.compress(pickle.dumps(tuple()))).decode()
         kwargs = base64.b64encode(gzip.compress(pickle.dumps(request_body))).decode()
@@ -621,6 +630,7 @@ async def _invoke(
                     metrics=metrics,
                     request=request,
                     prefixes=prefix_hashes,
+                    raw_payload=raw_payload,
                 ):
                     if include_trace:
                         if not first_chunk_processed:
@@ -741,6 +751,7 @@ async def _invoke(
         metrics=metrics,
         request=request,
         prefixes=prefix_hashes,
+        raw_payload=raw_payload,
     ):
         if response:
             continue

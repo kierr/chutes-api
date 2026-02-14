@@ -672,6 +672,7 @@ async def _invoke_one(
     metrics: dict = {},
     prefixes: list = None,
     manager: LeastConnManager = None,
+    raw_payload: dict = None,
 ):
     """
     Try invoking a chute/cord with a single instance.
@@ -679,7 +680,6 @@ async def _invoke_one(
     # Call the miner's endpoint.
     path = path.lstrip("/")
     response = None
-    payload = {"args": args, "kwargs": kwargs}
 
     # Set the 'p' private flag on invocations.
     private_billing = (
@@ -690,7 +690,18 @@ async def _invoke_one(
 
     plain_path = path.lstrip("/").rstrip("/")
     path = "/" + path.lstrip("/")
-    payload, iv = await asyncio.to_thread(encrypt_instance_request, json.dumps(payload), target)
+
+    # Version-gate payload format: >= 0.5.5 uses plain JSON + gzip, < 0.5.5 uses pickle.
+    if raw_payload is not None and semcomp(target.chutes_version or "0.0.0", "0.5.5") >= 0:
+        # >= 0.5.5: plain JSON + gzip, no pickle
+        payload_bytes = gzip.compress(json.dumps(raw_payload).encode())
+        use_serialized = False
+    else:
+        # < 0.5.5: pickle-wrapped args/kwargs, no gzip
+        payload_bytes = json.dumps({"args": args, "kwargs": kwargs})
+        use_serialized = True
+
+    payload, iv = await asyncio.to_thread(encrypt_instance_request, payload_bytes, target)
     encrypted_path, _ = await asyncio.to_thread(
         encrypt_instance_request, path.ljust(24, "?"), target, True
     )
@@ -713,7 +724,8 @@ async def _invoke_one(
     try:
         session = await get_miner_session(target, timeout=timeout)
         headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
-        headers["X-Chutes-Serialized"] = "true"
+        if use_serialized:
+            headers["X-Chutes-Serialized"] = "true"
 
         if stream:
             # Use streaming request for streaming responses.
@@ -767,6 +779,8 @@ async def _invoke_one(
             cllmv_verified = False
             async for raw_chunk in stream_response.aiter_bytes():
                 chunk = await asyncio.to_thread(decrypt_instance_response, raw_chunk, target, iv)
+                if not use_serialized:
+                    chunk = gzip.decompress(chunk)
 
                 # Track time to first token and (approximate) token count; approximate
                 # here because in speculative decoding multiple tokens may be returned.
@@ -994,6 +1008,8 @@ async def _invoke_one(
                 plaintext = await asyncio.to_thread(
                     decrypt_instance_response, response_data["json"], target, iv
                 )
+                if not use_serialized:
+                    plaintext = gzip.decompress(plaintext)
                 if chute.standard_template == "vllm" and plaintext.startswith(
                     b'{"object":"error","message":"input_ids cannot be empty."'
                 ):
@@ -1013,6 +1029,8 @@ async def _invoke_one(
                 plaintext = await asyncio.to_thread(
                     decrypt_instance_response, response_data["body"], target, iv
                 )
+                if not use_serialized:
+                    plaintext = gzip.decompress(plaintext)
                 headers = response_data["headers"]
                 data = {
                     "content_type": response_data.get(
@@ -1246,6 +1264,7 @@ async def invoke(
     metrics: dict = {},
     request: Request = None,
     prefixes: list = None,
+    raw_payload: dict = None,
 ):
     """
     Helper to actual perform function invocations, retrying when a target fails.
@@ -1329,6 +1348,7 @@ async def invoke(
                     metrics,
                     prefixes,
                     manager,
+                    raw_payload,
                 ):
                     try:
                         if "input_ids cannot be empty" in str(data):

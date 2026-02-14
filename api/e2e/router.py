@@ -239,7 +239,6 @@ async def e2e_invoke(
         headers, payload_string = sign_request(
             miner_ss58=instance.miner_hotkey, payload=encrypted_payload
         )
-        headers["X-Chutes-Serialized"] = "true"
         headers["X-E2E-Encrypted"] = "true"
         if is_stream:
             headers["X-E2E-Stream"] = "true"
