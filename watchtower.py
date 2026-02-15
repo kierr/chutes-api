@@ -1589,9 +1589,12 @@ async def check_runint(instance: Instance) -> bool:
                     )
                     return False
 
-            # Check epoch is advancing (detect replay attacks)
+            # Check epoch is advancing (detect replay attacks and ticker-stall)
             epoch_key = f"rint_epoch:{instance.instance_id}"
+            epoch_ts_key = f"rint_epoch_ts:{instance.instance_id}"
             last_epoch = await settings.redis_client.get(epoch_key)
+            last_ts = await settings.redis_client.get(epoch_ts_key)
+            now = time.time()
             if last_epoch is not None:
                 last_epoch = int(last_epoch)
                 if epoch < last_epoch:
@@ -1600,7 +1603,30 @@ async def check_runint(instance: Instance) -> bool:
                         f"epoch went backwards: {epoch} < {last_epoch}"
                     )
                     return False
+                if epoch == last_epoch:
+                    logger.error(
+                        f"RUNINT: {instance.instance_id=} {instance.miner_hotkey=} "
+                        f"epoch stalled (ticker frozen?): {epoch} == {last_epoch}"
+                    )
+                    return False
+                # Ticker runs at 10 Hz, so epoch should advance ~10 per second.
+                # Check that it advanced at least 10% of expected to catch
+                # severe stalls while being very generous with tolerance.
+                if last_ts is not None:
+                    elapsed = now - float(last_ts)
+                    if elapsed > 30.0:
+                        expected_advance = elapsed * 10  # _BUF_EPOCH_RATE = 10
+                        actual_advance = epoch - last_epoch
+                        rate = actual_advance / expected_advance if expected_advance > 0 else 1.0
+                        if rate < 0.10:
+                            logger.error(
+                                f"RUNINT: {instance.instance_id=} {instance.miner_hotkey=} "
+                                f"epoch advancing too slowly: {actual_advance} in {elapsed:.0f}s "
+                                f"(expected ~{expected_advance:.0f}, rate={rate:.2%})"
+                            )
+                            return False
             await settings.redis_client.set(epoch_key, str(epoch), ex=86400)
+            await settings.redis_client.set(epoch_ts_key, str(now), ex=86400)
 
             logger.success(
                 f"RUNINT: {instance.instance_id=} {instance.miner_hotkey=} "
