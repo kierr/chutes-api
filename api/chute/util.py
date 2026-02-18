@@ -234,9 +234,13 @@ async def safe_store_invocation(*args, **kwargs):
         logger.error(f"SAFE_STORE_INVOCATION: failed to insert new invocation record: {str(exc)}")
 
 
-async def get_miner_session(instance: Instance, timeout: int = 600):
+async def get_miner_session(
+    instance: Instance, timeout: int = 600
+) -> tuple[httpx.AsyncClient, bool]:
     """
     Get or create an httpx client for an instance (with TLS if available).
+
+    Returns (client, pooled) — caller must close the client when done if not pooled.
     """
     from api.instance.connection import get_instance_client
 
@@ -722,8 +726,9 @@ async def _invoke_one(
         timeout = 600
     elif semcomp(target.chutes_version or "0.0.0", "0.4.2") < 0:
         timeout = 900
+    pooled = True
     try:
-        session = await get_miner_session(target, timeout=timeout)
+        session, pooled = await get_miner_session(target, timeout=timeout)
         headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
         if use_serialized:
             headers["X-Chutes-Serialized"] = "true"
@@ -1267,6 +1272,11 @@ async def _invoke_one(
                 await stream_response.aclose()
             except Exception:
                 pass
+        if not pooled:
+            try:
+                await session.aclose()
+            except Exception:
+                pass
 
 
 async def _s3_upload(data: io.BytesIO, path: str):
@@ -1770,17 +1780,24 @@ async def load_llm_details(chute, target):
     }
     payload, iv = await asyncio.to_thread(encrypt_instance_request, json.dumps(payload), target)
 
-    session = await get_miner_session(target, timeout=60)
-    headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
-    headers["X-Chutes-Serialized"] = "true"
-    resp = await session.post(f"/{path}", content=payload_string, headers=headers)
-    resp.raise_for_status()
-    raw_data = resp.json()
-    logger.info(f"{target.chute_id=} {target.instance_id=} {target.miner_hotkey=}: {raw_data=}")
-    info = json.loads(
-        await asyncio.to_thread(decrypt_instance_response, raw_data["json"], target, iv)
-    )
-    return info["data"][0]
+    session, pooled = await get_miner_session(target, timeout=60)
+    try:
+        headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
+        headers["X-Chutes-Serialized"] = "true"
+        resp = await session.post(f"/{path}", content=payload_string, headers=headers)
+        resp.raise_for_status()
+        raw_data = resp.json()
+        logger.info(f"{target.chute_id=} {target.instance_id=} {target.miner_hotkey=}: {raw_data=}")
+        info = json.loads(
+            await asyncio.to_thread(decrypt_instance_response, raw_data["json"], target, iv)
+        )
+        return info["data"][0]
+    finally:
+        if not pooled:
+            try:
+                await session.aclose()
+            except Exception:
+                pass
 
 
 async def get_mtoken_price(user_id: str, chute_id: str) -> tuple[float, float, float]:

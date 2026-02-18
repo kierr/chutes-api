@@ -7,6 +7,7 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from api.util import semcomp
 
 
 # Cache SSL contexts and cert CNs per instance_id.
@@ -14,6 +15,11 @@ _ssl_cache: dict[str, tuple[ssl.SSLContext, str]] = {}
 
 # Pooled httpx clients per instance (reuse TCP+TLS connections).
 _client_cache: dict[str, httpx.AsyncClient] = {}
+
+
+def _should_pool(instance) -> bool:
+    """Only pool/cache when the instance has TLS (cacert) AND chutes_version >= 0.5.5."""
+    return bool(instance.cacert) and semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0
 
 
 def _get_ssl_and_cn(instance) -> tuple[ssl.SSLContext, str]:
@@ -123,13 +129,19 @@ class _InstanceNetworkBackend(httpcore.AsyncNetworkBackend):
         await self._backend.sleep(seconds)
 
 
-async def get_instance_client(instance, timeout: int = 600) -> httpx.AsyncClient:
-    """Get or create a pooled httpx AsyncClient for an instance (HTTP/2 if TLS)."""
+async def get_instance_client(instance, timeout: int = 600) -> tuple[httpx.AsyncClient, bool]:
+    """Get or create an httpx AsyncClient for an instance.
+
+    Returns (client, pooled) — caller must close the client when done if not pooled.
+    Only HTTPS instances with chutes_version >= 0.5.5 are pooled (HTTP/2 multiplexing).
+    """
+    pooled = _should_pool(instance)
     iid = str(instance.instance_id)
-    if iid in _client_cache:
+
+    if pooled and iid in _client_cache:
         client = _client_cache[iid]
         if not client.is_closed:
-            return client
+            return client, True
 
     if instance.cacert:
         ssl_ctx, cn = _get_ssl_and_cn(instance)
@@ -153,5 +165,8 @@ async def get_instance_client(instance, timeout: int = 600) -> httpx.AsyncClient
                 connect=10.0, read=float(timeout) if timeout else None, write=30.0, pool=10.0
             ),
         )
-    _client_cache[iid] = client
-    return client
+
+    if pooled:
+        _client_cache[iid] = client
+
+    return client, pooled

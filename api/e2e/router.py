@@ -232,10 +232,11 @@ async def e2e_invoke(
     started_at = time.time()
 
     session = None
+    pooled = True
     response = None
     try:
         # Send to instance.
-        session = await get_miner_session(instance, timeout=1800)
+        session, pooled = await get_miner_session(instance, timeout=1800)
         headers, payload_string = sign_request(
             miner_ss58=instance.miner_hotkey, payload=encrypted_payload
         )
@@ -304,6 +305,7 @@ async def e2e_invoke(
                     manager,
                     conn_id,
                     request,
+                    pooled,
                 ),
                 media_type="text/event-stream",
             )
@@ -344,7 +346,7 @@ async def e2e_invoke(
     finally:
         if not is_stream:
             # For streaming, cleanup happens in the generator.
-            await _cleanup(session, response, manager, chute_id, instance_id, conn_id)
+            await _cleanup(session, response, manager, chute_id, instance_id, conn_id, pooled)
 
 
 async def _stream_e2e_response(
@@ -360,6 +362,7 @@ async def _stream_e2e_response(
     manager,
     conn_id,
     request,
+    pooled,
 ):
     """
     Stream E2E response chunks, extracting usage events for billing.
@@ -438,7 +441,9 @@ async def _stream_e2e_response(
         logger.error(f"E2E stream error: {exc}\n{traceback.format_exc()}")
         raise
     finally:
-        await _cleanup(session, response, manager, chute.chute_id, instance.instance_id, conn_id)
+        await _cleanup(
+            session, response, manager, chute.chute_id, instance.instance_id, conn_id, pooled
+        )
 
 
 async def _do_billing(
@@ -536,7 +541,7 @@ async def _do_billing(
         asyncio.create_task(update_shutdown_timestamp(instance.instance_id))
 
 
-async def _cleanup(session, response, manager, chute_id, instance_id, conn_id):
+async def _cleanup(session, response, manager, chute_id, instance_id, conn_id, pooled=True):
     """
     Clean up httpx response and connection tracking.
     """
@@ -545,7 +550,11 @@ async def _cleanup(session, response, manager, chute_id, instance_id, conn_id):
             await response.aclose()
         except Exception:
             pass
-    # Don't close session — it's a pooled httpx client.
+    if not pooled and session:
+        try:
+            await session.aclose()
+        except Exception:
+            pass
     if manager:
         try:
             key = f"conn:{chute_id}:{instance_id}"

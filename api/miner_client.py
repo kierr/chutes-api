@@ -129,11 +129,18 @@ async def post(miner_ss58: str, url: str, payload: Dict[str, Any], instance=None
     if instance:
         from api.instance.connection import get_instance_client
 
-        client = await get_instance_client(
+        client, pooled = await get_instance_client(
             instance, timeout=int(timeout_val) if timeout_val else 600
         )
-        response = await client.post(url, content=payload_data, headers=headers)
-        yield _HttpxResponseWrapper(response)
+        try:
+            response = await client.post(url, content=payload_data, headers=headers)
+            yield _HttpxResponseWrapper(response)
+        finally:
+            if not pooled:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
     else:
         timeout = httpx.Timeout(
             connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
@@ -156,11 +163,18 @@ async def patch(miner_ss58: str, url: str, payload: Dict[str, Any], instance=Non
     if instance:
         from api.instance.connection import get_instance_client
 
-        client = await get_instance_client(
+        client, pooled = await get_instance_client(
             instance, timeout=int(timeout_val) if timeout_val else 600
         )
-        response = await client.patch(url, content=payload_data, headers=headers)
-        yield _HttpxResponseWrapper(response)
+        try:
+            response = await client.patch(url, content=payload_data, headers=headers)
+            yield _HttpxResponseWrapper(response)
+        finally:
+            if not pooled:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
     else:
         timeout = httpx.Timeout(
             connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
@@ -184,11 +198,18 @@ async def get(miner_ss58: str, url: str, purpose: str, instance=None, **kwargs):
     if instance:
         from api.instance.connection import get_instance_client
 
-        client = await get_instance_client(
+        client, pooled = await get_instance_client(
             instance, timeout=int(timeout_val) if timeout_val else 600
         )
-        response = await client.get(url, headers=headers, params=params)
-        yield _HttpxResponseWrapper(response)
+        try:
+            response = await client.get(url, headers=headers, params=params)
+            yield _HttpxResponseWrapper(response)
+        finally:
+            if not pooled:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
     else:
         timeout = httpx.Timeout(
             connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
