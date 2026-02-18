@@ -1570,46 +1570,77 @@ async def deploy_chute(
                 f"{current_user.hotkey=} with external egress allowed!"
             )
 
+        # Skip full config/size check for 8-GPU deployments on high-end GPUs
+        # (h200, b200, b300) — just verify it's a real HF repo.
+        _high_end_gpus = {"h200", "b200", "b300"}
+        _include = set(chute_args.node_selector.include or [])
+        skip_size_check = (
+            chute_args.node_selector.gpu_count == 8 and _include and _include <= _high_end_gpus
+        )
+
         # Sanity check the model's node selector (and HF config generally).
         async with aiohttp.ClientSession() as hsession:
-            try:
-                guessed_config = await guesser.analyze_model(chute_args.name, hsession)
-            except HTTPException as e:
-                raise e
-            except Exception as e:
-                logger.error(
-                    f"Affine user tried to deploy invalid model: {chute_args.name=} {current_user.username=}"
+            if skip_size_check:
+                # Only verify the HF repo exists (config.json is accessible).
+                config_url = f"https://huggingface.co/{chute_args.name}/raw/main/config.json"
+                try:
+                    async with hsession.get(config_url) as resp:
+                        if resp.status != 200:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Could not fetch config.json for {chute_args.name} — is this a valid HF model repo?",
+                            )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Unable to verify HF repo for {chute_args.name}: {str(e)}",
+                    )
+                logger.info(
+                    f"Skipping size check for 8×high-end GPU deployment: {chute_args.name=} "
+                    f"include={_include} {current_user.username=}"
                 )
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Unable to properly evaluate requested model {chute_args.name}: {str(e)}",
-                )
+            else:
+                try:
+                    guessed_config = await guesser.analyze_model(chute_args.name, hsession)
+                except HTTPException as e:
+                    raise e
+                except Exception as e:
+                    logger.error(
+                        f"Affine user tried to deploy invalid model: {chute_args.name=} {current_user.username=}"
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Unable to properly evaluate requested model {chute_args.name}: {str(e)}",
+                    )
 
         # Prevent mi300x for now.
         chute_args.node_selector.exclude = list(
             set(chute_args.node_selector.exclude or [] + ["mi300x"])
         )
 
-        # Check that our best guess for model config matches the node selector.
-        min_vram_required = guessed_config.required_gpus * guessed_config.min_vram_per_gpu
-        node_selector_min_vram = chute_args.node_selector.gpu_count * min(
-            [
-                SUPPORTED_GPUS[gpu]["memory"]
-                for gpu in SUPPORTED_GPUS
-                if gpu in chute_args.node_selector.supported_gpus
-            ]
-        )
-        if min_vram_required < 8 * 140 and node_selector_min_vram < min_vram_required:
-            logger.error(
-                f"Affine user tried to deploy bad node_selector: {min_vram_required=} {node_selector_min_vram} {chute_args.name=} {current_user.username=}"
+        if not skip_size_check:
+            # Check that our best guess for model config matches the node selector.
+            min_vram_required = guessed_config.required_gpus * guessed_config.min_vram_per_gpu
+            node_selector_min_vram = chute_args.node_selector.gpu_count * min(
+                [
+                    SUPPORTED_GPUS[gpu]["memory"]
+                    for gpu in SUPPORTED_GPUS
+                    if gpu in chute_args.node_selector.supported_gpus
+                ]
             )
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "node_selector specs are insufficient to support the model: "
-                    f"{min_vram_required=} {node_selector_min_vram=}, please fix and try again."
-                ),
-            )
+            if min_vram_required < 8 * 140 and node_selector_min_vram < min_vram_required:
+                logger.error(
+                    f"Affine user tried to deploy bad node_selector: {min_vram_required=} {node_selector_min_vram} {chute_args.name=} {current_user.username=}"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "node_selector specs are insufficient to support the model: "
+                        f"{min_vram_required=} {node_selector_min_vram=}, please fix and try again."
+                    ),
+                )
 
         logger.success(
             f"Affine deployment initiated: {chute_args.name=} from {current_user.hotkey=}, "
@@ -1617,10 +1648,10 @@ async def deploy_chute(
         )
 
     # Affine chutes cannot be created with tee=True directly - must use /teeify endpoint
-    if "affine" in chute_args.name.lower() and chute_args.tee:
+    if chute_args.tee and not current_user.has_role(Permissioning.unlimited_dev):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Affine chutes cannot be created with tee=True. Deploy without TEE first, then use the /teeify endpoint to promote to TEE.",
+            detail="TEE private deployments are limited at this time due to infrastructure capacity limitations.",
         )
 
     # No-DoS-Plz.

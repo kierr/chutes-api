@@ -826,7 +826,7 @@ async def hostname_invocation(
         and request.url.path == "/v1/models"
         and request.method.lower() == "get"
     ):
-        return await get_llms()
+        return await get_llms(request=request)
 
     # The /v1/models endpoint can be checked with no auth, but otherwise we need users.
     if not current_user:
@@ -839,10 +839,10 @@ async def hostname_invocation(
     if request.state.chute_id in ("__megallm__", "__megadiffuser__", "__megaembed__"):
         try:
             payload = await request.json()
-        except Exception:
+        except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid request JSON: {str(exc)}",
+                detail=f"Invalid request JSON: {str(exc)}",
             )
 
         # MistralAI gated this model for some reason.......
@@ -913,6 +913,8 @@ async def hostname_invocation(
             payload["model"] = "OpenGVLab/InternVL3-78B-TEE"
         elif model == "mistralai/Devstral-2-123B-Instruct-2512":
             payload["model"] = "mistralai/Devstral-2-123B-Instruct-2512-TEE"
+        elif model == "Qwen/Qwen3-Coder-Next":
+            payload["model"] = "Qwen/Qwen3-Coder-Next-TEE"
 
         # No file support currently.
         if isinstance(payload.get("messages"), list):

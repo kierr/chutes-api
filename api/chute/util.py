@@ -777,6 +777,11 @@ async def _invoke_one(
 
         response.raise_for_status()
 
+        # Stash instance-reported utilization for prometheus gauges.
+        if manager:
+            manager._last_instance_utilization = response.headers.get("X-Chutes-Conn-Utilization")
+            manager._last_conn_used = response.headers.get("X-Chutes-Conn-Used")
+
         # All good, send back the response.
         if stream:
             last_chunk = None
@@ -1091,11 +1096,11 @@ async def _invoke_one(
                     # Make sure model name response is valid/matches chute name.
                     if "model" not in json_data or json_data.get("model") != chute.name:
                         logger.warning(
-                            f"NOSTREAM_BADMODEL: {chute.name=} {chute.chute_id=} response had invalid/missing model: {target.instance_id=}: json_data['model']={json_data.get('model')}"
+                            f"NOSTREAM_BADMODEL: {chute.name=} {chute.chute_id=} response had invalid/missing model: {target.instance_id=}: {json_data=}"
                         )
-                        # raise EmptyLLMResponse(
-                        #    f"BAD_RESPONSE {target.instance_id=} {chute.name} returned invalid chunk (model name)"
-                        # )
+                        raise EmptyLLMResponse(
+                            f"BAD_RESPONSE {target.instance_id=} {chute.name} returned invalid chunk (model name)"
+                        )
 
                     # New verification hash.
                     if (
@@ -1411,6 +1416,18 @@ async def invoke(
 
                 # Update capacity tracking.
                 track_request_completed(chute.chute_id)
+                try:
+                    instance_util = getattr(manager, "_last_instance_utilization", None)
+                    if instance_util is not None:
+                        instance_util = float(instance_util)
+                    await track_capacity(
+                        chute.chute_id,
+                        manager.mean_count or 0,
+                        chute.concurrency or 1,
+                        instance_utilization=instance_util,
+                    )
+                except Exception:
+                    pass
 
                 # Calculate the credits used and deduct from user's balance asynchronously.
                 # For LLMs and Diffusion chutes, we use custom per token/image step pricing,
@@ -1987,33 +2004,42 @@ async def refresh_all_llm_details():
     return successful
 
 
-async def get_llms(refresh: bool = False):
+async def get_llms(refresh: bool = False, request=None):
     """
     Get the combined /v1/models return value for chutes that are public and belong to chutes user.
     """
+    openrouter = False
+    if request is not None:
+        or_param = request.query_params.get("or")
+        if or_param is not None:
+            openrouter = or_param.lower() in ("true", "1", "yes")
+    cache_key = f"all_llms_{openrouter}"
     if not refresh:
-        cached = await settings.redis_client.get("all_llms")
+        cached = await settings.redis_client.get(cache_key)
         if cached:
             return json.loads(cached)
     else:
         await refresh_all_llm_details()
 
     async with get_session() as session:
+        filters = [
+            Chute.standard_template == "vllm",
+            Chute.public.is_(True),
+            Chute.user_id == await chutes_user_id(),
+            LLMDetail.details.is_not(None),
+        ]
+        if openrouter:
+            filters.append(Chute.openrouter.is_(True))
+
         result = await session.execute(
             select(LLMDetail.details)
             .join(Chute, LLMDetail.chute_id == Chute.chute_id)
-            .where(
-                Chute.standard_template == "vllm",
-                Chute.public.is_(True),
-                Chute.user_id == await chutes_user_id(),
-                Chute.chute_id != "561e4875-254d-588f-a36f-57c9cdef8961",
-                LLMDetail.details.is_not(None),
-            )
+            .where(*filters)
             .order_by(Chute.invocation_count.desc())
         )
         model_details = [row[0] for row in result if row[0]]
         return_value = {"object": "list", "data": model_details}
-        await settings.redis_client.set("all_llms", json.dumps(return_value), ex=300)
+        await settings.redis_client.set(cache_key, json.dumps(return_value), ex=300)
         return return_value
 
 

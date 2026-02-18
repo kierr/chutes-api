@@ -39,6 +39,8 @@ class ConfigGuesser:
             "default": 1.4,
         }
 
+        self.vram_overhead_moe = 1.2
+
         self.quant_multipliers = {
             "4bit": 0.25,
             "8bit": 0.5,
@@ -46,12 +48,28 @@ class ConfigGuesser:
             "none": 1.0,
         }
 
+    @staticmethod
+    def _cfg(config: Dict, key: str, default=0):
+        """Resolve a config value, falling back to text_config if needed."""
+        val = config.get(key)
+        if val is None and "text_config" in config:
+            val = config["text_config"].get(key)
+        return val if val is not None else default
+
+    def _is_moe(self, config: Dict) -> bool:
+        """Check whether the model is a Mixture-of-Experts architecture."""
+        return (
+            self._cfg(config, "n_routed_experts") > 0
+            or self._cfg(config, "num_experts") > 0
+            or self._cfg(config, "num_local_experts") > 0
+        )
+
     def _get_min_gpu_config(self, total_vram: float, config: Dict) -> tuple[int, int]:
         """
         Calculate minimum number of GPUs needed and VRAM per GPU.
         """
-        num_attention_heads = config.get("num_attention_heads", 0)
-        hidden_size = config.get("hidden_size", 0)
+        num_attention_heads = self._cfg(config, "num_attention_heads")
+        hidden_size = self._cfg(config, "hidden_size")
 
         best_gpu_count = float("inf")
         best_vram_size = float("inf")
@@ -131,15 +149,17 @@ class ConfigGuesser:
         """
         Estimate model size for MoE models like DeepSeek V3.
         """
-        hidden_size = config.get("hidden_size", 0)
-        num_layers = config.get("num_hidden_layers", 0)
-        vocab_size = config.get("vocab_size", 0)
+        hidden_size = self._cfg(config, "hidden_size")
+        num_layers = self._cfg(config, "num_hidden_layers")
+        vocab_size = self._cfg(config, "vocab_size")
 
-        # Check if it's an MoE model
-        n_routed_experts = config.get("n_routed_experts", 0)
-        n_shared_experts = config.get("n_shared_experts", 0)
-        moe_intermediate_size = config.get("moe_intermediate_size", 0)
-        intermediate_size = config.get("intermediate_size", 0)
+        # Check if it's an MoE model — try multiple naming conventions.
+        n_routed_experts = self._cfg(config, "n_routed_experts") or self._cfg(config, "num_experts")
+        n_shared_experts = self._cfg(config, "n_shared_experts")
+        moe_intermediate_size = self._cfg(config, "moe_intermediate_size")
+        intermediate_size = self._cfg(config, "intermediate_size") or self._cfg(
+            config, "shared_expert_intermediate_size"
+        )
 
         if n_routed_experts > 0:
             # MoE model size calculation
@@ -230,17 +250,23 @@ class ConfigGuesser:
         total_size_gb = math.ceil(total_size / (1024**3))
         model_type = self._detect_model_type(config)
         quantization = self._detect_quantization(config)
+        moe = self._is_moe(config)
 
-        # Calculate base VRAM requirement
-        overhead_multiplier = self.vram_overhead.get(model_type, self.vram_overhead["default"])
+        # Calculate base VRAM requirement — MoE models need less overhead
+        # relative to weight size since most expert params are dormant.
+        if moe:
+            overhead_multiplier = self.vram_overhead_moe
+        else:
+            overhead_multiplier = self.vram_overhead.get(model_type, self.vram_overhead["default"])
         base_vram = total_size_gb * overhead_multiplier
 
         # Apply quantization reduction if present
         if quantization and quantization != "none":
             base_vram *= self.quant_multipliers.get(quantization, 1.0)
 
-        # For very large models, ensure we have some buffer
-        if base_vram > 800:
+        # For very large dense models, ensure we have some buffer
+        # (skip for MoE — overhead is already appropriate).
+        if base_vram > 800 and not moe:
             base_vram *= 1.1
 
         try:
@@ -254,10 +280,10 @@ class ConfigGuesser:
             min_vram_per_gpu=vram_per_gpu,
             model_type=model_type,
             quantization=quantization,
-            num_attention_heads=config.get("num_attention_heads", 0),
-            num_key_value_heads=config.get("num_key_value_heads"),
-            hidden_size=config.get("hidden_size", 0),
-            num_layers=config.get("num_hidden_layers", 0),
+            num_attention_heads=self._cfg(config, "num_attention_heads"),
+            num_key_value_heads=self._cfg(config, "num_key_value_heads") or None,
+            hidden_size=self._cfg(config, "hidden_size"),
+            num_layers=self._cfg(config, "num_hidden_layers"),
         )
 
 
