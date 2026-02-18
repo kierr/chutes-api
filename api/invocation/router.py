@@ -991,6 +991,7 @@ async def hostname_invocation(
 
         model = payload.get("model")
         chute = None
+        fallback_chutes = []
         template = (
             "vllm"
             if "llm" in request.state.chute_id
@@ -999,35 +1000,65 @@ async def hostname_invocation(
             else "diffusion"
         )
         if model:
-            if (chute := await get_one(model)) is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"model not found: {model}",
-                )
-            if chute.standard_template != template or (
-                not chute.public
-                and (
-                    chute.user_id != current_user.user_id
-                    and not await is_shared(chute.chute_id, current_user.user_id)
-                )
-                and not subnet_role_accessible(chute, current_user)
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"model not found: {model}",
-                )
-            request.state.chute_id = chute.chute_id
-            request.state.auth_object_id = chute.chute_id
+            from api.model_routing import resolve_model_parameter
 
-    # # Model disabled temporarily?
-    # if (
-    #     await settings.redis_client.get(f"model_disabled:{request.state.chute_id}")
-    #     and current_user.user_id != "dff3e6bb-3a6b-5a2b-9c48-da3abcd5ca5f"
-    # ):
-    #     logger.warning(f"MODEL DISABLED: {request.state.chute_id}")
-    #     raise HTTPException(
-    #         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-    #         detail="model is under maintenance",
-    #     )
+            ranked_chutes, routing_mode = await resolve_model_parameter(
+                model, current_user.user_id, template
+            )
+            if not ranked_chutes:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"model not found: {model}",
+                )
+            chute = ranked_chutes[0]
+            fallback_chutes = ranked_chutes[1:]
+            if fallback_chutes or routing_mode:
+                payload["model"] = chute.name
+
+            if chute is not None:
+                if chute.standard_template != template or (
+                    not chute.public
+                    and (
+                        chute.user_id != current_user.user_id
+                        and not await is_shared(chute.chute_id, current_user.user_id)
+                    )
+                    and not subnet_role_accessible(chute, current_user)
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"model not found: {model}",
+                    )
+                request.state.chute_id = chute.chute_id
+                request.state.auth_object_id = chute.chute_id
+
+    # Try invocation with cross-chute failover for multi-model routing.
+    if fallback_chutes:
+        try:
+            return await _invoke(request, current_user)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
+                raise
+            # Try each fallback chute on infra_overload.
+            for fallback in fallback_chutes:
+                if fallback.standard_template != template or (
+                    not fallback.public
+                    and (
+                        fallback.user_id != current_user.user_id
+                        and not await is_shared(fallback.chute_id, current_user.user_id)
+                    )
+                    and not subnet_role_accessible(fallback, current_user)
+                ):
+                    continue
+                request.state.chute_id = fallback.chute_id
+                request.state.auth_object_id = fallback.chute_id
+                payload["model"] = fallback.name
+                try:
+                    return await _invoke(request, current_user)
+                except HTTPException as inner_exc:
+                    if inner_exc.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
+                        raise
+                    continue
+            # All chutes exhausted.
+            raise
 
     return await _invoke(request, current_user)
