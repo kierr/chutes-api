@@ -48,8 +48,8 @@ async def check_instance_logging_server(instance: Instance) -> bool:
                 timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
             )
 
-        headers, _ = miner_client.sign_request(instance.miner_hotkey, purpose="chutes")
         try:
+            headers, _ = miner_client.sign_request(instance.miner_hotkey, purpose="chutes")
             resp = await client.get("/logs", headers=headers)
             resp.raise_for_status()
             json_data = resp.json()

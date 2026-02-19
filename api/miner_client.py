@@ -126,6 +126,11 @@ async def post(miner_ss58: str, url: str, payload: Dict[str, Any], instance=None
     timeout_val = kwargs.pop("timeout", 600)
     kwargs.pop("params", None)  # httpx uses params kwarg natively
 
+    # Build per-request timeout for overriding pooled client defaults.
+    req_timeout = httpx.Timeout(
+        connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
+    )
+
     if instance:
         from api.instance.connection import get_instance_client
 
@@ -133,7 +138,9 @@ async def post(miner_ss58: str, url: str, payload: Dict[str, Any], instance=None
             instance, timeout=int(timeout_val) if timeout_val else 600
         )
         try:
-            response = await client.post(url, content=payload_data, headers=headers)
+            response = await client.post(
+                url, content=payload_data, headers=headers, timeout=req_timeout
+            )
             yield _HttpxResponseWrapper(response)
         finally:
             if not pooled:
@@ -142,10 +149,7 @@ async def post(miner_ss58: str, url: str, payload: Dict[str, Any], instance=None
                 except Exception:
                     pass
     else:
-        timeout = httpx.Timeout(
-            connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
-        )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=req_timeout) as client:
             response = await client.post(url, content=payload_data, headers=headers)
             yield _HttpxResponseWrapper(response)
 
@@ -160,6 +164,10 @@ async def patch(miner_ss58: str, url: str, payload: Dict[str, Any], instance=Non
     headers.update(new_headers)
     timeout_val = kwargs.pop("timeout", 600)
 
+    req_timeout = httpx.Timeout(
+        connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
+    )
+
     if instance:
         from api.instance.connection import get_instance_client
 
@@ -167,7 +175,9 @@ async def patch(miner_ss58: str, url: str, payload: Dict[str, Any], instance=Non
             instance, timeout=int(timeout_val) if timeout_val else 600
         )
         try:
-            response = await client.patch(url, content=payload_data, headers=headers)
+            response = await client.patch(
+                url, content=payload_data, headers=headers, timeout=req_timeout
+            )
             yield _HttpxResponseWrapper(response)
         finally:
             if not pooled:
@@ -176,10 +186,7 @@ async def patch(miner_ss58: str, url: str, payload: Dict[str, Any], instance=Non
                 except Exception:
                     pass
     else:
-        timeout = httpx.Timeout(
-            connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
-        )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=req_timeout) as client:
             response = await client.patch(url, content=payload_data, headers=headers)
             yield _HttpxResponseWrapper(response)
 
@@ -195,6 +202,10 @@ async def get(miner_ss58: str, url: str, purpose: str, instance=None, **kwargs):
     timeout_val = kwargs.pop("timeout", 600)
     params = kwargs.pop("params", None)
 
+    req_timeout = httpx.Timeout(
+        connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
+    )
+
     if instance:
         from api.instance.connection import get_instance_client
 
@@ -202,7 +213,7 @@ async def get(miner_ss58: str, url: str, purpose: str, instance=None, **kwargs):
             instance, timeout=int(timeout_val) if timeout_val else 600
         )
         try:
-            response = await client.get(url, headers=headers, params=params)
+            response = await client.get(url, headers=headers, params=params, timeout=req_timeout)
             yield _HttpxResponseWrapper(response)
         finally:
             if not pooled:
@@ -211,9 +222,6 @@ async def get(miner_ss58: str, url: str, purpose: str, instance=None, **kwargs):
                 except Exception:
                     pass
     else:
-        timeout = httpx.Timeout(
-            connect=10.0, read=float(timeout_val) if timeout_val else None, write=30.0, pool=10.0
-        )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=req_timeout) as client:
             response = await client.get(url, headers=headers, params=params)
             yield _HttpxResponseWrapper(response)

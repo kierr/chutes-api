@@ -1,20 +1,21 @@
 """Instance connection helpers — httpx + HTTP/2 with TLS cert verification."""
 
 import ssl
+import asyncio
 import httpx
 import httpcore
+from collections import OrderedDict
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from api.util import semcomp
 
+_POOL_MAX = 2048
 
-# Cache SSL contexts and cert CNs per instance_id.
-_ssl_cache: dict[str, tuple[ssl.SSLContext, str]] = {}
-
-# Pooled httpx clients per instance (reuse TCP+TLS connections).
-_client_cache: dict[str, httpx.AsyncClient] = {}
+# LRU caches keyed by instance_id — oldest entries evicted when full.
+_ssl_cache: OrderedDict[str, tuple[ssl.SSLContext, str]] = OrderedDict()
+_client_cache: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
 
 
 def _should_pool(instance) -> bool:
@@ -26,6 +27,7 @@ def _get_ssl_and_cn(instance) -> tuple[ssl.SSLContext, str]:
     """Get or create cached SSL context + CN for an instance."""
     iid = str(instance.instance_id)
     if iid in _ssl_cache:
+        _ssl_cache.move_to_end(iid)
         return _ssl_cache[iid]
 
     ctx = ssl.create_default_context()
@@ -65,6 +67,8 @@ def _get_ssl_and_cn(instance) -> tuple[ssl.SSLContext, str]:
     cert = x509.load_pem_x509_certificate(instance.cacert.encode())
     cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
     _ssl_cache[iid] = (ctx, cn)
+    if len(_ssl_cache) > _POOL_MAX:
+        _ssl_cache.popitem(last=False)
     return ctx, cn
 
 
@@ -74,8 +78,6 @@ def evict_instance_ssl(instance_id: str):
     _ssl_cache.pop(iid, None)
     client = _client_cache.pop(iid, None)
     if client and not client.is_closed:
-        import asyncio
-
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(client.aclose())
@@ -134,6 +136,10 @@ async def get_instance_client(instance, timeout: int = 600) -> tuple[httpx.Async
 
     Returns (client, pooled) — caller must close the client when done if not pooled.
     Only HTTPS instances with chutes_version >= 0.5.5 are pooled (HTTP/2 multiplexing).
+
+    For pooled clients the timeout baked into the client is generous (read=None);
+    callers should pass per-request timeouts to .post()/.get() etc.
+    For ephemeral clients the caller's timeout is set on the client directly.
     """
     pooled = _should_pool(instance)
     iid = str(instance.instance_id)
@@ -141,7 +147,13 @@ async def get_instance_client(instance, timeout: int = 600) -> tuple[httpx.Async
     if pooled and iid in _client_cache:
         client = _client_cache[iid]
         if not client.is_closed:
+            _client_cache.move_to_end(iid)
             return client, True
+        _client_cache.pop(iid, None)
+
+    # Pooled clients use read=None so per-request timeouts can override.
+    # Ephemeral clients bake in the caller's timeout directly.
+    read_timeout = None if pooled else (float(timeout) if timeout else None)
 
     if instance.cacert:
         ssl_ctx, cn = _get_ssl_and_cn(instance)
@@ -154,19 +166,23 @@ async def get_instance_client(instance, timeout: int = 600) -> tuple[httpx.Async
         client = httpx.AsyncClient(
             transport=pool,
             base_url=f"https://{cn}:{instance.port}",
-            timeout=httpx.Timeout(
-                connect=10.0, read=float(timeout) if timeout else None, write=30.0, pool=10.0
-            ),
+            timeout=httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=10.0),
         )
     else:
         client = httpx.AsyncClient(
             base_url=f"http://{instance.host}:{instance.port}",
-            timeout=httpx.Timeout(
-                connect=10.0, read=float(timeout) if timeout else None, write=30.0, pool=10.0
-            ),
+            timeout=httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=10.0),
         )
 
     if pooled:
         _client_cache[iid] = client
+        if len(_client_cache) > _POOL_MAX:
+            _, evicted = _client_cache.popitem(last=False)
+            if evicted and not evicted.is_closed:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(evicted.aclose())
+                except RuntimeError:
+                    pass
 
     return client, pooled

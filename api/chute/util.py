@@ -798,6 +798,9 @@ async def _invoke_one(
     elif semcomp(target.chutes_version or "0.0.0", "0.4.2") < 0:
         timeout = 900
     pooled = True
+    req_timeout = httpx.Timeout(
+        connect=10.0, read=float(timeout) if timeout else None, write=30.0, pool=10.0
+    )
     try:
         session, pooled = await get_miner_session(target, timeout=timeout)
         headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
@@ -809,6 +812,7 @@ async def _invoke_one(
             stream_response = await session.send(
                 session.build_request("POST", f"/{path}", content=payload_string, headers=headers),
                 stream=True,
+                timeout=req_timeout,
             )
             response = stream_response
         else:
@@ -816,6 +820,7 @@ async def _invoke_one(
                 f"/{path}",
                 content=payload_string,
                 headers=headers,
+                timeout=req_timeout,
             )
 
         if response.status_code != 200:
@@ -1751,7 +1756,7 @@ async def invoke(
                     error_message = "INVALID_RESPONSE"
                     instant_delete = True
                 elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
-                    error_message = f"HTTP_{exc.status}: {error_message}"
+                    error_message = f"HTTP_{exc.response.status_code}: {error_message}"
                     # Server returned an error - connection worked, server is broken
                     # skip_disable_loop = True
 
@@ -1885,10 +1890,13 @@ async def load_llm_details(chute, target):
     payload, iv = await asyncio.to_thread(encrypt_instance_request, json.dumps(payload), target)
 
     session, pooled = await get_miner_session(target, timeout=60)
+    llm_timeout = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
     try:
         headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
         headers["X-Chutes-Serialized"] = "true"
-        resp = await session.post(f"/{path}", content=payload_string, headers=headers)
+        resp = await session.post(
+            f"/{path}", content=payload_string, headers=headers, timeout=llm_timeout
+        )
         resp.raise_for_status()
         raw_data = resp.json()
         logger.info(f"{target.chute_id=} {target.instance_id=} {target.miner_hotkey=}: {raw_data=}")
