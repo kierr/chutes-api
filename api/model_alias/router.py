@@ -3,7 +3,7 @@ CRUD endpoints for user model aliases.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from api.database import get_db_session
@@ -63,7 +63,7 @@ async def create_or_update_alias(
     result = await db.execute(
         select(ModelAlias).where(
             ModelAlias.user_id == current_user.user_id,
-            ModelAlias.alias == body.alias,
+            func.lower(ModelAlias.alias) == body.alias,
         )
     )
     return result.scalar_one()
@@ -78,7 +78,7 @@ async def delete_alias(
     result = await db.execute(
         delete(ModelAlias).where(
             ModelAlias.user_id == current_user.user_id,
-            ModelAlias.alias == alias,
+            func.lower(ModelAlias.alias) == alias.lower(),
         )
     )
     if result.rowcount == 0:

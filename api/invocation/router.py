@@ -69,6 +69,30 @@ async def initialize_quota_cache(cache_key: str) -> None:
     await settings.redis_client.incrbyfloat(cache_key, 0.0)
 
 
+def _derive_upstream_status(error: object) -> int | None:
+    """
+    Map upstream error payloads to HTTP statuses used by retry/failover logic.
+    """
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, int):
+            if 500 <= code < 600:
+                return status.HTTP_503_SERVICE_UNAVAILABLE
+            if 400 <= code < 500:
+                return code
+        return None
+
+    if isinstance(error, str):
+        if error in {"infra_overload", "no_targets"}:
+            return status.HTTP_429_TOO_MANY_REQUESTS
+        if error == "bad_request":
+            return status.HTTP_400_BAD_REQUEST
+        if error.startswith("HTTP_5"):
+            return status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return None
+
+
 @router.get("/usage")
 async def get_usage(request: Request):
     """
@@ -646,28 +670,14 @@ async def _invoke(
 
                         # If the error occurred on the first chunk, we can raise an HTTP exception.
                         if not first_chunk_processed:
-                            # SGLang errors.
-                            if isinstance(error, dict):
-                                if (
-                                    isinstance(error.get("code"), int)
-                                    and 400 <= error["code"] < 500
-                                ):
+                            mapped_status = _derive_upstream_status(error)
+                            if mapped_status is not None:
+                                if isinstance(error, dict) and 400 <= error.get("code", 0) < 500:
                                     logger.warning(
                                         f"Received error code from upstream streaming response: {error=}"
                                     )
-                                    raise HTTPException(
-                                        status_code=error["code"],
-                                        detail=error,
-                                    )
-
-                            if error in ("infra_overload", "no_targets"):
                                 raise HTTPException(
-                                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                                    detail=chunk_data.get("detail") or error,
-                                )
-                            elif error == "bad_request":
-                                raise HTTPException(
-                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    status_code=mapped_status,
                                     detail=chunk_data.get("detail") or error,
                                 )
                             raise HTTPException(
@@ -787,14 +797,10 @@ async def _invoke(
         elif chunk.startswith('data: {"error"'):
             chunk_data = json.loads(chunk[6:])
             error = chunk_data["error"]
-            if error in ("infra_overload", "no_targets"):
+            mapped_status = _derive_upstream_status(error)
+            if mapped_status is not None:
                 raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=chunk_data.get("detail") or error,
-                )
-            elif error == "bad_request":
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
+                    status_code=mapped_status,
                     detail=chunk_data.get("detail") or error,
                 )
             raise HTTPException(
@@ -1048,7 +1054,10 @@ async def hostname_invocation(
         try:
             return await _invoke(request, current_user)
         except HTTPException as exc:
-            if exc.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
+            if exc.status_code not in (
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+            ):
                 raise
             # Try each fallback chute on infra_overload.
             for fallback in fallback_chutes:
@@ -1067,7 +1076,10 @@ async def hostname_invocation(
                 try:
                     return await _invoke(request, current_user)
                 except HTTPException as inner_exc:
-                    if inner_exc.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
+                    if inner_exc.status_code not in (
+                        status.HTTP_429_TOO_MANY_REQUESTS,
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                    ):
                         raise
                     continue
             # All chutes exhausted.

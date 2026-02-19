@@ -35,16 +35,19 @@ class ModelAliasCreate(BaseModel):
             raise ValueError("alias must be 1-64 characters")
         if not _ALIAS_PATTERN.match(v):
             raise ValueError("alias must be ASCII printable (no spaces or colons)")
-        if ":latency" in v.lower() or ":throughput" in v.lower():
+        v = v.lower()
+        if ":latency" in v or ":throughput" in v:
             raise ValueError("alias must not contain ':latency' or ':throughput'")
         return v
 
     @field_validator("chute_ids")
     @classmethod
     def validate_chute_ids(cls, v: list[str]) -> list[str]:
-        if not 1 <= len(v) <= 20:
+        # De-duplicate while preserving order to avoid repeated fallback attempts.
+        deduped = list(dict.fromkeys(v))
+        if not 1 <= len(deduped) <= 20:
             raise ValueError("chute_ids must have 1-20 items")
-        return v
+        return deduped
 
 
 class ModelAliasResponse(BaseModel):
