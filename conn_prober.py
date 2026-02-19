@@ -32,12 +32,12 @@ NETNANNY.verify.restype = ctypes.c_int
 
 async def _post_connectivity(instance: Instance, endpoint: str) -> Dict[str, Any]:
     enc_path, _ = encrypt_instance_request("/_connectivity", instance, hex_encode=True)
-    url = f"http://{instance.host}:{instance.port}/{enc_path}"
     payload, _ = encrypt_instance_request(json.dumps({"endpoint": endpoint}), instance)
     async with miner_client.post(
         instance.miner_hotkey,
-        url,
+        f"/{enc_path}",
         payload,
+        instance=instance,
         timeout=30.0,
     ) as resp:
         resp.raise_for_status()
@@ -46,12 +46,12 @@ async def _post_connectivity(instance: Instance, endpoint: str) -> Dict[str, Any
 
 async def _post_netnanny_challenge(instance: Instance, challenge: str) -> Dict[str, Any]:
     enc_path, _ = encrypt_instance_request("/_netnanny_challenge", instance, hex_encode=True)
-    url = f"http://{instance.host}:{instance.port}/{enc_path}"
     payload, _ = encrypt_instance_request(json.dumps({"challenge": challenge}), instance)
     async with miner_client.post(
         instance.miner_hotkey,
-        url,
+        f"/{enc_path}",
         payload,
+        instance=instance,
         timeout=15.0,
     ) as resp:
         resp.raise_for_status()

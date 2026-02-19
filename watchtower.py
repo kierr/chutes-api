@@ -157,8 +157,9 @@ async def do_slurp(instance, payload, encrypted_slurp):
     path, _ = encrypt_instance_request("/_slurp", instance, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         enc_payload,
+        instance=instance,
         timeout=15.0,
     ) as resp:
         if resp.status == 404:
@@ -499,8 +500,9 @@ async def check_ping(chute, instance):
     path, _ = encrypt_instance_request("/_ping", instance, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         payload,
+        instance=instance,
         timeout=10.0,
     ) as resp:
         raw_content = await resp.read()
@@ -837,7 +839,7 @@ async def check_chute(chute_id):
                         chute,
                         miner_hotkey=instance.miner_hotkey,
                         seed=instance.nodes[0].seed,
-                        tls=False,
+                        tls=semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0,
                     )
                 except AssertionError as exc:
                     logger.error(f"{log_prefix} failed running command check: {exc=}")
@@ -1097,8 +1099,9 @@ async def procs_check():
                 try:
                     async with miner_client.get(
                         instance.miner_hotkey,
-                        f"http://{instance.host}:{instance.port}/{path}",
+                        f"/{path}",
                         purpose="chutes",
+                        instance=instance,
                         timeout=15.0,
                     ) as resp:
                         data = await resp.json()
@@ -1137,8 +1140,9 @@ async def get_env_dump(instance):
     path, _ = encrypt_instance_request("/_env_dump", instance, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         enc_payload,
+        instance=instance,
         timeout=30.0,
     ) as resp:
         if resp.status != 200:
@@ -1157,8 +1161,9 @@ async def get_env_sig(instance, salt):
     path, _ = encrypt_instance_request("/_env_sig", instance, hex_encode=True)
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         enc_payload,
+        instance=instance,
         timeout=5.0,
     ) as resp:
         if resp.status != 200:
@@ -1182,8 +1187,9 @@ async def get_dump(instance, outdir: str = None):
     try:
         async with miner_client.post(
             instance.miner_hotkey,
-            f"http://{instance.host}:{instance.port}/{path}",
+            f"/{path}",
             enc_payload,
+            instance=instance,
             timeout=400.0,
         ) as resp:
             if resp.status != 200:
@@ -1247,8 +1253,9 @@ async def get_sig(instance):
     logger.info(f"Querying {instance.instance_id=} envdump (sig)")
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         enc_payload,
+        instance=instance,
         timeout=15.0,
     ) as resp:
         if resp.status != 200:
@@ -1273,8 +1280,9 @@ async def slurp(instance, path, offset: int = 0, length: int = 0):
     logger.info(f"Querying {instance.instance_id=} envdump (slurp) {payload=}")
     async with miner_client.post(
         instance.miner_hotkey,
-        f"http://{instance.host}:{instance.port}/{path}",
+        f"/{path}",
         enc_payload,
+        instance=instance,
         timeout=30.0,
     ) as resp:
         if resp.status != 200:
@@ -1450,8 +1458,9 @@ async def verify_fs_hash(instance):
     try:
         async with miner_client.post(
             instance.miner_hotkey,
-            f"http://{instance.host}:{instance.port}/{path}",
+            f"/{path}",
             enc_payload,
+            instance=instance,
             timeout=90.0,
         ) as resp:
             fs_hash = (await resp.json())["result"]
@@ -1488,8 +1497,9 @@ async def check_runint(instance: Instance) -> bool:
 
         async with miner_client.post(
             instance.miner_hotkey,
-            f"http://{instance.host}:{instance.port}/{path}",
+            f"/{path}",
             enc_payload,
+            instance=instance,
             timeout=15.0,
         ) as resp:
             if resp.status != 200:
@@ -1675,8 +1685,9 @@ async def verify_bytecode_integrity(instance: Instance, chute: Chute) -> bool:
     try:
         async with miner_client.post(
             instance.miner_hotkey,
-            f"http://{instance.host}:{instance.port}/{path}",
+            f"/{path}",
             enc_payload,
+            instance=instance,
             timeout=30.0,
         ) as resp:
             if resp.status != 200:
@@ -1787,8 +1798,9 @@ async def verify_package_integrity(instance: Instance, chute: Chute) -> dict:
     try:
         async with miner_client.post(
             instance.miner_hotkey,
-            f"http://{instance.host}:{instance.port}/{path}",
+            f"/{path}",
             enc_payload,
+            instance=instance,
             timeout=60.0,
         ) as resp:
             if resp.status != 200:

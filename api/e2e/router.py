@@ -18,6 +18,7 @@ from api.user.service import get_current_user
 from api.user.schemas import User
 from api.chute.util import (
     get_one,
+    is_shared,
     get_miner_session,
     get_mtoken_price,
     update_usage_data,
@@ -40,7 +41,7 @@ from api.util import (
 from api.miner_client import sign_request
 from api.rate_limit import rate_limit
 from api.gpu import COMPUTE_UNIT_PRICE_BASIS
-from api.user.service import chutes_user_id
+from api.user.service import chutes_user_id, subnet_role_accessible
 
 router = APIRouter()
 
@@ -71,6 +72,13 @@ async def get_e2e_instances(
     # Load chute and verify access.
     chute = await get_one(chute_id)
     if not chute:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chute not found")
+    if not (
+        chute.public
+        or chute.user_id == current_user.user_id
+        or await is_shared(chute.chute_id, current_user.user_id)
+        or subnet_role_accessible(chute, current_user)
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chute not found")
 
     # Load active instances.
@@ -186,9 +194,16 @@ async def e2e_invoke(
             detail="Instance is no longer active",
         )
 
-    # Load chute for billing info.
+    # Load chute and verify access.
     chute = await get_one(chute_id)
     if not chute:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chute not found")
+    if not (
+        chute.public
+        or chute.user_id == current_user.user_id
+        or await is_shared(chute.chute_id, current_user.user_id)
+        or subnet_role_accessible(chute, current_user)
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chute not found")
 
     # Read raw E2E blob from request body.

@@ -12,7 +12,6 @@ from api.config import settings
 from api.instance.util import load_chute_target
 from api.miner_client import get as miner_get
 from api.metrics.capacity import track_capacity
-import aiohttp
 
 CONNECTION_EXPIRY = 3600
 GAUGE_REFRESH_INTERVAL = 10  # seconds
@@ -21,12 +20,12 @@ GAUGE_REFRESH_INTERVAL = 10  # seconds
 async def _query_conn_stats(instance) -> dict | None:
     """Query an instance's /_conn_stats endpoint for ground-truth connection info."""
     try:
-        url = f"http://{instance.host}:{instance.port}/_conn_stats"
         async with miner_get(
             miner_ss58=instance.miner_hotkey,
-            url=url,
+            url="/_conn_stats",
+            instance=instance,
             purpose="conn_stats",
-            timeout=aiohttp.ClientTimeout(total=5),
+            timeout=5,
         ) as resp:
             if resp.status == 200:
                 return await resp.json()

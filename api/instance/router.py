@@ -116,17 +116,14 @@ NETNANNY = ctypes.CDLL("/usr/local/lib/chutes-nnverify.so")
 NETNANNY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 NETNANNY.verify.restype = ctypes.c_int
 
-# Aegis v4 verification library (optional — may not be deployed yet)
-AEGIS_VERIFY = None
-try:
-    AEGIS_VERIFY = ctypes.CDLL("/usr/local/lib/chutes-aegis-verify.so")
-    AEGIS_VERIFY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
-    AEGIS_VERIFY.verify.restype = ctypes.c_int
-    logger.info("Loaded chutes-aegis-verify.so")
-except OSError:
-    logger.warning(
-        "chutes-aegis-verify.so not found, v4 netnanny verification will fall back to commitment-only"
-    )
+# Aegis v4 verification library is required.
+import chutes as _chutes_pkg  # noqa: E402
+
+_aegis_verify_path = os.path.join(os.path.dirname(_chutes_pkg.__file__), "chutes-aegis-verify.so")
+AEGIS_VERIFY = ctypes.CDLL(_aegis_verify_path)
+AEGIS_VERIFY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
+AEGIS_VERIFY.verify.restype = ctypes.c_int
+logger.info(f"Loaded chutes-aegis-verify.so from {_aegis_verify_path}")
 
 
 def _verify_rint_commitment_v4(commitment_hex: str) -> bool:
@@ -1110,7 +1107,18 @@ async def _validate_launch_config_instance(
     tls_cert_sig = getattr(args, "tls_cert_sig", None)
     rint_commitment = getattr(args, "rint_commitment", None)
 
-    if is_v4 and rint_commitment and rint_commitment[:2] == "04":
+    if is_v4:
+        if not rint_commitment or rint_commitment[:2] != "04":
+            logger.error(
+                f"{log_prefix} v4 instance (>= 0.5.5) must provide v4 (04-prefix) rint_commitment"
+            )
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = "v4 instance must provide v4 rint_commitment"
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="chutes >= 0.5.5 must provide a v4 runtime integrity commitment",
+            )
         if not tls_cert or not tls_cert_sig:
             logger.error(f"{log_prefix} v4 instance missing tls_cert or tls_cert_sig")
             launch_config.failed_at = func.now()
@@ -2561,17 +2569,21 @@ async def stream_logs(
         ]
         # Build a temporary client for the log port (different from main port).
         import httpx as _httpx
+        import httpcore as _httpcore
 
         if instance.cacert:
-            from api.instance.connection import _get_ssl_and_cn, _InstanceTransport
+            from api.instance.connection import _get_ssl_and_cn, _InstanceNetworkBackend
 
             ssl_ctx, cn = _get_ssl_and_cn(instance)
-            transport = _InstanceTransport(hostname=cn, ip=instance.host, ssl_context=ssl_ctx)
+            pool = _httpcore.AsyncConnectionPool(
+                ssl_context=ssl_ctx,
+                http2=True,
+                network_backend=_InstanceNetworkBackend(hostname=cn, ip=instance.host),
+            )
             client = _httpx.AsyncClient(
-                transport=transport,
+                transport=pool,
                 base_url=f"https://{cn}:{log_port}",
                 timeout=_httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
-                http2=True,
             )
         else:
             client = _httpx.AsyncClient(

@@ -39,6 +39,10 @@ RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/s
 # Set Python 3.12 as default python3
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
+# NN verification lib (v3 instances).
+ADD data/chutes-nnverify.so /usr/local/lib/chutes-nnverify.so
+RUN chmod 755 /usr/local/lib/chutes-nnverify.so
+
 ###
 # FORGE
 ###

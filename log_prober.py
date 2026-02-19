@@ -1,6 +1,7 @@
 import gc
 import asyncio
 import traceback
+import httpx as _httpx
 import api.database.orms  # noqa
 from loguru import logger
 from api.config import settings
@@ -24,14 +25,34 @@ async def check_instance_logging_server(instance: Instance) -> bool:
         log_port = next(p for p in instance.port_mappings if p["internal_port"] == 8001)[
             "external_port"
         ]
-        async with miner_client.get(
-            instance.miner_hotkey,
-            f"http://{instance.host}:{log_port}/logs",
-            timeout=10,
-            purpose="chutes",
-        ) as resp:
+
+        # Build a TLS-aware client for the log port when instance has cacert.
+        if instance.cacert:
+            import httpcore as _httpcore
+            from api.instance.connection import _get_ssl_and_cn, _InstanceNetworkBackend
+
+            ssl_ctx, cn = _get_ssl_and_cn(instance)
+            pool = _httpcore.AsyncConnectionPool(
+                ssl_context=ssl_ctx,
+                http2=True,
+                network_backend=_InstanceNetworkBackend(hostname=cn, ip=instance.host),
+            )
+            client = _httpx.AsyncClient(
+                transport=pool,
+                base_url=f"https://{cn}:{log_port}",
+                timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
+            )
+        else:
+            client = _httpx.AsyncClient(
+                base_url=f"http://{instance.host}:{log_port}",
+                timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
+            )
+
+        headers, _ = miner_client.sign_request(instance.miner_hotkey, purpose="chutes")
+        try:
+            resp = await client.get("/logs", headers=headers)
             resp.raise_for_status()
-            json_data = await resp.json()
+            json_data = resp.json()
             if "logs" not in json_data:
                 raise ValueError("Missing 'logs' key in response")
             has_required_log = any(
@@ -39,13 +60,17 @@ async def check_instance_logging_server(instance: Instance) -> bool:
             )
             if not has_required_log:
                 raise ValueError("No log entry with path '/tmp/_chute.log' found")
+            proto = "https" if instance.cacert else "http"
             logger.success(
-                f"✅ logging server running for {instance.instance_id=} of {instance.miner_hotkey=} for {instance.chute_id=} on http://{instance.host}:{log_port}"
+                f"✅ logging server running for {instance.instance_id=} of {instance.miner_hotkey=} for {instance.chute_id=} on {proto}://{instance.host}:{log_port}"
             )
             return True
+        finally:
+            await client.aclose()
     except Exception as exc:
+        proto = "https" if instance.cacert else "http"
         logger.error(
-            f"❌ logging server check failure for {instance.instance_id=} of {instance.miner_hotkey=} for {instance.chute_id=} on http://{instance.host}:{log_port or '???'}: {str(exc)}\n{traceback.format_exc()}"
+            f"❌ logging server check failure for {instance.instance_id=} of {instance.miner_hotkey=} for {instance.chute_id=} on {proto}://{instance.host}:{log_port or '???'}: {str(exc)}\n{traceback.format_exc()}"
         )
         return False
 
