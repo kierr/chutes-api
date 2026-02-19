@@ -809,10 +809,11 @@ async def _invoke_one(
 
         if stream:
             # Use streaming request for streaming responses.
+            # .send() doesn't accept timeout= kwarg; set it on the client directly.
+            session.timeout = req_timeout
             stream_response = await session.send(
                 session.build_request("POST", f"/{path}", content=payload_string, headers=headers),
                 stream=True,
-                timeout=req_timeout,
             )
             response = stream_response
         else:

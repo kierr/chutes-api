@@ -9,6 +9,7 @@ import secrets
 import asyncio
 import random
 import traceback
+import httpx
 import orjson as json
 from loguru import logger
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -259,8 +260,11 @@ async def e2e_invoke(
         if is_stream:
             headers["X-E2E-Stream"] = "true"
 
+        e2e_timeout = httpx.Timeout(connect=10.0, read=1800.0, write=30.0, pool=10.0)
         if is_stream:
             # Use streaming request for streaming responses.
+            # .send() doesn't accept timeout= kwarg; set it on the client directly.
+            session.timeout = e2e_timeout
             response = await session.send(
                 session.build_request(
                     "POST", f"/{encrypted_path}", content=payload_string, headers=headers
@@ -272,6 +276,7 @@ async def e2e_invoke(
                 f"/{encrypted_path}",
                 content=payload_string,
                 headers=headers,
+                timeout=e2e_timeout,
             )
 
         # Handle transport-level errors.
