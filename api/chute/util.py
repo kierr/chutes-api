@@ -867,7 +867,9 @@ async def _invoke_one(
             cllmv_verified = False
             last_usage = None
             disconnect_chunk_check = 0
-            async for raw_chunk in stream_response.aiter_bytes():
+            async for raw_chunk in stream_response.aiter_lines():
+                if not raw_chunk:
+                    continue
                 chunk = await asyncio.to_thread(decrypt_instance_response, raw_chunk, target, iv)
                 if not use_serialized:
                     chunk = gzip.decompress(chunk)

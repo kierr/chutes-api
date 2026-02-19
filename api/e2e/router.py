@@ -390,7 +390,9 @@ async def _stream_e2e_response(
     metrics = {}
     chunk_count = 0
     try:
-        async for raw_chunk in response.aiter_bytes():
+        async for raw_chunk in response.aiter_lines():
+            if not raw_chunk:
+                continue
             # Transport-decrypt each chunk.
             try:
                 decrypted = await asyncio.to_thread(decrypt_instance_response, raw_chunk, instance)
