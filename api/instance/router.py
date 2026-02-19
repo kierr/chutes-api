@@ -16,7 +16,6 @@ import asyncio
 import orjson as json  # noqa
 from api.image.util import get_inspecto_hash
 import api.miner_client as miner_client
-import cllmv as _cllmv
 from loguru import logger
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
@@ -123,7 +122,28 @@ _aegis_verify_path = os.path.join(os.path.dirname(_chutes_pkg.__file__), "chutes
 AEGIS_VERIFY = ctypes.CDLL(_aegis_verify_path)
 AEGIS_VERIFY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 AEGIS_VERIFY.verify.restype = ctypes.c_int
+AEGIS_VERIFY.decrypt_session_key.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+]
+AEGIS_VERIFY.decrypt_session_key.restype = ctypes.c_int
 logger.info(f"Loaded chutes-aegis-verify.so from {_aegis_verify_path}")
+
+
+def _decrypt_cllmv_session_key(blob_hex: str, x25519_priv_hex: str) -> str | None:
+    """Decrypt miner's ephemeral HMAC key from the CLLMV V2 init blob."""
+    key_buf = ctypes.create_string_buffer(65)
+    ret = AEGIS_VERIFY.decrypt_session_key(
+        blob_hex.encode(),
+        x25519_priv_hex.encode(),
+        key_buf,
+        65,
+    )
+    if ret != 0:
+        return None
+    return key_buf.value.decode()
 
 
 def _verify_rint_commitment_v4(commitment_hex: str) -> bool:
@@ -1360,7 +1380,7 @@ async def _validate_launch_config_instance(
                 detail="CLLMV V2 not configured on validator",
             )
         try:
-            cllmv_session_key = _cllmv.decrypt_session_key(cllmv_init, x25519_priv)
+            cllmv_session_key = _decrypt_cllmv_session_key(cllmv_init, x25519_priv)
             if not cllmv_session_key:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -1382,7 +1402,7 @@ async def _validate_launch_config_instance(
         x25519_priv = os.environ.get("CLLMV_X25519_PRIVATE_KEY")
         if x25519_priv:
             try:
-                cllmv_session_key = _cllmv.decrypt_session_key(cllmv_init, x25519_priv)
+                cllmv_session_key = _decrypt_cllmv_session_key(cllmv_init, x25519_priv)
                 if cllmv_session_key:
                     if instance.extra is None:
                         instance.extra = {}

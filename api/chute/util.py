@@ -3,6 +3,7 @@ Application logic and utilities for chutes.
 """
 
 import os
+import ctypes
 import httpx
 import asyncio
 import re
@@ -82,7 +83,77 @@ from api.metrics.capacity import (
     track_request_completed,
     track_request_rate_limited,
 )
-from cllmv import validate as cllmv_validate, validate_v2 as cllmv_validate_v2
+import chutes as _chutes_pkg
+
+_aegis_verify_path = os.path.join(os.path.dirname(_chutes_pkg.__file__), "chutes-aegis-verify.so")
+_AEGIS_VERIFY = ctypes.CDLL(_aegis_verify_path)
+_AEGIS_VERIFY.validate.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+]
+_AEGIS_VERIFY.validate.restype = ctypes.c_int
+_AEGIS_VERIFY.validate_v2.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+]
+_AEGIS_VERIFY.validate_v2.restype = ctypes.c_int
+
+
+def cllmv_validate(
+    id: str,
+    created: int,
+    value: str,
+    expected_hash: str,
+    salt: str,
+    model: str,
+    revision: str,
+) -> bool:
+    return bool(
+        _AEGIS_VERIFY.validate(
+            id.encode(),
+            created,
+            value.encode() if value else None,
+            expected_hash.encode(),
+            salt.encode(),
+            model.encode(),
+            revision.encode(),
+        )
+    )
+
+
+def cllmv_validate_v2(
+    id: str,
+    created: int,
+    value: str,
+    expected_token: str,
+    session_key_hex: str,
+    sub: str,
+    model: str,
+    revision: str,
+) -> bool:
+    return bool(
+        _AEGIS_VERIFY.validate_v2(
+            id.encode(),
+            created,
+            value.encode() if value else None,
+            expected_token.encode(),
+            session_key_hex.encode(),
+            sub.encode(),
+            model.encode(),
+            revision.encode(),
+        )
+    )
 
 
 # Tokenizer for input/output token estimation.
