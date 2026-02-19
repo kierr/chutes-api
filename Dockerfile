@@ -39,11 +39,6 @@ RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/s
 # Set Python 3.12 as default python3
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
-# NN verification lib.
-ADD data/chutes-nnverify.so /usr/local/lib/chutes-nnverify.so
-ADD data/chutes-aegis-verify.so /usr/local/lib/chutes-aegis-verify.so
-RUN chmod 755 /usr/local/lib/chutes-*.so
-
 ###
 # FORGE
 ###
@@ -84,7 +79,7 @@ ADD data/containers.conf /etc/containers/containers.conf
 RUN mkdir -p /root/build /forge /var/lib/containers
 
 # Install trivy
-RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.68.2
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.69.1
 
 # Install cosign
 ENV COSIGN_VERSION=2.5.3

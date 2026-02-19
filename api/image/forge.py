@@ -260,8 +260,8 @@ RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 COPY cfsv /cfsv
 USER root
-RUN find / -type f -name '*.pyc' -exec rm -f {{}} || true
-RUN find / -type d -name __pycache__ -exec rm -rf {{}} || true
+RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
+RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 RUN uv cache clean --force
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
@@ -1108,8 +1108,8 @@ RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 COPY cfsv /cfsv
 USER root
-RUN find / -type f -name '*.pyc' -exec rm -f {{}} || true
-RUN find / -type d -name __pycache__ -exec rm -rf {{}} || true
+RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
+RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 RUN uv cache clean --force
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
