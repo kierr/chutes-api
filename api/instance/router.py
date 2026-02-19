@@ -1346,7 +1346,39 @@ async def _validate_launch_config_instance(
 
     # CLLMV V2: decrypt miner's ephemeral HMAC session key from init blob
     cllmv_init = getattr(args, "cllmv_session_init", None)
-    if cllmv_init and semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
+    is_v4_instance = semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0
+    if is_v4_instance:
+        if not cllmv_init:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="cllmv_session_init required for chutes >= 0.5.5",
+            )
+        x25519_priv = os.environ.get("CLLMV_X25519_PRIVATE_KEY")
+        if not x25519_priv:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="CLLMV V2 not configured on validator",
+            )
+        try:
+            cllmv_session_key = _cllmv.decrypt_session_key(cllmv_init, x25519_priv)
+            if not cllmv_session_key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="CLLMV V2 session key decryption failed (invalid init blob or signature)",
+                )
+            if instance.extra is None:
+                instance.extra = {}
+            instance.extra["cllmv_session_key"] = cllmv_session_key
+            logger.info(f"CLLMV V2 session key decrypted for {instance.instance_id}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"CLLMV V2 session key decryption error: {exc}",
+            )
+    elif cllmv_init:
+        # Pre-0.5.5 instance sent cllmv_init anyway — best-effort decrypt
         x25519_priv = os.environ.get("CLLMV_X25519_PRIVATE_KEY")
         if x25519_priv:
             try:
@@ -1356,15 +1388,8 @@ async def _validate_launch_config_instance(
                         instance.extra = {}
                     instance.extra["cllmv_session_key"] = cllmv_session_key
                     logger.info(f"CLLMV V2 session key decrypted for {instance.instance_id}")
-                else:
-                    logger.warning(
-                        f"CLLMV V2 session key decryption failed for {instance.instance_id} "
-                        f"(invalid init blob or signature)"
-                    )
             except Exception as exc:
-                logger.warning(f"CLLMV V2 session key decryption error: {exc}")
-        else:
-            logger.debug("CLLMV_X25519_PRIVATE_KEY not set, skipping V2 session key decrypt")
+                logger.warning(f"CLLMV V2 session key decryption error (pre-0.5.5): {exc}")
 
     return launch_config, nodes, instance, validator_pubkey
 

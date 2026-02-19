@@ -882,8 +882,9 @@ async def _invoke_one(
                                     + target.rint_nonce
                                     + chute.image.package_hashes["hash"]
                                 )
-                            # Try V2 (HMAC-SHA256 with session key) first, fall back to V1
+                            # V2 (HMAC-SHA256 with session key) required for >= 0.5.5, V1 fallback for older
                             cllmv_v2_key = (target.extra or {}).get("cllmv_session_key")
+                            is_v4_cllmv = semcomp(target.chutes_version or "0.0.0", "0.5.5") >= 0
                             if cllmv_v2_key:
                                 cllmv_ok = cllmv_validate_v2(
                                     data.get("id") or "bad",
@@ -895,6 +896,13 @@ async def _invoke_one(
                                     model_identifier,
                                     chute.revision,
                                 )
+                            elif is_v4_cllmv:
+                                # >= 0.5.5 must use V2; missing key means launch was broken
+                                logger.error(
+                                    f"CLLMV FAILURE: STREAMED {target.instance_id=} {target.miner_hotkey=} "
+                                    f"v4 instance missing cllmv_session_key"
+                                )
+                                cllmv_ok = False
                             else:
                                 cllmv_ok = cllmv_validate(
                                     data.get("id") or "bad",
@@ -1138,8 +1146,9 @@ async def _invoke_one(
                                     + target.rint_nonce
                                     + chute.image.package_hashes["hash"]
                                 )
-                            # Try V2 (HMAC-SHA256 with session key) first, fall back to V1
+                            # V2 (HMAC-SHA256 with session key) required for >= 0.5.5, V1 fallback for older
                             cllmv_v2_key = (target.extra or {}).get("cllmv_session_key")
+                            is_v4_cllmv = semcomp(target.chutes_version or "0.0.0", "0.5.5") >= 0
                             if cllmv_v2_key:
                                 cllmv_ok = verification_token and cllmv_validate_v2(
                                     json_data.get("id") or "bad",
@@ -1151,6 +1160,13 @@ async def _invoke_one(
                                     model_identifier,
                                     chute.revision,
                                 )
+                            elif is_v4_cllmv:
+                                # >= 0.5.5 must use V2; missing key means launch was broken
+                                logger.error(
+                                    f"CLLMV FAILURE: {target.instance_id=} {target.miner_hotkey=} "
+                                    f"v4 instance missing cllmv_session_key"
+                                )
+                                cllmv_ok = False
                             else:
                                 cllmv_ok = verification_token and cllmv_validate(
                                     json_data.get("id") or "bad",

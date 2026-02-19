@@ -1,4 +1,5 @@
 import gc
+import os
 import uuid
 import orjson as json
 import asyncio
@@ -28,6 +29,13 @@ LBPING_URL = "https://api.chutes.ai/_lbping"
 NETNANNY = ctypes.CDLL("/usr/local/lib/chutes-nnverify.so")
 NETNANNY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 NETNANNY.verify.restype = ctypes.c_int
+
+import chutes as _chutes_pkg  # noqa: E402
+
+_aegis_verify_path = os.path.join(os.path.dirname(_chutes_pkg.__file__), "chutes-aegis-verify.so")
+AEGIS_VERIFY = ctypes.CDLL(_aegis_verify_path)
+AEGIS_VERIFY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
+AEGIS_VERIFY.verify.restype = ctypes.c_int
 
 
 async def _post_connectivity(instance: Instance, endpoint: str) -> Dict[str, Any]:
@@ -136,10 +144,17 @@ async def _verify_netnanny(instance: Instance, allow_external_egress: bool) -> N
             f"Netnanny reported allow_external_egress={miner_egress} "
             f"but chute requires {allow_external_egress}."
         )
-    if not NETNANNY.verify(
-        challenge.encode(), miner_hash.encode(), ctypes.c_uint8(allow_external_egress)
-    ):
-        raise RuntimeError("Netnanny verify() returned failure.")
+    # Use aegis-verify for >= 0.5.5, netnanny for older instances.
+    if semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
+        if not AEGIS_VERIFY.verify(
+            challenge.encode(), miner_hash.encode(), ctypes.c_uint8(allow_external_egress)
+        ):
+            raise RuntimeError("Aegis verify() returned failure.")
+    else:
+        if not NETNANNY.verify(
+            challenge.encode(), miner_hash.encode(), ctypes.c_uint8(allow_external_egress)
+        ):
+            raise RuntimeError("Netnanny verify() returned failure.")
 
 
 async def check_instance_connectivity(
