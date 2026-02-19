@@ -23,11 +23,24 @@ def parse_model_parameter(model_str: str) -> tuple[str, str | None]:
     Returns (model_str_without_suffix, routing_mode).
     routing_mode is None (failover), "latency", or "throughput".
     """
+    model_str = model_str.strip()
     lower = model_str.lower()
     for suffix in ROUTING_SUFFIXES:
         if lower.endswith(suffix):
             return model_str[: -len(suffix)], suffix[1:]  # strip the colon
     return model_str, None
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    """Remove duplicates while preserving original order."""
+    seen = set()
+    out = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 async def get_user_alias(user_id: str, alias: str) -> list[str] | None:
@@ -198,7 +211,19 @@ async def resolve_model_parameter(
     chute_ids: list[str] | None = None
 
     if "," in raw_model:
-        chute_ids = [s.strip() for s in raw_model.split(",") if s.strip()]
+        tokens = [s.strip() for s in raw_model.split(",") if s.strip()]
+        expanded: list[str] = []
+        for token in tokens:
+            # Prefer direct model lookup over alias when names collide.
+            if await get_one(token) is not None:
+                expanded.append(token)
+                continue
+            alias_ids = await get_user_alias(user_id, token)
+            if alias_ids is not None:
+                expanded.extend(alias_ids)
+            else:
+                expanded.append(token)
+        chute_ids = _dedupe_keep_order(expanded)
     else:
         # Try single lookup on suffix-stripped name.
         if routing_mode is not None:
