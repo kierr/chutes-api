@@ -340,9 +340,17 @@ class Settings(BaseSettings):
     # TDX Attestation settings - Measurement configuration loaded from ConfigMap
     tee_measurement_config_path: Path = Path("/etc/config/tee_measurements.yaml")
 
-    @cached_property
+    @property
     def tee_measurements(self) -> List[TeeMeasurementConfig]:
-        """Load TEE measurement configurations from YAML file (mounted from ConfigMap)."""
+        """Load TEE measurement configurations from YAML file (mounted from ConfigMap).
+
+        Re-reads the file on every access so that ConfigMap updates propagated
+        by Kubernetes are picked up without restarting the pod.
+        """
+        return self._load_tee_measurements()
+
+    def _load_tee_measurements(self) -> List[TeeMeasurementConfig]:
+        """Parse and validate TEE measurement configurations from the YAML file."""
         try:
             with open(self.tee_measurement_config_path) as f:
                 config = yaml.safe_load(f)
@@ -380,7 +388,8 @@ class Settings(BaseSettings):
                 k.upper(): v.upper().strip() for k, v in measurement_config["boot_rtmrs"].items()
             }
             runtime_rtmrs = {
-                k.upper(): v.upper().strip() for k, v in measurement_config["runtime_rtmrs"].items()
+                k.upper(): v.upper().strip()
+                for k, v in measurement_config["runtime_rtmrs"].items()
             }
 
             if boot_rtmrs.get("RTMR0") != runtime_rtmrs.get("RTMR0"):
