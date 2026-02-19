@@ -49,7 +49,7 @@ async def create_or_update_alias(
         )
         .on_conflict_do_update(
             index_elements=["user_id", "alias"],
-            set_={"chute_ids": body.chute_ids, "updated_at": ModelAlias.updated_at.default.arg},
+            set_={"chute_ids": body.chute_ids, "updated_at": func.now()},
         )
     )
     await db.execute(stmt)
