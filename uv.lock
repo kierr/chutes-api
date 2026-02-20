@@ -749,7 +749,7 @@ wheels = [
 
 [[package]]
 name = "chutes"
-version = "0.5.5rc1"
+version = "0.5.5rc12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -758,7 +758,6 @@ dependencies = [
     { name = "cllmv" },
     { name = "cryptography" },
     { name = "fastapi" },
-    { name = "fickling" },
     { name = "graval" },
     { name = "huggingface-hub" },
     { name = "loguru" },
@@ -779,7 +778,7 @@ dependencies = [
     { name = "uvicorn" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b4/78/519cf70ae864d804a222d2fc1cb9493647c4097bc1644fede8d9e649475d/chutes-0.5.5rc1-py3-none-any.whl", hash = "sha256:a0b16d061c8f990a1dfff173a4316243df925b6a2e5fa38323fb195e221371db", size = 8918289, upload-time = "2026-02-19T09:33:58.111Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/a3/9ab64f1d8cf18063d80666a2012fc177332c1b07e7ac2bc87be0136f4c67/chutes-0.5.5rc12-py3-none-any.whl", hash = "sha256:fa9b20e4484c2fd3307f4f88269567e013a2eb23539733e913ca6b1fed50f64e", size = 8927094, upload-time = "2026-02-20T14:02:34.74Z" },
 ]
 
 [[package]]
@@ -856,7 +855,7 @@ requires-dist = [
     { name = "backoff", specifier = ">=2.2.1,<3.0.0" },
     { name = "bittensor-drand", specifier = ">=1.2.0" },
     { name = "bittensor-wallet", specifier = ">=4.0.1" },
-    { name = "chutes", specifier = "==0.5.5rc1" },
+    { name = "chutes", specifier = "==0.5.5rc12" },
     { name = "dcap-qvl", specifier = "==0.3.12" },
     { name = "dnslib", specifier = ">=0.9.26,<0.10.0" },
     { name = "fastapi", specifier = ">=0.124.0,<0.125.0" },
@@ -912,13 +911,13 @@ wheels = [
 
 [[package]]
 name = "cllmv"
-version = "0.1.2"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "setuptools" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/e7/da6c1525948f8608945b3665f81d72daff9614368c52ffb6ec116db8e41a/cllmv-0.1.2-py3-none-any.whl", hash = "sha256:bb9bb6dc87717e0d632374d06e56f8e77e1e2115355f97d57b168f448d356216", size = 4459, upload-time = "2026-02-19T09:19:25.375Z" },
+    { url = "https://files.pythonhosted.org/packages/de/bc/c794a38145ca902da5bd6f8349fece930060386e282b522bd2da1f2c0a1f/cllmv-0.1.3-py3-none-any.whl", hash = "sha256:aef678f61a7da9126a4690aa83bb7e76a3e6564bb79879d0498040361717cb4c", size = 4487, upload-time = "2026-02-19T12:50:34.224Z" },
 ]
 
 [[package]]
