@@ -193,7 +193,10 @@ RUN rm -f /etc/chutesfs.index
 RUN usermod -aG root chutes || true
 RUN chmod g+rwx /usr/local/lib /usr/local/bin /usr/local/share /usr/local/share/man
 RUN chmod g+rwx /usr/local/lib/python3.12/dist-packages || true
+RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
+RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
+ENV PYTHONDONTWRITEBYTECODE=1
 RUN pip install chutes=={image.chutes_version}
 """
         # v4 (aegis) vs v3 (netnanny+logintercept) .so injection
@@ -259,10 +262,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 COPY cfsv /cfsv
-USER root
-RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
-RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
-USER chutes
 RUN uv cache clean --force
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
 USER root
@@ -1042,6 +1041,8 @@ RUN rm -f /etc/chutesfs.index
 RUN usermod -aG root chutes || true
 RUN chmod g+rwx /usr/local/lib /usr/local/bin /usr/local/share /usr/local/share/man
 RUN chmod g+rwx /usr/local/lib/python3.12/dist-packages || true
+RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
+RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 RUN pip install chutes=={chutes_version}
 """
@@ -1107,9 +1108,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 COPY cfsv /cfsv
-USER root
-RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
-RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 RUN uv cache clean --force
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
