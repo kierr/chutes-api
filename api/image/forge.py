@@ -256,12 +256,16 @@ ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-loginterc
         verification_tag = f"{short_tag}-fsv-{uuid.uuid4().hex[:8]}"
         logger.info(f"Building filesystem verification image as {verification_tag}")
         fsv_dockerfile_content = f"""FROM {chutes_tag}
+USER chutes
 ARG CFSV_OP
 ARG PS_OP
 ENV LD_PRELOAD=""
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
+USER root
+RUN rm -f /etc/bytecode.manifest /tmp/chutesfs.index /etc/chutesfs.index /tmp/chutesfs.data
+USER chutes
 COPY cfsv /cfsv
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
 USER root
@@ -1105,12 +1109,15 @@ ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-loginterc
             fsv_dockerfile_content = f"""FROM {updated_tag}
 ARG CFSV_OP
 ARG PS_OP
+USER chutes
 ENV LD_PRELOAD=""
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
-COPY cfsv /cfsv
+USER root
+RUN rm -f /etc/bytecode.manifest /tmp/chutesfs.index /etc/chutesfs.index /tmp/chutesfs.data
 USER chutes
+COPY cfsv /cfsv
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
 USER root
 RUN cp -f /tmp/chutesfs.index /etc/chutesfs.index && chmod a+r /etc/chutesfs.index
