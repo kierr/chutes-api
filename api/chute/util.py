@@ -770,7 +770,7 @@ async def _invoke_one(
     # Version-gate payload format: >= 0.5.5 uses plain JSON + gzip, < 0.5.5 uses pickle.
     if raw_payload is not None and semcomp(target.chutes_version or "0.0.0", "0.5.5") >= 0:
         # >= 0.5.5: plain JSON + gzip, no pickle
-        payload_bytes = gzip.compress(json.dumps(raw_payload).encode())
+        payload_bytes = gzip.compress(json.dumps(raw_payload))
         use_serialized = False
     else:
         # < 0.5.5: pickle-wrapped args/kwargs, no gzip
