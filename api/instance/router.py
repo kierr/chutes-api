@@ -839,7 +839,7 @@ async def _validate_launch_config_inspecto(
                 detail=launch_config.verification_error,
             )
 
-        enforce_inspecto = "PS_OP" in os.environ
+        enforce_inspecto = "PS_OP" in os.environ and semcomp(chute.chutes_version, "0.5.5") < 0
         inspecto_valid = True
         fail_reason = None
         if enforce_inspecto:
