@@ -2639,7 +2639,7 @@ async def stream_logs(
         import httpcore as _httpcore
 
         if instance.cacert:
-            from api.instance.connection import _get_ssl_and_cn, _InstanceNetworkBackend
+            from api.instance.connection import _get_ssl_and_cn, _InstanceNetworkBackend, _CoreTransport
 
             ssl_ctx, cn = _get_ssl_and_cn(instance)
             pool = _httpcore.AsyncConnectionPool(
@@ -2648,7 +2648,7 @@ async def stream_logs(
                 network_backend=_InstanceNetworkBackend(hostname=cn, ip=instance.host),
             )
             client = _httpx.AsyncClient(
-                transport=pool,
+                transport=_CoreTransport(pool),
                 base_url=f"https://{cn}:{log_port}",
                 timeout=_httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
             )

@@ -26,27 +26,10 @@ async def check_instance_logging_server(instance: Instance) -> bool:
             "external_port"
         ]
 
-        # Build a TLS-aware client for the log port when instance has cacert.
-        if instance.cacert:
-            import httpcore as _httpcore
-            from api.instance.connection import _get_ssl_and_cn, _InstanceNetworkBackend
-
-            ssl_ctx, cn = _get_ssl_and_cn(instance)
-            pool = _httpcore.AsyncConnectionPool(
-                ssl_context=ssl_ctx,
-                http2=True,
-                network_backend=_InstanceNetworkBackend(hostname=cn, ip=instance.host),
-            )
-            client = _httpx.AsyncClient(
-                transport=pool,
-                base_url=f"https://{cn}:{log_port}",
-                timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
-            )
-        else:
-            client = _httpx.AsyncClient(
-                base_url=f"http://{instance.host}:{log_port}",
-                timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
-            )
+        client = _httpx.AsyncClient(
+            base_url=f"http://{instance.host}:{log_port}",
+            timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
+        )
 
         try:
             headers, _ = miner_client.sign_request(instance.miner_hotkey, purpose="chutes")
@@ -60,7 +43,7 @@ async def check_instance_logging_server(instance: Instance) -> bool:
             )
             if not has_required_log:
                 raise ValueError("No log entry with path '/tmp/_chute.log' found")
-            proto = "https" if instance.cacert else "http"
+            proto = "http"
             logger.success(
                 f"✅ logging server running for {instance.instance_id=} of {instance.miner_hotkey=} for {instance.chute_id=} on {proto}://{instance.host}:{log_port}"
             )

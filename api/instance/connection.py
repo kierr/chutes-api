@@ -131,6 +131,41 @@ class _InstanceNetworkBackend(httpcore.AsyncNetworkBackend):
         await self._backend.sleep(seconds)
 
 
+class _CoreTransport(httpx.AsyncBaseTransport):
+    """Wrap a raw httpcore pool so httpx <-> httpcore request mapping works.
+
+    httpx 0.28+ passes string-based URLs to transports, but httpcore 1.0
+    expects bytes-based URLs. httpx.AsyncHTTPTransport handles this internally
+    but doesn't expose the network_backend param we need for custom DNS.
+    """
+
+    def __init__(self, pool: httpcore.AsyncConnectionPool):
+        self._pool = pool
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        core_request = httpcore.Request(
+            method=request.method.encode() if isinstance(request.method, str) else request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+        )
+        core_response = await self._pool.handle_async_request(core_request)
+        return httpx.Response(
+            status_code=core_response.status,
+            headers=core_response.headers,
+            stream=core_response.stream,
+            extensions=core_response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
+
+
 async def get_instance_client(instance, timeout: int = 600) -> tuple[httpx.AsyncClient, bool]:
     """Get or create an httpx AsyncClient for an instance.
 
@@ -164,7 +199,7 @@ async def get_instance_client(instance, timeout: int = 600) -> tuple[httpx.Async
             network_backend=_InstanceNetworkBackend(hostname=cn, ip=instance.host),
         )
         client = httpx.AsyncClient(
-            transport=pool,
+            transport=_CoreTransport(pool),
             base_url=f"https://{cn}:{instance.port}",
             timeout=httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=10.0),
         )
