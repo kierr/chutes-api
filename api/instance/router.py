@@ -1376,7 +1376,7 @@ async def _validate_launch_config_instance(
                 )
             if instance.extra is None:
                 instance.extra = {}
-            instance.extra["cllmv_session_key"] = cllmv_session_key
+            instance.extra = {**instance.extra, "cllmv_session_key": cllmv_session_key}
             logger.info(f"CLLMV V2 session key decrypted for {instance.instance_id}")
         except HTTPException:
             raise
@@ -1394,7 +1394,7 @@ async def _validate_launch_config_instance(
                 if cllmv_session_key:
                     if instance.extra is None:
                         instance.extra = {}
-                    instance.extra["cllmv_session_key"] = cllmv_session_key
+                    instance.extra = {**instance.extra, "cllmv_session_key": cllmv_session_key}
                     logger.info(f"CLLMV V2 session key decrypted for {instance.instance_id}")
             except Exception as exc:
                 logger.warning(f"CLLMV V2 session key decryption error (pre-0.5.5): {exc}")
