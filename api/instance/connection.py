@@ -31,10 +31,12 @@ def _get_ssl_and_cn(instance) -> tuple[ssl.SSLContext, str]:
         return _ssl_cache[iid]
 
     ctx = ssl.create_default_context()
-    ctx.load_verify_locations(cadata=instance.cacert)
+    extra = instance.extra or {}
+    # Use CA cert for chain verification when available, fall back to server cert.
+    ca_pem = extra.get("ca_cert") or instance.cacert
+    ctx.load_verify_locations(cadata=ca_pem)
 
     # Load mTLS client cert if available.
-    extra = instance.extra or {}
     client_cert_pem = extra.get("client_cert")
     client_key_pem = extra.get("client_key")
     client_key_password = extra.get("client_key_password")

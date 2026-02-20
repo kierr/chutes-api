@@ -65,6 +65,7 @@ class LaunchConfigArgs(BaseModel):
     rint_pubkey: Optional[str] = None
     tls_cert: Optional[str] = None
     tls_cert_sig: Optional[str] = None
+    tls_ca_cert: Optional[str] = None
     tls_client_cert: Optional[str] = None
     tls_client_key: Optional[str] = None
     tls_client_key_password: Optional[str] = None

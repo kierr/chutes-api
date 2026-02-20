@@ -1164,6 +1164,10 @@ async def _validate_launch_config_instance(
     extra_fields = {
         "e2e_pubkey": getattr(args, "e2e_pubkey", None),
     }
+    # Store CA cert for SSL verification (separate from server cert in cacert).
+    tls_ca_cert = getattr(args, "tls_ca_cert", None)
+    if tls_ca_cert:
+        extra_fields["ca_cert"] = tls_ca_cert
     # Store mTLS client cert + key for API-to-instance connections.
     tls_client_cert = getattr(args, "tls_client_cert", None)
     if tls_client_cert:
@@ -2639,7 +2643,11 @@ async def stream_logs(
         import httpcore as _httpcore
 
         if instance.cacert:
-            from api.instance.connection import _get_ssl_and_cn, _InstanceNetworkBackend, _CoreTransport
+            from api.instance.connection import (
+                _get_ssl_and_cn,
+                _InstanceNetworkBackend,
+                _CoreTransport,
+            )
 
             ssl_ctx, cn = _get_ssl_and_cn(instance)
             pool = _httpcore.AsyncConnectionPool(
