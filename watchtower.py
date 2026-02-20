@@ -35,7 +35,7 @@ from sqlalchemy.orm import joinedload, selectinload
 import api.database.orms  # noqa
 import api.miner_client as miner_client
 from api.instance.schemas import Instance, LaunchConfig
-from api.instance.util import invalidate_instance_cache
+from api.instance.util import invalidate_instance_cache, cleanup_instance_conn_tracking
 from api.chute.codecheck import is_bad_code
 
 
@@ -133,6 +133,8 @@ async def purge(target, reason="miner failed watchtower probes", valid_terminati
             await notify_job_deleted(job)
 
         await session.commit()
+
+    await cleanup_instance_conn_tracking(target.chute_id, target.instance_id)
 
 
 async def purge_and_notify(

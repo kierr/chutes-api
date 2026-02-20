@@ -115,15 +115,15 @@ async def _record_failure_or_delete(session, instance: Instance, hard_reason: st
     rkey = f"{REDIS_PREFIX}{instance.instance_id}"
     try:
         failure_count = await settings.redis_client.incr(rkey)
-        await settings.redis_client.expire(rkey, 600)
+        await settings.redis_client.expire(rkey, 900)
     except Exception as redis_exc:
         logger.warning(f"Redis error tracking failures for {instance.instance_id}: {redis_exc}")
-        failure_count = 3
-    if failure_count >= 3:
+        failure_count = 1
+    if failure_count >= 5:
         await _hard_delete_instance(
             session,
             instance,
-            "Failed 3 or more consecutive connectivity probes.",
+            "Failed 5 or more consecutive connectivity probes.",
         )
 
 

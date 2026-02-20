@@ -921,6 +921,8 @@ async def hostname_invocation(
             payload["model"] = "mistralai/Devstral-2-123B-Instruct-2512-TEE"
         elif model == "Qwen/Qwen3-Coder-Next":
             payload["model"] = "Qwen/Qwen3-Coder-Next-TEE"
+        elif model == "XiaomiMiMo/MiMo-V2-Flash":
+            payload["model"] = "XiaomiMiMo/MiMo-V2-Flash-TEE"
 
         # No file support currently.
         if isinstance(payload.get("messages"), list):

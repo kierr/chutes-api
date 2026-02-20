@@ -65,7 +65,7 @@ from api.bounty.util import (
     set_chute_disabled,
 )
 from api.instance.schemas import Instance
-from api.instance.util import get_chute_target_manager
+from api.instance.util import get_chute_target_manager, cleanup_instance_conn_tracking
 from api.user.schemas import User, PriceOverride
 from api.user.service import get_current_user, chutes_user_id, subnet_role_accessible
 from api.image.schemas import Image
@@ -1012,6 +1012,11 @@ async def delete_chute(
     await db.delete(chute)
 
     await db.commit()
+
+    # Clean up Redis connection tracking for all deleted instances.
+    for instance_id in instance_ids:
+        await cleanup_instance_conn_tracking(chute_id, instance_id)
+
     await settings.redis_client.publish(
         "miner_broadcast",
         json.dumps(
