@@ -1159,22 +1159,6 @@ async def _validate_launch_config_instance(
             )
         validated_cacert = tls_cert
 
-        # Live TLS verification: connect to logging port and verify served cert.
-        log_port_mapping = next((p for p in args.port_mappings if p.internal_port == 8001), None)
-        if log_port_mapping:
-            live_ok = await _verify_instance_tls_live(
-                args.host, log_port_mapping.external_port, tls_cert
-            )
-            if not live_ok:
-                logger.error(f"{log_prefix} live TLS cert verification failed")
-                launch_config.failed_at = func.now()
-                launch_config.verification_error = "Live TLS certificate verification failed"
-                await db.commit()
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Live TLS certificate verification failed — cert mismatch or unreachable",
-                )
-
     # Create the instance now that we've verified the envdump/k8s env.
     node_selector = NodeSelector(**chute.node_selector)
     extra_fields = {
@@ -1895,6 +1879,42 @@ async def claim_graval_launch_config(
     return response
 
 
+async def delayed_instance_tls_check(instance_id: str):
+    """Verify the chute port serves the expected TLS cert after activation."""
+    await asyncio.sleep(10)  # Wait for uvicorn to be listening.
+
+    async with get_session() as session:
+        instance = (
+            (await session.execute(select(Instance).where(Instance.instance_id == instance_id)))
+            .unique()
+            .scalar_one_or_none()
+        )
+        if not instance or not instance.active:
+            return
+        if not instance.cacert:
+            return
+        live_ok = await _verify_instance_tls_live(instance.host, instance.port, instance.cacert)
+        if not live_ok:
+            reason = (
+                f"Live TLS cert verification failed: "
+                f"{instance.instance_id=} {instance.miner_hotkey=} {instance.chute_id=}"
+            )
+            logger.error(reason)
+            await session.delete(instance)
+            await asyncio.create_task(notify_deleted(instance))
+            await session.execute(
+                text(
+                    "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = :instance_id"
+                ),
+                {"instance_id": instance.instance_id, "reason": reason},
+            )
+            await invalidate_instance_cache(instance.chute_id, instance_id=instance.instance_id)
+        else:
+            logger.success(
+                f"Live TLS cert verification passed: {instance.instance_id=} on {instance.host}:{instance.port}"
+            )
+
+
 async def delayed_instance_fs_check(instance_id: str):
     await asyncio.sleep(10)  # XXX wait for uvicorn to be listening.
 
@@ -2079,6 +2099,8 @@ async def activate_launch_config_instance(
         await invalidate_instance_cache(instance.chute_id, instance_id=instance.instance_id)
         await delete_bounty(chute.chute_id)
         asyncio.create_task(notify_activated(instance))
+        if instance.cacert:
+            asyncio.create_task(delayed_instance_tls_check(instance.instance_id))
     return {"ok": True}
 
 
