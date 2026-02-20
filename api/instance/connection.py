@@ -133,6 +133,20 @@ class _InstanceNetworkBackend(httpcore.AsyncNetworkBackend):
         await self._backend.sleep(seconds)
 
 
+class _AsyncStreamWrapper(httpx.AsyncByteStream):
+    """Wrap an httpcore async stream as an httpx AsyncByteStream."""
+
+    def __init__(self, core_stream):
+        self._stream = core_stream
+
+    async def __aiter__(self):
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self):
+        await self._stream.aclose()
+
+
 class _CoreTransport(httpx.AsyncBaseTransport):
     """Wrap a raw httpcore pool so httpx <-> httpcore request mapping works.
 
@@ -160,7 +174,7 @@ class _CoreTransport(httpx.AsyncBaseTransport):
         return httpx.Response(
             status_code=core_response.status,
             headers=core_response.headers,
-            stream=core_response.stream,
+            stream=_AsyncStreamWrapper(core_response.stream),
             extensions=core_response.extensions,
         )
 
