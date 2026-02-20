@@ -289,7 +289,7 @@ RUN python -m cllmv.pkg_hash > /tmp/package_hashes.json
             shutil.copy2(MANIFEST_DRIVER_PATH, build_driver_path)
             fsv_dockerfile_content += """COPY chutes-bcm.so /tmp/chutes-bcm.so
 COPY generate_manifest_driver.py /tmp/generate_manifest_driver.py
-RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
+RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --output /tmp/bytecode.manifest \
     --json-output /tmp/bytecode.manifest.json \
     --lib /tmp/chutes-bcm.so \
@@ -1137,7 +1137,7 @@ RUN python -m cllmv.pkg_hash > /tmp/package_hashes.json
                 shutil.copy2(MANIFEST_DRIVER_PATH, build_driver_path)
                 fsv_dockerfile_content += """COPY chutes-bcm.so /tmp/chutes-bcm.so
 COPY generate_manifest_driver.py /tmp/generate_manifest_driver.py
-RUN CFSV_OP="${CFSV_OP}" python3 /tmp/generate_manifest_driver.py \
+RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --output /tmp/bytecode.manifest \
     --json-output /tmp/bytecode.manifest.json \
     --lib /tmp/chutes-bcm.so \
