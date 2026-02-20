@@ -193,8 +193,8 @@ RUN rm -f /etc/chutesfs.index
 RUN usermod -aG root chutes || true
 RUN chmod g+rwx /usr/local/lib /usr/local/bin /usr/local/share /usr/local/share/man
 RUN chmod g+rwx /usr/local/lib/python3.12/dist-packages || true
-RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
-RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
+RUN find / -xdev -type f -name '*.pyc' -exec rm -f {{}} \\; || true
+RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN pip install chutes=={image.chutes_version}
@@ -1041,9 +1041,10 @@ RUN rm -f /etc/chutesfs.index
 RUN usermod -aG root chutes || true
 RUN chmod g+rwx /usr/local/lib /usr/local/bin /usr/local/share /usr/local/share/man
 RUN chmod g+rwx /usr/local/lib/python3.12/dist-packages || true
-RUN find / -type f -name '*.pyc' -exec rm -f {{}} \\; || true
-RUN find / -type d -name __pycache__ -exec rm -rf {{}} \\; || true
+RUN find / -xdev -type f -name '*.pyc' -exec rm -f {{}} \\; || true
+RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
+ENV PYTHONDONTWRITEBYTECODE=1
 RUN pip install chutes=={chutes_version}
 """
             # v4 (aegis) vs v3 (netnanny+logintercept) .so injection
