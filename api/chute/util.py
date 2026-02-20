@@ -743,7 +743,9 @@ async def _invoke_one(
                         key, manager.concurrency, ex=manager.connection_expiry
                     )
                     await track_capacity(
-                        manager.chute_id, manager.concurrency, manager.concurrency,
+                        manager.chute_id,
+                        manager.concurrency,
+                        manager.concurrency,
                         instance_utilization=1.0,
                     )
                 except Exception:
