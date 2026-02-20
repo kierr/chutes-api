@@ -198,6 +198,7 @@ RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN pip install chutes=={image.chutes_version}
+RUN uv cache clean --force
 """
         # v4 (aegis) vs v3 (netnanny+logintercept) .so injection
         if semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
@@ -262,7 +263,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 COPY cfsv /cfsv
-RUN uv cache clean --force
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
 USER root
 RUN cp -f /tmp/chutesfs.index /etc/chutesfs.index && chmod a+r /etc/chutesfs.index
@@ -1046,6 +1046,7 @@ RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN pip install chutes=={chutes_version}
+RUN uv cache clean --force
 """
             # v4 (aegis) vs v3 (netnanny+logintercept) .so injection
             if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
@@ -1110,7 +1111,6 @@ RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 COPY cfsv /cfsv
 USER chutes
-RUN uv cache clean --force
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
 USER root
 RUN cp -f /tmp/chutesfs.index /etc/chutesfs.index && chmod a+r /etc/chutesfs.index
