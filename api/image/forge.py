@@ -273,13 +273,6 @@ RUN cp -f /tmp/chutesfs.index /etc/chutesfs.index && chmod a+r /etc/chutesfs.ind
 USER chutes
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv collect / /etc/chutesfs.index /tmp/chutesfs.data
 """
-        if semcomp(image.chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
-            from api.user.service import chutes_user_id
-
-            if image.user_id == await chutes_user_id():
-                fsv_dockerfile_content += """
-RUN python -m cllmv.pkg_hash > /tmp/package_hashes.json
-"""
 
         # Generate bytecode manifest (V2) for chutes >= 0.5.5.
         build_bcm_path = os.path.join(build_dir, "chutes-bcm.so")
@@ -298,6 +291,13 @@ RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --json-output /tmp/bytecode.manifest.json \
     --lib /tmp/chutes-bcm.so \
     --extra-dirs /usr/local/lib/python3.12/site-packages
+"""
+        if semcomp(image.chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
+            from api.user.service import chutes_user_id
+
+            if image.user_id == await chutes_user_id():
+                fsv_dockerfile_content += """
+RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 """
 
         fsv_dockerfile_path = os.path.join(build_dir, "Dockerfile.fsv")
@@ -1124,13 +1124,6 @@ RUN cp -f /tmp/chutesfs.index /etc/chutesfs.index && chmod a+r /etc/chutesfs.ind
 USER chutes
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv collect / /etc/chutesfs.index /tmp/chutesfs.data
 """
-            if semcomp(chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
-                from api.user.service import chutes_user_id
-
-                if image.user_id == await chutes_user_id():
-                    fsv_dockerfile_content += """
-RUN python -m cllmv.pkg_hash > /tmp/package_hashes.json
-"""
 
             # Generate bytecode manifest (V2) for chutes >= 0.5.5.
             build_bcm_path = os.path.join(build_dir, "chutes-bcm.so")
@@ -1149,6 +1142,14 @@ RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --json-output /tmp/bytecode.manifest.json \
     --lib /tmp/chutes-bcm.so \
     --extra-dirs /usr/local/lib/python3.12/site-packages
+"""
+
+            if semcomp(chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
+                from api.user.service import chutes_user_id
+
+                if image.user_id == await chutes_user_id():
+                    fsv_dockerfile_content += """
+RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 """
 
             fsv_dockerfile_path = os.path.join(build_dir, "Dockerfile.fsv")
