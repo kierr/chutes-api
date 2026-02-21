@@ -16,7 +16,7 @@ from api.config import settings
 from api.chute.schemas import RollingUpdate, Chute
 from api.database import get_session
 from api.instance.schemas import Instance
-from api.instance.util import invalidate_instance_cache
+from api.instance.util import invalidate_instance_cache, cleanup_instance_conn_tracking
 from api.util import encrypt_instance_request, notify_deleted, semcomp
 from api.chute.util import get_one
 from watchtower import check_runint
@@ -106,6 +106,7 @@ async def _hard_delete_instance(session, instance: Instance, reason: str) -> Non
     await notify_deleted(instance, message=reason)
     await invalidate_instance_cache(instance.chute_id, instance_id=instance.instance_id)
     await session.commit()
+    await cleanup_instance_conn_tracking(instance.chute_id, instance.instance_id)
 
 
 async def _record_failure_or_delete(session, instance: Instance, hard_reason: str | None) -> None:

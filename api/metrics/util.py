@@ -9,7 +9,7 @@ to keep prometheus utilization gauges current between requests.
 import asyncio
 from loguru import logger
 from api.config import settings
-from api.instance.util import load_chute_target
+from api.instance.util import load_chute_target, cleanup_instance_conn_tracking
 from api.miner_client import get as miner_get
 from api.metrics.capacity import track_capacity
 
@@ -39,7 +39,8 @@ async def _reconcile_instance(chute_id: str, instance_id: str) -> bool:
     redis_client = settings.redis_client
     instance = await load_chute_target(instance_id)
     if not instance:
-        return False
+        await cleanup_instance_conn_tracking(chute_id, instance_id)
+        return True
 
     stats = await _query_conn_stats(instance)
     key = f"cc:{chute_id}:{instance_id}"
