@@ -7,8 +7,7 @@ import httpcore
 from collections import OrderedDict
 from cryptography import x509
 from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
 from api.util import semcomp
 
 _POOL_MAX = 2048
@@ -37,20 +36,10 @@ def _get_ssl_and_cn(instance) -> tuple[ssl.SSLContext, str]:
     ctx.load_verify_locations(cadata=ca_pem)
 
     # Load mTLS client cert if available.
+    # Client key is sent unencrypted (no passphrase) from the miner.
     client_cert_pem = extra.get("client_cert")
     client_key_pem = extra.get("client_key")
-    client_key_password = extra.get("client_key_password")
     if client_cert_pem and client_key_pem:
-        # Decrypt the client key and load into SSL context.
-        password_bytes = client_key_password.encode() if client_key_password else None
-        client_key = load_pem_private_key(client_key_pem.encode(), password=password_bytes)
-        # Re-serialize unencrypted (in memory only, never written to disk).
-        client_key_unencrypted = client_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        # Write to temporary in-memory for ssl context (load_cert_chain requires files).
         import tempfile
         import os
 
@@ -58,7 +47,7 @@ def _get_ssl_and_cn(instance) -> tuple[ssl.SSLContext, str]:
             cf.write(client_cert_pem.encode())
             cert_tmp = cf.name
         with tempfile.NamedTemporaryFile(mode="wb", suffix=".pem", delete=False) as kf:
-            kf.write(client_key_unencrypted)
+            kf.write(client_key_pem.encode())
             key_tmp = kf.name
         try:
             ctx.load_cert_chain(certfile=cert_tmp, keyfile=key_tmp)

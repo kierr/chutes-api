@@ -1169,11 +1169,11 @@ async def _validate_launch_config_instance(
     if tls_ca_cert:
         extra_fields["ca_cert"] = tls_ca_cert
     # Store mTLS client cert + key for API-to-instance connections.
+    # Client key is unencrypted (no passphrase).
     tls_client_cert = getattr(args, "tls_client_cert", None)
     if tls_client_cert:
         extra_fields["client_cert"] = tls_client_cert
         extra_fields["client_key"] = getattr(args, "tls_client_key", None)
-        extra_fields["client_key_password"] = getattr(args, "tls_client_key_password", None)
 
     instance = Instance(
         instance_id=new_instance_id,
