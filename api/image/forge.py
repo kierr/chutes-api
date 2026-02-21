@@ -297,6 +297,9 @@ RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
 
             if image.user_id == await chutes_user_id():
                 fsv_dockerfile_content += """
+USER root
+RUN cp -f /tmp/bytecode.manifest /etc/bytecode.manifest || true
+USER chutes
 RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 """
 
@@ -1156,6 +1159,9 @@ RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
 
                 if image.user_id == await chutes_user_id():
                     fsv_dockerfile_content += """
+USER root
+RUN cp -f /tmp/bytecode.manifest /etc/bytecode.manifest || true
+USER chutes
 RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 """
 
