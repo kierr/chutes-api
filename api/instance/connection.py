@@ -1,6 +1,7 @@
 """Instance connection helpers — httpx + HTTP/2 with TLS cert verification."""
 
 import ssl
+import socket
 import asyncio
 import httpx
 import httpcore
@@ -11,6 +12,15 @@ from cryptography.x509.oid import NameOID
 from api.util import semcomp
 
 _POOL_MAX = 2048
+
+# Aggressive TCP keepalive: detect dead peers in ~40s.
+# 15s idle before first probe, then probe every 5s, give up after 5 failures.
+_KEEPALIVE_SOCK_OPTS = [
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5),
+]
 
 # LRU caches keyed by instance_id — oldest entries evicted when full.
 _ssl_cache: OrderedDict[str, tuple[ssl.SSLContext, str]] = OrderedDict()
@@ -202,6 +212,7 @@ async def get_instance_client(instance, timeout: int = 600) -> tuple[httpx.Async
             ssl_context=ssl_ctx,
             http2=True,
             network_backend=_InstanceNetworkBackend(hostname=cn, ip=instance.host),
+            socket_options=_KEEPALIVE_SOCK_OPTS,
         )
         client = httpx.AsyncClient(
             transport=_CoreTransport(pool),

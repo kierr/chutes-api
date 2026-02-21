@@ -5,6 +5,7 @@ Application logic and utilities for chutes.
 import os
 import ctypes
 import httpx
+import httpcore
 import asyncio
 import re
 import uuid
@@ -792,7 +793,9 @@ async def _invoke_one(
         and chute.standard_template == "vllm"
         and plain_path.endswith("_stream")
     ):
-        # No timeouts for streaming LLM calls with newer chutes lib versions.
+        # No read timeout for streaming LLM calls — prefill on large prompts
+        # can legitimately take minutes. Dead connections are caught by TCP
+        # keepalive probes on the socket instead (see connection.py).
         timeout = None
     if semcomp(target.chutes_version or "0.0.0", "0.3.59") < 0:
         timeout = 600
@@ -1761,6 +1764,24 @@ async def invoke(
                 return
             except Exception as exc:
                 avoid.append(target.instance_id)
+
+                # Evict cached connection on transport/connection errors so
+                # subsequent retries or requests don't reuse a dead socket.
+                if isinstance(
+                    exc,
+                    (
+                        httpx.NetworkError,
+                        httpx.RemoteProtocolError,
+                        httpcore.NetworkError,
+                        httpcore.RemoteProtocolError,
+                        ConnectionError,
+                        OSError,
+                    ),
+                ):
+                    from api.instance.connection import evict_instance_ssl
+
+                    evict_instance_ssl(str(target.instance_id))
+
                 error_message = f"{exc}\n{traceback.format_exc()}"
                 error_message = error_message.replace(
                     f"{target.host}:{target.port}", "[host redacted]"
