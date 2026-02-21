@@ -153,6 +153,21 @@ async def is_instance_disabled(instance_id: str) -> bool:
     return disabled is not None
 
 
+async def batch_check_disabled(instance_ids: list[str]) -> set[str]:
+    """Return the set of instance IDs that are currently disabled (single MGET)."""
+    if not instance_ids:
+        return set()
+    keys = [f"instance_disabled:{iid}" for iid in instance_ids]
+    try:
+        values = await settings.redis_client.client.mget(keys)
+        if not values:
+            return set()
+        return {iid for iid, v in zip(instance_ids, values) if v is not None}
+    except Exception as e:
+        logger.error(f"Error batch checking disabled instances: {e}")
+        return set()
+
+
 async def get_instance_disable_count(instance_id: str) -> int:
     count = await settings.redis_client.get(f"instance_disable_count:{instance_id}")
     if count is None:
@@ -536,10 +551,11 @@ class LeastConnManager:
                 yield None, "No infrastructure available to serve request"
                 return
 
-            # Find first non-disabled instance (lazy check with caching)
+            # Find first non-disabled instance (single MGET instead of N GETs)
+            disabled_ids = await batch_check_disabled([t.instance_id for t in targets])
             instance = None
             for candidate in targets:
-                if not await is_instance_disabled(candidate.instance_id):
+                if candidate.instance_id not in disabled_ids:
                     instance = candidate
                     break
 
@@ -554,11 +570,10 @@ class LeastConnManager:
 
             key = f"cc:{self.chute_id}:{instance.instance_id}"
             try:
-                await asyncio.wait_for(
-                    self.redis_client.client.incr(key),
-                    timeout=3.0,
-                )
-                await self.redis_client.expire(key, self.connection_expiry)
+                pipe = self.redis_client.client.pipeline()
+                pipe.incr(key)
+                pipe.expire(key, self.connection_expiry)
+                await asyncio.wait_for(pipe.execute(), timeout=3.0)
             except asyncio.TimeoutError:
                 logger.warning(
                     f"Timeout incrementing connection count for {instance.instance_id}, proceeding anyway"
