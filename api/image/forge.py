@@ -264,7 +264,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 USER root
-RUN rm -f /etc/bytecode.manifest /tmp/chutesfs.index /etc/chutesfs.index /tmp/chutesfs.data
+RUN rm -f /etc/ld.so.preload /etc/bytecode.manifest /tmp/chutesfs.index /etc/chutesfs.index /tmp/chutesfs.data
 USER chutes
 COPY cfsv /cfsv
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
@@ -364,7 +364,6 @@ RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 FROM {chutes_tag}
 COPY --from=fsv /etc/chutesfs.index /etc/chutesfs.index
 ENV PYTHONDONTWRITEBYTECODE=1
-ENTRYPOINT []
 """
         # Include bytecode manifest in final image if it was generated.
         if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
@@ -372,6 +371,14 @@ ENTRYPOINT []
             final_dockerfile_content += (
                 "COPY --from=fsv /tmp/bytecode.manifest /etc/bytecode.manifest\n"
             )
+        if semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
+            final_dockerfile_content += (
+                "USER root\n"
+                "RUN printf '/usr/local/lib/chutes-aegis.so\\\\n' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"
+                "USER chutes\n"
+                "ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so\n"
+            )
+        final_dockerfile_content += "ENTRYPOINT []\n"
         final_dockerfile_path = os.path.join(build_dir, "Dockerfile.final")
         with open(final_dockerfile_path, "w") as f:
             f.write(final_dockerfile_content)
@@ -1115,7 +1122,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN rm -rf does_not_exist.py does_not_exist
 RUN PS_OP="${{PS_OP}}" chutes run does_not_exist:chute --generate-inspecto-hash > /tmp/inspecto.hash
 USER root
-RUN rm -f /etc/bytecode.manifest /tmp/chutesfs.index /etc/chutesfs.index /tmp/chutesfs.data
+RUN rm -f /etc/ld.so.preload /etc/bytecode.manifest /tmp/chutesfs.index /etc/chutesfs.index /tmp/chutesfs.data
 USER chutes
 COPY cfsv /cfsv
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv index / /tmp/chutesfs.index
@@ -1234,7 +1241,6 @@ RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 FROM {updated_tag} as base
 COPY --from=fsv /tmp/chutesfs.index /etc/chutesfs.index
 ENV PYTHONDONTWRITEBYTECODE=1
-ENTRYPOINT []
 """
             # Include bytecode manifest in final image if it was generated.
             if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
@@ -1242,6 +1248,14 @@ ENTRYPOINT []
                 final_dockerfile_content += (
                     "COPY --from=fsv /tmp/bytecode.manifest /etc/bytecode.manifest\n"
                 )
+            if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
+                final_dockerfile_content += (
+                    "USER root\n"
+                    "RUN printf '/usr/local/lib/chutes-aegis.so\\\\n' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"
+                    "USER chutes\n"
+                    "ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so\n"
+                )
+            final_dockerfile_content += "ENTRYPOINT []\n"
             final_dockerfile_path = os.path.join(build_dir, "Dockerfile.final")
             with open(final_dockerfile_path, "w") as f:
                 f.write(final_dockerfile_content)
