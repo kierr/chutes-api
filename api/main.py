@@ -43,6 +43,7 @@ from api.chute.util import chute_id_by_slug
 from api.database import Base, engine, get_session
 from api.config import settings
 from api.metrics.util import keep_gauges_fresh
+from api.instance.util import start_instance_invalidation_listener
 
 
 async def loop_lag_monitor(interval: float = 0.1, warn_threshold: float = 0.2):
@@ -103,6 +104,7 @@ async def lifespan(_: FastAPI):
 
     asyncio.create_task(loop_lag_monitor())
     asyncio.create_task(keep_gauges_fresh())
+    asyncio.create_task(start_instance_invalidation_listener())
 
     # Prom multi-proc dir.
     os.makedirs("/tmp/prometheus_multiproc", exist_ok=True)

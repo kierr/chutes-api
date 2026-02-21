@@ -320,6 +320,70 @@ async def clear_instance_disable_state(instance_id: str) -> None:
 MANAGERS = {}
 
 
+async def remove_instance_from_manager(chute_id: str, instance_id: str):
+    """Remove a deleted instance from the local MANAGERS dict."""
+    manager = MANAGERS.get(chute_id)
+    if manager:
+        async with manager.lock:
+            manager.instances.pop(instance_id, None)
+
+
+async def start_instance_invalidation_listener():
+    """
+    Subscribe to Redis 'events' channel and invalidate local caches
+    when instances are deleted, so all API pods stay in sync.
+    """
+    import redis.asyncio as aioredis
+    import orjson
+
+    while True:
+        pubsub = None
+        try:
+            client = aioredis.Redis(
+                host=settings.redis_host,
+                port=settings.redis_port,
+                db=settings.redis_db,
+                password=settings.redis_password,
+                socket_connect_timeout=2.5,
+                socket_timeout=60,
+                socket_keepalive=True,
+                retry_on_timeout=True,
+            )
+            pubsub = client.pubsub()
+            await pubsub.subscribe("events")
+            logger.info("Instance invalidation listener subscribed to 'events' channel")
+
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                try:
+                    data = orjson.loads(message["data"])
+                    if data.get("reason") != "instance_deleted":
+                        continue
+                    payload = data.get("data", {})
+                    chute_id = payload.get("chute_id")
+                    instance_id = payload.get("instance_id")
+                    if not chute_id or not instance_id:
+                        continue
+                    logger.info(
+                        f"Pubsub: invalidating cache for deleted instance {instance_id} "
+                        f"of chute {chute_id}"
+                    )
+                    await invalidate_instance_cache(chute_id, instance_id=instance_id)
+                    await remove_instance_from_manager(chute_id, instance_id)
+                except Exception as exc:
+                    logger.warning(f"Error processing pubsub message: {exc}")
+        except Exception as exc:
+            logger.warning(f"Instance invalidation listener error: {exc}, reconnecting in 2s")
+        finally:
+            if pubsub:
+                try:
+                    await pubsub.close()
+                except Exception:
+                    pass
+        await asyncio.sleep(2)
+
+
 class LeastConnManager:
     def __init__(
         self,
@@ -480,7 +544,12 @@ class LeastConnManager:
                     break
 
             if not instance:
-                yield None, "infra_overload"
+                # Check if there are actually any active instances (bypass LRU cache).
+                real_ids = await load_chute_target_ids(self.chute_id, nonce=int(time.time()))
+                if not real_ids:
+                    yield None, "No infrastructure available to serve request"
+                else:
+                    yield None, "infra_overload"
                 return
 
             key = f"cc:{self.chute_id}:{instance.instance_id}"
