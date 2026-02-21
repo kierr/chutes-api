@@ -374,7 +374,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
         if semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
             final_dockerfile_content += (
                 "USER root\n"
-                "RUN printf '/usr/local/lib/chutes-aegis.so\\\\n' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"
+                "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload\n"
                 "USER chutes\n"
                 "ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so\n"
             )
@@ -1251,7 +1251,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
             if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
                 final_dockerfile_content += (
                     "USER root\n"
-                    "RUN printf '/usr/local/lib/chutes-aegis.so\\\\n' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"
+                    "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload\n"
                     "USER chutes\n"
                     "ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so\n"
                 )
