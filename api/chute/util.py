@@ -1936,26 +1936,34 @@ async def load_llm_details(chute, target):
     path, _ = await asyncio.to_thread(
         encrypt_instance_request, "/get_models".ljust(24, "?"), target, True
     )
-    payload = {
-        "args": base64.b64encode(gzip.compress(pickle.dumps(tuple()))).decode(),
-        "kwargs": base64.b64encode(gzip.compress(pickle.dumps({}))).decode(),
-    }
-    payload, iv = await asyncio.to_thread(encrypt_instance_request, json.dumps(payload), target)
+    use_new_format = semcomp(target.chutes_version or "0.0.0", "0.5.5") >= 0
+    if use_new_format:
+        payload_bytes = gzip.compress(json.dumps({}))
+    else:
+        payload_bytes = json.dumps(
+            {
+                "args": base64.b64encode(gzip.compress(pickle.dumps(tuple()))).decode(),
+                "kwargs": base64.b64encode(gzip.compress(pickle.dumps({}))).decode(),
+            }
+        )
+    payload, iv = await asyncio.to_thread(encrypt_instance_request, payload_bytes, target)
 
     session, pooled = await get_miner_session(target, timeout=60)
     llm_timeout = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
     try:
         headers, payload_string = sign_request(miner_ss58=target.miner_hotkey, payload=payload)
-        headers["X-Chutes-Serialized"] = "true"
+        if not use_new_format:
+            headers["X-Chutes-Serialized"] = "true"
         resp = await session.post(
             f"/{path}", content=payload_string, headers=headers, timeout=llm_timeout
         )
         resp.raise_for_status()
         raw_data = resp.json()
         logger.info(f"{target.chute_id=} {target.instance_id=} {target.miner_hotkey=}: {raw_data=}")
-        info = json.loads(
-            await asyncio.to_thread(decrypt_instance_response, raw_data["json"], target, iv)
-        )
+        plaintext = await asyncio.to_thread(decrypt_instance_response, raw_data["json"], target, iv)
+        if use_new_format:
+            plaintext = gzip.decompress(plaintext)
+        info = json.loads(plaintext)
         return info["data"][0]
     finally:
         if not pooled:
