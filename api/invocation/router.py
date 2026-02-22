@@ -93,6 +93,16 @@ def _derive_upstream_status(error: object) -> int | None:
     return None
 
 
+def _quota_headers(request, base_headers=None):
+    headers = dict(base_headers or {})
+    if getattr(request.state, "quota_total", None) is not None:
+        headers["X-Chutes-Quota-Total"] = str(int(request.state.quota_total))
+        headers["X-Chutes-Quota-Used"] = str(int(request.state.quota_used))
+        remaining = max(0, request.state.quota_total - request.state.quota_used)
+        headers["X-Chutes-Quota-Remaining"] = str(int(remaining))
+    return headers
+
+
 @router.get("/usage")
 async def get_usage(request: Request):
     """
@@ -482,6 +492,10 @@ async def _invoke(
             # When within the quota, mark the invocation as "free" so no balance is deducted when finished.
             request.state.free_invocation = True
 
+        # Store quota info for response headers.
+        request.state.quota_total = quota
+        request.state.quota_used = request_count
+
     # Identify the cord that we'll trying to access by the public API path and method.
     selected_cord = None
     request_body = None
@@ -735,7 +749,7 @@ async def _invoke(
             return StreamingResponse(
                 _stream_with_first_chunk(),
                 media_type="text/event-stream",
-                headers={"X-Chutes-InvocationID": parent_invocation_id},
+                headers=_quota_headers(request, {"X-Chutes-InvocationID": parent_invocation_id}),
             )
 
         except HTTPException:
@@ -777,22 +791,22 @@ async def _invoke(
                 response = StreamingResponse(
                     _streamfile(),
                     media_type=result["content_type"],
-                    headers={"X-Chutes-InvocationID": parent_invocation_id},
+                    headers=_quota_headers(request, {"X-Chutes-InvocationID": parent_invocation_id}),
                 )
             elif "text" in result:
                 response = Response(
                     content=result["text"],
                     media_type=result["content_type"],
-                    headers={"X-Chutes-InvocationID": parent_invocation_id},
+                    headers=_quota_headers(request, {"X-Chutes-InvocationID": parent_invocation_id}),
                 )
             else:
                 response = Response(
                     content=json.dumps(result.get("json", result)).decode(),
                     media_type="application/json",
-                    headers={
+                    headers=_quota_headers(request, {
                         "Content-type": "application/json",
                         "X-Chutes-InvocationID": parent_invocation_id,
-                    },
+                    }),
                 )
         elif chunk.startswith('data: {"error"'):
             chunk_data = json.loads(chunk[6:])
