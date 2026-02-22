@@ -185,13 +185,20 @@ class _InstanceInfo:
         self.config_id = config_id
 
 
+def cm_redis_shard(chute_id: str):
+    """Get the sharded cm_redis client for a chute's connection counting.
+    Uses first 8 hex chars of the UUID for deterministic sharding
+    (Python's hash() is randomized per-process via PYTHONHASHSEED)."""
+    clients = settings.cm_redis_client
+    return clients[int(chute_id[:8], 16) % len(clients)]
+
+
 async def cleanup_instance_conn_tracking(chute_id: str, instance_id: str):
     """Remove a deleted instance from Redis connection tracking sets/keys."""
     try:
-        pipe = settings.redis_client.client.pipeline()
-        pipe.srem(f"cc_inst:{chute_id}", instance_id)
-        pipe.delete(f"cc:{chute_id}:{instance_id}")
-        await pipe.execute()
+        # Enumeration key on primary redis.
+        await settings.redis_client.client.srem(f"cc_inst:{chute_id}", instance_id)
+        await cm_redis_shard(chute_id).delete(f"cc:{chute_id}:{instance_id}")
     except Exception as e:
         logger.warning(f"Failed to clean up connection tracking for {instance_id}: {e}")
 
@@ -409,7 +416,8 @@ class LeastConnManager:
     ):
         self.concurrency = concurrency or 1
         self.chute_id = chute_id
-        self.redis_client = settings.redis_client
+        # Shard connection counting across cm_redis backends.
+        self.redis_client = cm_redis_shard(chute_id)
         self.instances = {instance.instance_id: instance for instance in instances}
         self.connection_expiry = connection_expiry
         self.mean_count = None
@@ -528,9 +536,10 @@ class LeastConnManager:
         return result
 
     async def _track_active(self, instance_id: str):
-        """Fire-and-forget tracking of active chutes/instances for gauge enumeration."""
+        """Fire-and-forget tracking of active chutes/instances for gauge enumeration.
+        Uses primary redis for enumeration keys (low-throughput metadata)."""
         try:
-            pipe = self.redis_client.client.pipeline()
+            pipe = settings.redis_client.client.pipeline()
             pipe.sadd("active_chutes", self.chute_id)
             pipe.expire("active_chutes", self.connection_expiry)
             pipe.sadd(f"cc_inst:{self.chute_id}", instance_id)
@@ -542,6 +551,20 @@ class LeastConnManager:
 
     @asynccontextmanager
     async def get_target(self, avoid=[], prefixes=None):
+        # Single-instance fast path: skip connection counting, just check disabled.
+        if len(self.instances) == 1:
+            instance = next(iter(self.instances.values()))
+            if instance.instance_id in avoid:
+                yield None, "No infrastructure available to serve request"
+            else:
+                disabled_ids = await batch_check_disabled([instance.instance_id])
+                if instance.instance_id in disabled_ids:
+                    yield None, "infra_overload"
+                else:
+                    asyncio.create_task(self._track_active(instance.instance_id))
+                    yield instance, None
+            return
+
         instance = None
         try:
             targets = await asyncio.wait_for(

@@ -223,23 +223,16 @@ async def e2e_invoke(
         encrypt_instance_request, request_path.ljust(24, "?"), instance, True
     )
 
-    # Connection tracking.
+    # Connection tracking (INCR/DECR, same as LeastConnManager.get_target).
     conn_id = str(uuid.uuid4())
     manager = MANAGERS.get(chute_id)
     if manager:
         try:
-            key = f"conn:{chute_id}:{instance_id}"
-            await asyncio.wait_for(
-                manager.redis_client.eval(
-                    manager.lua_add_connection,
-                    1,
-                    key,
-                    conn_id,
-                    int(time.time()),
-                    manager.connection_expiry,
-                ),
-                timeout=3.0,
-            )
+            key = f"cc:{chute_id}:{instance_id}"
+            pipe = manager.redis_client.client.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, manager.connection_expiry)
+            await asyncio.wait_for(pipe.execute(), timeout=3.0)
         except Exception as e:
             logger.warning(f"E2E: Error tracking connection: {e}")
 
@@ -579,16 +572,13 @@ async def _cleanup(session, response, manager, chute_id, instance_id, conn_id, p
             pass
     if manager:
         try:
-            key = f"conn:{chute_id}:{instance_id}"
-            await asyncio.shield(
-                manager.redis_client.eval(
-                    manager.lua_remove_connection,
-                    1,
-                    key,
-                    conn_id,
-                    int(time.time()),
-                    manager.connection_expiry,
-                )
-            )
+            key = f"cc:{chute_id}:{instance_id}"
+
+            async def _decr():
+                val = await manager.redis_client.client.decr(key)
+                if val < 0:
+                    await manager.redis_client.client.set(key, 0, ex=manager.connection_expiry)
+
+            await asyncio.shield(_decr())
         except Exception as e:
             logger.warning(f"E2E: Error cleaning up connection {conn_id}: {e}")

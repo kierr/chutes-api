@@ -220,8 +220,6 @@ UNIFIED_INVOCATION_INSERT_LEGACY = text(
 )
 UNIFIED_INVOCATION_INSERT = text(
     f"""{BASE_UNIFIED_INVOCATION_INSERT}
-ON CONFLICT (invocation_id, started_at)
-    DO UPDATE SET invocation_id = EXCLUDED.invocation_id
 {UNIFIED_INVOCATION_RV}""".format(table_name="invocations")
 )
 

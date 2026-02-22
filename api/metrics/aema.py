@@ -3,9 +3,8 @@ Helper for redis-based adaptive exponential moving average tracking.
 """
 
 import time
-import uuid
 import redis
-from api.config import settings
+from api.instance.util import cm_redis_shard
 
 
 class AdaptiveEMA:
@@ -98,7 +97,7 @@ class AdaptiveEMA:
         """
         Update the adaptive EMA metrics.
         """
-        client = settings.cm_redis_client[uuid.UUID(key).int % len(settings.cm_redis_client)]
+        client = cm_redis_shard(key)
         await self._ensure_script(client)
         try:
             result = await client.evalsha(
@@ -134,7 +133,7 @@ class AdaptiveEMA:
         """
         Get current state information.
         """
-        client = settings.cm_redis_client[uuid.UUID(key).int % len(settings.cm_redis_client)]
+        client = cm_redis_shard(key)
         data = await client.hgetall(f"{self.key_prefix}:{key}")
         if not data:
             return None
