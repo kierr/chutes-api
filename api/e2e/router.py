@@ -43,8 +43,11 @@ from api.miner_client import sign_request
 from api.rate_limit import rate_limit
 from api.gpu import COMPUTE_UNIT_PRICE_BASIS
 from api.user.service import chutes_user_id, subnet_role_accessible
-from api.invocation.router import _quota_headers, DEFAULT_RATE_LIMIT
-from api.permissions import Permissioning
+from api.invocation.util import (
+    resolve_rate_limit_headers,
+    build_response_headers,
+    check_quota_and_balance,
+)
 
 router = APIRouter()
 
@@ -209,19 +212,8 @@ async def e2e_invoke(
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chute not found")
 
-    # Resolve per-user rate limit headers.
-    request.state.invoice_billing = current_user.has_role(Permissioning.invoice_billing)
-    if not chute.public:
-        request.state.rl_user = "inf"
-    else:
-        overrides = current_user.rate_limit_overrides or {}
-        chute_rl = overrides.get(chute.chute_id)
-        global_rl = overrides.get("*")
-        if chute_rl is not None:
-            request.state.rl_chute = chute_rl
-            request.state.rl_user = global_rl if global_rl is not None else DEFAULT_RATE_LIMIT
-        else:
-            request.state.rl_user = global_rl if global_rl is not None else DEFAULT_RATE_LIMIT
+    resolve_rate_limit_headers(request, current_user, chute)
+    await check_quota_and_balance(request, current_user, chute)
 
     # Read raw E2E blob from request body.
     e2e_blob = await request.body()
@@ -337,7 +329,7 @@ async def e2e_invoke(
                     pooled,
                 ),
                 media_type="text/event-stream",
-                headers=_quota_headers(request),
+                headers=build_response_headers(request),
             )
         else:
             # Non-streaming: read full response, transport-decrypt, relay.
@@ -369,7 +361,7 @@ async def e2e_invoke(
             return Response(
                 content=decrypted,
                 media_type="application/octet-stream",
-                headers=_quota_headers(request),
+                headers=build_response_headers(request),
             )
 
     except HTTPException:

@@ -15,7 +15,7 @@ import decimal
 import traceback
 from loguru import logger
 from pydantic import BaseModel, ValidationError, Field
-from datetime import date, datetime, timedelta, UTC
+from datetime import date, datetime
 from io import BytesIO, StringIO
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
@@ -30,18 +30,19 @@ from api.chute.util import (
     is_shared,
     count_prompt_tokens,
 )
-from api.util import (
-    recreate_vlm_payload,
-    has_legacy_private_billing,
-)
-from api.user.schemas import User, InvocationQuota
-from api.user.service import get_current_user, chutes_user_id, subnet_role_accessible
+from api.util import recreate_vlm_payload
+from api.user.schemas import User
+from api.user.service import get_current_user, subnet_role_accessible
 from api.report.schemas import Report, ReportArgs
 from api.database import get_db_session, get_session, get_inv_session, get_db_ro_session
 from api.instance.util import get_chute_target_manager
-from api.invocation.util import get_prompt_prefix_hashes, get_sponsored_chute_ids
+from api.invocation.util import (
+    get_prompt_prefix_hashes,
+    resolve_rate_limit_headers,
+    build_response_headers,
+    check_quota_and_balance,
+)
 from api.util import validate_tool_call_arguments
-from api.permissions import Permissioning
 
 router = APIRouter()
 host_invocation_router = APIRouter()
@@ -63,10 +64,6 @@ class DiffusionInput(BaseModel):
 
     class Config:
         extra = "forbid"
-
-
-async def initialize_quota_cache(cache_key: str) -> None:
-    await settings.redis_client.incrbyfloat(cache_key, 0.0)
 
 
 def _derive_upstream_status(error: object) -> int | None:
@@ -91,27 +88,6 @@ def _derive_upstream_status(error: object) -> int | None:
             return status.HTTP_503_SERVICE_UNAVAILABLE
 
     return None
-
-
-DEFAULT_RATE_LIMIT = 60
-
-
-def _quota_headers(request, base_headers=None):
-    headers = dict(base_headers or {})
-    if getattr(request.state, "quota_total", None) is not None:
-        headers["X-Chutes-Quota-Total"] = str(int(request.state.quota_total))
-        headers["X-Chutes-Quota-Used"] = str(int(request.state.quota_used))
-        remaining = max(0, request.state.quota_total - request.state.quota_used)
-        headers["X-Chutes-Quota-Remaining"] = str(int(remaining))
-    rl_user = getattr(request.state, "rl_user", None)
-    rl_chute = getattr(request.state, "rl_chute", None)
-    if rl_user is not None:
-        headers["X-Chutes-RL-User"] = str(rl_user) if rl_user == "inf" else str(int(rl_user))
-    if rl_chute is not None:
-        headers["X-Chutes-RL-Chute"] = str(int(rl_chute))
-    if getattr(request.state, "invoice_billing", False):
-        headers["X-Chutes-Invoice-Billing"] = "true"
-    return headers
 
 
 @router.get("/usage")
@@ -352,19 +328,7 @@ async def _invoke(
             status_code=status.HTTP_404_NOT_FOUND, detail="No matching chute found!"
         )
 
-    # Resolve per-user rate limit headers.
-    request.state.invoice_billing = current_user.has_role(Permissioning.invoice_billing)
-    if not chute.public:
-        request.state.rl_user = "inf"
-    else:
-        overrides = current_user.rate_limit_overrides or {}
-        chute_rl = overrides.get(chute.chute_id)
-        global_rl = overrides.get("*")
-        if chute_rl is not None:
-            request.state.rl_chute = chute_rl
-            request.state.rl_user = global_rl if global_rl is not None else DEFAULT_RATE_LIMIT
-        else:
-            request.state.rl_user = global_rl if global_rl is not None else DEFAULT_RATE_LIMIT
+    resolve_rate_limit_headers(request, current_user, chute)
 
     # Check if the chute is disabled.
     if chute.disabled:
@@ -381,145 +345,7 @@ async def _invoke(
             detail="This chute does not have TEE enabled. Use the /teeify endpoint to promote the chute to TEE, or remove the X-TEE-Only header.",
         )
 
-    quota_date = date.today()
-    if chute.discount == 1.0:
-        request.state.free_invocation = True
-
-        # Limit free model usage independently of quota.
-        if current_user.permissions_bitmask == 0:
-            effective_balance = (
-                current_user.current_balance.effective_balance
-                if current_user.current_balance
-                else 0.0
-            )
-            unlimited = False
-            if effective_balance >= 10:
-                unlimited = True
-            else:
-                quota = await InvocationQuota.get(current_user.user_id, "__anychute__")
-                if quota > 2000:
-                    unlimited = True
-            if not unlimited:
-                free_usage = 0
-                try:
-                    qkey = f"free_usage:{quota_date}:{current_user.user_id}"
-                    free_usage = await settings.redis_client.incr(qkey)
-                    if free_usage <= 3:
-                        tomorrow = datetime.combine(quota_date, datetime.min.time()) + timedelta(
-                            days=1
-                        )
-                        exp = max(int((tomorrow - datetime.now()).total_seconds()), 1)  # noqa
-                except Exception as exc:
-                    logger.warning(
-                        f"Error checking free usage for {current_user.user_id=}: {str(exc)}"
-                    )
-                if free_usage > 100:
-                    logger.warning(
-                        f"{current_user.user_id=} {current_user.username=} has hit daily free limit: {chute.name=} {effective_balance=}"
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="Free models limit reached for today - maintain >= $10 balance or upgrade subscription to pro to unlock more.",
-                    )
-    elif current_user.user_id == settings.or_free_user_id:
-        sponsored_chutes = await get_sponsored_chute_ids(current_user.user_id)
-        if chute.chute_id not in sponsored_chutes:
-            logger.warning(
-                f"Attempt to invoke {chute.chute_id=} {chute.name=} from openrouter free account."
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Invalid free model, please select from the updated list of current chutes free models",
-            )
-
-    # Check account balance.
-    origin_ip = request.headers.get("x-forwarded-for", "").split(",")[0]
-
-    # Prevent calling private chutes when the owner has no balance.
-    if (
-        not chute.public
-        and not has_legacy_private_billing(chute)
-        and chute.user_id != await chutes_user_id()
-    ):
-        owner_balance = (
-            chute.user.current_balance.effective_balance if chute.user.current_balance else 0.0
-        )
-        if owner_balance <= 0:
-            logger.warning(
-                f"Preventing execution of chute {chute.name=} {chute.chute_id=}, "
-                f"creator has insufficient balance {owner_balance=}"
-            )
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail="Chute unavailable because the creator of this chute {chute.user_id=} has zero balance.",
-            )
-        request.state.free_invocation = True
-
-    # Check account quotas if not free/invoiced.
-    quota_date = date.today()
-    if not (
-        current_user.has_role(Permissioning.free_account)
-        or current_user.has_role(Permissioning.invoice_billing)
-        or request.state.free_invocation
-    ):
-        quota = await InvocationQuota.get(current_user.user_id, chute.chute_id)
-        key = await InvocationQuota.quota_key(current_user.user_id, chute.chute_id)
-        client_success, cached = await settings.redis_client.get_with_status(key)
-        request_count = 0.0
-        if cached is not None:
-            try:
-                request_count = float(cached.decode())
-            except ValueError:
-                await settings.redis_client.delete(key)
-        elif client_success:
-            asyncio.create_task(initialize_quota_cache(key))
-
-        # No quota for private/user-created chutes.
-        effective_balance = (
-            current_user.current_balance.effective_balance if current_user.current_balance else 0.0
-        )
-        if (
-            not chute.public
-            and not has_legacy_private_billing(chute)
-            and chute.user_id != await chutes_user_id()
-        ):
-            quota = 0
-
-        # Automatically switch to paygo when the quota is exceeded.
-        if request_count >= quota:
-            if effective_balance <= 0 and not request.state.free_invocation:
-                logger.warning(
-                    f"Payment required: attempted invocation of {chute.name} "
-                    f"from user {current_user.username} [{origin_ip}] with no balance "
-                    f"and {request_count=} of {quota=}"
-                )
-                error_kwargs = {
-                    "status_code": status.HTTP_402_PAYMENT_REQUIRED,
-                    "detail": {
-                        "message": (
-                            f"Quota exceeded and account balance is ${current_user.current_balance.effective_balance}, "
-                            f"please pay with fiat or send tao to {current_user.payment_address}"
-                        ),
-                    },
-                }
-                if quota:
-                    quota_reset = quota_date + timedelta(days=1)
-                    quota_reset = quota_reset = datetime(
-                        year=quota_reset.year,
-                        month=quota_reset.month,
-                        day=quota_reset.day,
-                        tzinfo=UTC,
-                    ).isoformat()
-                    error_kwargs["detail"]["quota_reset_timestamp"] = quota_reset
-
-                raise HTTPException(**error_kwargs)
-        else:
-            # When within the quota, mark the invocation as "free" so no balance is deducted when finished.
-            request.state.free_invocation = True
-
-        # Store quota info for response headers.
-        request.state.quota_total = quota
-        request.state.quota_used = request_count
+    await check_quota_and_balance(request, current_user, chute)
 
     # Identify the cord that we'll trying to access by the public API path and method.
     selected_cord = None
@@ -774,7 +600,9 @@ async def _invoke(
             return StreamingResponse(
                 _stream_with_first_chunk(),
                 media_type="text/event-stream",
-                headers=_quota_headers(request, {"X-Chutes-InvocationID": parent_invocation_id}),
+                headers=build_response_headers(
+                    request, {"X-Chutes-InvocationID": parent_invocation_id}
+                ),
             )
 
         except HTTPException:
@@ -816,7 +644,7 @@ async def _invoke(
                 response = StreamingResponse(
                     _streamfile(),
                     media_type=result["content_type"],
-                    headers=_quota_headers(
+                    headers=build_response_headers(
                         request, {"X-Chutes-InvocationID": parent_invocation_id}
                     ),
                 )
@@ -824,7 +652,7 @@ async def _invoke(
                 response = Response(
                     content=result["text"],
                     media_type=result["content_type"],
-                    headers=_quota_headers(
+                    headers=build_response_headers(
                         request, {"X-Chutes-InvocationID": parent_invocation_id}
                     ),
                 )
@@ -832,7 +660,7 @@ async def _invoke(
                 response = Response(
                     content=json.dumps(result.get("json", result)).decode(),
                     media_type="application/json",
-                    headers=_quota_headers(
+                    headers=build_response_headers(
                         request,
                         {
                             "Content-type": "application/json",
