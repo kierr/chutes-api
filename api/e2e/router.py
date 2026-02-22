@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse, Response
 from api.config import settings
 from api.user.service import get_current_user
-from api.user.schemas import User
+from api.user.schemas import User, PriceOverride, InvocationDiscount, InvocationQuota
 from api.chute.util import (
     get_one,
     is_shared,
@@ -24,6 +24,7 @@ from api.chute.util import (
     get_mtoken_price,
     update_usage_data,
     safe_store_invocation,
+    selector_hourly_price,
 )
 from api.chute.schemas import NodeSelector
 from api.instance.util import (
@@ -42,12 +43,14 @@ from api.util import (
 from api.miner_client import sign_request
 from api.rate_limit import rate_limit
 from api.gpu import COMPUTE_UNIT_PRICE_BASIS
+from api.constants import DIFFUSION_PRICE_MULT_PER_STEP
 from api.user.service import chutes_user_id, subnet_role_accessible
 from api.invocation.util import (
     resolve_rate_limit_headers,
     build_response_headers,
     check_quota_and_balance,
 )
+from api.metrics.capacity import track_request_completed, track_capacity
 
 router = APIRouter()
 
@@ -211,6 +214,11 @@ async def e2e_invoke(
         or subnet_role_accessible(chute, current_user)
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chute not found")
+    if chute.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="This chute is currently disabled.",
+        )
 
     resolve_rate_limit_headers(request, current_user, chute)
     await check_quota_and_balance(request, current_user, chute)
@@ -350,6 +358,7 @@ async def e2e_invoke(
                 invocation_id,
                 parent_invocation_id,
                 request,
+                manager,
             )
 
             # Cleanup.
@@ -452,6 +461,7 @@ async def _stream_e2e_response(
             invocation_id,
             parent_invocation_id,
             request,
+            manager,
         )
 
         # Clear failure tracking on success.
@@ -480,15 +490,19 @@ async def _do_billing(
     invocation_id,
     parent_invocation_id,
     request,
+    manager=None,
 ):
     """
     Handle billing for an E2E invocation.
     """
     user_id = user.user_id
     balance_used = 0.0
+    override_applied = False
     free_invocation = getattr(request.state, "free_invocation", False)
 
     if compute_units and not free_invocation:
+        hourly_price = await selector_hourly_price(chute.node_selector)
+
         # Per megatoken pricing for vLLM chutes.
         if chute.standard_template == "vllm" and metrics and metrics.get("it"):
             per_million_in, per_million_out, cache_discount = await get_mtoken_price(
@@ -502,14 +516,40 @@ async def _do_billing(
                 - cached_tokens / 1000000.0 * per_million_in * cache_discount
                 + output_tokens / 1000000.0 * per_million_out
             )
-        else:
-            # Time-based pricing.
+            override_applied = True
+
+        elif (price_override := await PriceOverride.get(user_id, chute.chute_id)) is not None:
+            if chute.standard_template == "diffusion" and price_override.per_step is not None:
+                balance_used = (metrics.get("steps", 0) or 0) * price_override.per_step
+                override_applied = True
+            elif price_override.per_request is not None:
+                balance_used = price_override.per_request
+                override_applied = True
+
+        # If no override was applied, use standard pricing.
+        if not override_applied:
             discount = 0.0
             if chute.discount and -3 < chute.discount <= 1:
                 discount = chute.discount
             if discount < 1.0:
-                balance_used = compute_units * COMPUTE_UNIT_PRICE_BASIS / 3600.0
-                balance_used -= balance_used * discount
+                if chute.standard_template == "diffusion":
+                    balance_used = (
+                        (metrics.get("steps", 0) or 0)
+                        * hourly_price
+                        * DIFFUSION_PRICE_MULT_PER_STEP
+                    )
+                    balance_used -= balance_used * discount
+
+                default_balance_used = compute_units * COMPUTE_UNIT_PRICE_BASIS / 3600.0
+                default_balance_used -= default_balance_used * discount
+                if not balance_used:
+                    balance_used = default_balance_used
+
+        # User discounts.
+        if balance_used and not override_applied:
+            user_discount = await InvocationDiscount.get(user_id, chute.chute_id)
+            if user_discount:
+                balance_used -= balance_used * user_discount
 
     # Don't charge for private instances.
     if (
@@ -554,6 +594,35 @@ async def _do_billing(
             compute_time=duration,
         )
     )
+
+    # Increment quota usage value.
+    if (
+        free_invocation
+        and chute.discount < 1.0
+        and (
+            chute.public
+            or has_legacy_private_billing(chute)
+            or chute.user_id == await chutes_user_id()
+        )
+    ):
+        key = await InvocationQuota.quota_key(user.user_id, chute.chute_id)
+        asyncio.create_task(settings.redis_client.incrbyfloat(key, 1.0))
+
+    # Prometheus metrics.
+    track_request_completed(chute.chute_id)
+    if manager and hasattr(manager, "mean_count"):
+        try:
+            instance_util = getattr(manager, "_last_instance_utilization", None)
+            if instance_util is not None:
+                instance_util = float(instance_util)
+            await track_capacity(
+                chute.chute_id,
+                manager.mean_count or 0,
+                chute.concurrency or 1,
+                instance_utilization=instance_util,
+            )
+        except Exception:
+            pass
 
     # Push back instance shutdown for private chutes.
     if (
