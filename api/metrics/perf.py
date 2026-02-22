@@ -91,9 +91,9 @@ class PerfTracker:
                 try:
                     ptps = metrics["it"] / metrics["ttft"]
                     pema, _, _ = await ptps_tracker().update(chute_id, ptps)
-                except Exception:
+                except Exception as exc:
                     logger.warning(
-                        "Failed to update adaptive EMA for prompt processing TPS: {str(exc)}"
+                        f"Failed to update adaptive EMA for prompt processing TPS: {exc}"
                     )
 
                 # Completion tokens.
@@ -101,10 +101,8 @@ class PerfTracker:
                     try:
                         otps = metrics["ot"] / (duration - metrics["ttft"])
                         oema, _, _ = await otps_tracker().update(chute_id, otps)
-                    except Exception:
-                        logger.warning(
-                            "Failed to update adaptive EMA for completion TPS: {str(exc)}"
-                        )
+                    except Exception as exc:
+                        logger.warning(f"Failed to update adaptive EMA for completion TPS: {exc}")
                 if pema and oema:
                     updates.update(
                         {

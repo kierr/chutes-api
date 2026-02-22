@@ -146,6 +146,8 @@ async def _refresh_gauges_once():
 
             cm_redis = _get_cm_redis(chute_id)
             values = await cm_redis.mget(keys)
+            if values is None:
+                continue
             total_conns = sum(int(v or 0) for v in values)
             instance_count = len(keys)
             mean_conn = total_conns / instance_count if instance_count else 0
