@@ -379,32 +379,26 @@ async def _stream_e2e_response(
 ):
     """
     Stream E2E response chunks, extracting usage events for billing.
+
+    E2E streaming chunks are SSE events sent in plaintext over the mTLS
+    tunnel (no per-chunk transport encryption). The events are already
+    E2E-encrypted by the instance, so we relay them directly and only
+    parse usage data for billing.
     """
     metrics = {}
     chunk_count = 0
     try:
         async for raw_chunk in response.aiter_lines():
-            if not raw_chunk:
-                continue
-            # Transport-decrypt each chunk.
-            try:
-                decrypted = await asyncio.to_thread(decrypt_instance_response, raw_chunk, instance)
-            except Exception as exc:
-                logger.warning(f"E2E stream: transport decrypt failed: {exc}")
-                continue
-
-            # Parse SSE lines to extract usage data for billing.
-            # Decrypted chunks are SSE lines like:
-            #   data: {"e2e_init": "..."}  - ML-KEM ciphertext
-            #   data: {"e2e": "..."}       - encrypted content
-            #   data: {"usage": {...}}     - plaintext usage for billing
-            #   data: {"e2e_error": {...}} - error with encrypted message
+            # aiter_lines() strips newlines; relay every line (including
+            # empty ones) with a trailing \n to reconstruct the original
+            # SSE framing (data: {...}\n\n).
             chunk_str = (
-                decrypted.decode("utf-8", errors="replace")
-                if isinstance(decrypted, bytes)
-                else decrypted
+                raw_chunk.decode("utf-8", errors="replace")
+                if isinstance(raw_chunk, bytes)
+                else raw_chunk
             )
 
+            # Parse non-empty SSE data lines to extract usage for billing.
             if chunk_str.startswith("data: "):
                 try:
                     obj = json.loads(chunk_str[6:].encode())
@@ -418,17 +412,18 @@ async def _stream_e2e_response(
                 except Exception:
                     pass
 
-            # Periodic disconnect check (every 5 chunks).
-            chunk_count += 1
-            if chunk_count % 5 == 0 and await request.is_disconnected():
+            # Periodic disconnect check (every 5 data lines).
+            if chunk_str:
+                chunk_count += 1
+            if chunk_count % 5 == 0 and chunk_count > 0 and await request.is_disconnected():
                 logger.info(
                     f"E2E client disconnected mid-stream for {chute.name} {instance.instance_id=}"
                 )
                 await response.aclose()
                 break
 
-            # Relay the decrypted chunk to client as-is.
-            yield decrypted
+            # Relay the line with newline to preserve SSE framing.
+            yield f"{chunk_str}\n".encode()
 
         # Billing after stream completes.
         duration = time.time() - started_at
