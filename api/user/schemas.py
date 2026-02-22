@@ -19,7 +19,7 @@ from sqlalchemy import (
     select,
     case,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship, validates
 from api.database import Base
 import hashlib
@@ -108,6 +108,9 @@ class User(Base):
 
     # Logo/avatar.
     logo_id = Column(String, ForeignKey("logos.logo_id", ondelete="SET NULL"), nullable=True)
+
+    # Per-user rate limit overrides (JSONB: {"*": N, "<chute_id>": M}).
+    rate_limit_overrides = Column(JSONB, nullable=True)
 
     chutes = relationship("Chute", back_populates="user")
     images = relationship("Image", back_populates="user")

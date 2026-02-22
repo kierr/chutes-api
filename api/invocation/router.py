@@ -93,6 +93,9 @@ def _derive_upstream_status(error: object) -> int | None:
     return None
 
 
+DEFAULT_RATE_LIMIT = 60
+
+
 def _quota_headers(request, base_headers=None):
     headers = dict(base_headers or {})
     if getattr(request.state, "quota_total", None) is not None:
@@ -100,6 +103,14 @@ def _quota_headers(request, base_headers=None):
         headers["X-Chutes-Quota-Used"] = str(int(request.state.quota_used))
         remaining = max(0, request.state.quota_total - request.state.quota_used)
         headers["X-Chutes-Quota-Remaining"] = str(int(remaining))
+    rl_user = getattr(request.state, "rl_user", None)
+    rl_chute = getattr(request.state, "rl_chute", None)
+    if rl_user is not None:
+        headers["X-Chutes-RL-User"] = str(rl_user) if rl_user == "inf" else str(int(rl_user))
+    if rl_chute is not None:
+        headers["X-Chutes-RL-Chute"] = str(int(rl_chute))
+    if getattr(request.state, "invoice_billing", False):
+        headers["X-Chutes-Invoice-Billing"] = "true"
     return headers
 
 
@@ -340,6 +351,20 @@ async def _invoke(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="No matching chute found!"
         )
+
+    # Resolve per-user rate limit headers.
+    request.state.invoice_billing = current_user.has_role(Permissioning.invoice_billing)
+    if not chute.public:
+        request.state.rl_user = "inf"
+    else:
+        overrides = current_user.rate_limit_overrides or {}
+        chute_rl = overrides.get(chute.chute_id)
+        global_rl = overrides.get("*")
+        if chute_rl is not None:
+            request.state.rl_chute = chute_rl
+            request.state.rl_user = global_rl if global_rl is not None else DEFAULT_RATE_LIMIT
+        else:
+            request.state.rl_user = global_rl if global_rl is not None else DEFAULT_RATE_LIMIT
 
     # Check if the chute is disabled.
     if chute.disabled:
@@ -791,22 +816,29 @@ async def _invoke(
                 response = StreamingResponse(
                     _streamfile(),
                     media_type=result["content_type"],
-                    headers=_quota_headers(request, {"X-Chutes-InvocationID": parent_invocation_id}),
+                    headers=_quota_headers(
+                        request, {"X-Chutes-InvocationID": parent_invocation_id}
+                    ),
                 )
             elif "text" in result:
                 response = Response(
                     content=result["text"],
                     media_type=result["content_type"],
-                    headers=_quota_headers(request, {"X-Chutes-InvocationID": parent_invocation_id}),
+                    headers=_quota_headers(
+                        request, {"X-Chutes-InvocationID": parent_invocation_id}
+                    ),
                 )
             else:
                 response = Response(
                     content=json.dumps(result.get("json", result)).decode(),
                     media_type="application/json",
-                    headers=_quota_headers(request, {
-                        "Content-type": "application/json",
-                        "X-Chutes-InvocationID": parent_invocation_id,
-                    }),
+                    headers=_quota_headers(
+                        request,
+                        {
+                            "Content-type": "application/json",
+                            "X-Chutes-InvocationID": parent_invocation_id,
+                        },
+                    ),
                 )
         elif chunk.startswith('data: {"error"'):
             chunk_data = json.loads(chunk[6:])
