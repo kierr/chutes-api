@@ -377,7 +377,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
         if semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
             final_dockerfile_content += (
                 "USER root\n"
-                "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload\n"
+                "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"
                 "USER chutes\n"
                 "ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so\n"
             )
@@ -1051,7 +1051,7 @@ async def update_chutes_lib(image_id: str, chutes_version: str, force: bool = Fa
             dockerfile_content = f"""FROM {full_source_tag}
 USER root
 ENV LD_PRELOAD=""
-RUN rm -f /etc/chutesfs.index
+RUN rm -f /etc/chutesfs.index /usr/bin/cautious-launcher /etc/ld.so.preload
 RUN usermod -aG root chutes || true
 RUN chmod g+rwx /usr/local/lib /usr/local/bin /usr/local/share /usr/local/share/man
 RUN chmod g+rwx /usr/local/lib/python3.12/dist-packages || true
@@ -1257,7 +1257,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
             if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
                 final_dockerfile_content += (
                     "USER root\n"
-                    "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload\n"
+                    "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"
                     "USER chutes\n"
                     "ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so\n"
                 )
