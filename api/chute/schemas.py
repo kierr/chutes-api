@@ -209,6 +209,7 @@ class ChuteArgs(BaseModel):
     allow_external_egress: Optional[bool] = Field(default=False)
     encrypted_fs: Optional[bool] = Field(default=False)
     tee: Optional[bool] = Field(default=False)
+    lock_modules: Optional[bool] = Field(default=None)
 
 
 class InvocationArgs(BaseModel):
@@ -250,6 +251,7 @@ class Chute(Base):
     allow_external_egress = Column(Boolean, default=False)
     encrypted_fs = Column(Boolean, default=False)
     tee = Column(Boolean, default=False)
+    lock_modules = Column(Boolean, nullable=True, default=None)
     immutable = Column(Boolean, default=False)
     disabled = Column(Boolean, default=False)
 

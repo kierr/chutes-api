@@ -57,6 +57,7 @@ class LaunchConfigArgs(BaseModel):
     port_mappings: list[PortMap]
     fsv: Optional[str] = None
     egress: Optional[bool] = None
+    lock_modules: Optional[bool] = None
     netnanny_hash: Optional[str] = None
     run_path: Optional[str] = None
     py_dirs: Optional[list[str]] = None

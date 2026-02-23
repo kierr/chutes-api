@@ -1051,7 +1051,7 @@ async def _validate_launch_config_instance(
                 f"{log_prefix} has tampered with netnanny? {args.netnanny_hash=} {args.egress=} {chute.allow_external_egress=}"
             )
             launch_config.failed_at = func.now()
-            launch_config.verification_error = "Failed netnanny validation."
+            launch_config.verification_error = "Failed aegis validation."
             await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1599,7 +1599,12 @@ async def get_launch_config(
     token = None
     if semcomp(chute.chutes_version or "0.0.0", "0.3.61") >= 0:
         token = create_launch_jwt_v2(
-            launch_config, egress=chute.allow_external_egress, disk_gb=disk_gb
+            launch_config,
+            egress=chute.allow_external_egress,
+            lock_modules=True
+            if chute.standard_template
+            else (chute.lock_modules if chute.lock_modules is not None else False),
+            disk_gb=disk_gb,
         )
     else:
         token = create_launch_jwt(launch_config, disk_gb=disk_gb)

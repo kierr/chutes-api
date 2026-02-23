@@ -749,7 +749,10 @@ def _decode_chutes_jwt(token: str, *, require_exp: bool) -> dict:
 
 
 def create_launch_jwt_v2(
-    launch_config: LaunchConfig, disk_gb: int = None, egress: bool = False
+    launch_config: LaunchConfig,
+    disk_gb: int = None,
+    egress: bool = False,
+    lock_modules: bool = False,
 ) -> str:
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=2)
@@ -763,6 +766,7 @@ def create_launch_jwt_v2(
         "env_key": launch_config.env_key,
         "iss": "chutes",
         "egress": egress,
+        "lock_modules": lock_modules,
         "env_type": env_type,
     }
     if launch_config.job_id:
