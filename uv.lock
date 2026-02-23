@@ -749,7 +749,7 @@ wheels = [
 
 [[package]]
 name = "chutes"
-version = "0.5.5rc39"
+version = "0.5.5rc45"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -778,7 +778,7 @@ dependencies = [
     { name = "uvicorn" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fb/00/4c178f2a623359ae57c54f7a7a7838b131abcdf7fe72f7612103c093a89e/chutes-0.5.5rc39-py3-none-any.whl", hash = "sha256:d74bd6b06d8100e928d437812f276187ba53724d2f89b0e59550dbcf0e6b345a", size = 8956649, upload-time = "2026-02-21T18:56:17.327Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/48/fb0a4bdf35989a0c6bd0dece3d637c3203ffb5a820feca63a8cc4637e629/chutes-0.5.5rc45-py3-none-any.whl", hash = "sha256:f78c617a0270b82c1a12b58d3ed847d872f1e04cbf2750a58989632587916cd9", size = 8962379, upload-time = "2026-02-23T12:06:29.39Z" },
 ]
 
 [[package]]
@@ -855,7 +855,7 @@ requires-dist = [
     { name = "backoff", specifier = ">=2.2.1,<3.0.0" },
     { name = "bittensor-drand", specifier = ">=1.2.0" },
     { name = "bittensor-wallet", specifier = ">=4.0.1" },
-    { name = "chutes", specifier = "==0.5.5rc39" },
+    { name = "chutes", specifier = "==0.5.5rc45" },
     { name = "dcap-qvl", specifier = "==0.3.12" },
     { name = "dnslib", specifier = ">=0.9.26,<0.10.0" },
     { name = "fastapi", specifier = ">=0.124.0,<0.125.0" },
