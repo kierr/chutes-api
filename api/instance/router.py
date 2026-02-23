@@ -839,10 +839,11 @@ async def _validate_launch_config_inspecto(
                 detail=launch_config.verification_error,
             )
 
-        enforce_inspecto = "PS_OP" in os.environ and semcomp(chute.chutes_version, "0.5.5") < 0
+        check_inspecto = "PS_OP" in os.environ
+        enforce_inspecto = check_inspecto and semcomp(chute.chutes_version, "0.5.5") < 0
         inspecto_valid = True
         fail_reason = None
-        if enforce_inspecto:
+        if check_inspecto:
             inspecto_hash = await get_inspecto_hash(chute.image_id)
             if not inspecto_hash:
                 logger.info(f"INSPECTO: image_id={chute.image_id} has no inspecto hash; allowing.")
@@ -877,14 +878,19 @@ async def _validate_launch_config_inspecto(
                                 inspecto_valid = False
                                 fail_reason = f"inspecto verification failed: {payload}"
         if not inspecto_valid:
-            logger.error(f"{log_prefix} has invalid inspecto verification: {fail_reason}")
-            launch_config.failed_at = func.now()
-            launch_config.verification_error = "Failed inspecto environment/lib verification."
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=launch_config.verification_error,
-            )
+            if enforce_inspecto:
+                logger.error(f"{log_prefix} has invalid inspecto verification: {fail_reason}")
+                launch_config.failed_at = func.now()
+                launch_config.verification_error = "Failed inspecto environment/lib verification."
+                await db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=launch_config.verification_error,
+                )
+            else:
+                logger.warning(
+                    f"{log_prefix} inspecto mismatch (not enforced, chutes_version={chute.chutes_version}): {fail_reason}"
+                )
 
 
 async def _validate_launch_config_filesystem(
