@@ -593,13 +593,6 @@ def get_expected_command(chute, miner_hotkey: str, seed: int = None, tls: bool =
             "--validator-ss58",
             settings.validator_ss58,
         ]
-        if tls:
-            parts += [
-                "--keyfile",
-                "/app/.chutetls/key.pem",
-                "--certfile",
-                "/app/.chutetls/cert.pem",
-            ]
         return " ".join(parts).strip()
 
     # Legacy format.
