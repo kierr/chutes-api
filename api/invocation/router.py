@@ -699,6 +699,7 @@ async def hostname_invocation(
     include_in_schema=False,
 ):
     request.state.started_at = time.time()
+    fallback_chutes = []
 
     # /v1/models endpoint for llm.chutes.ai is handled differently.
     if (
