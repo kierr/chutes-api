@@ -397,6 +397,26 @@ async def _invoke(
             )
         request.state.free_invocation = True
 
+    # Block users with negative balances before checking quotas.
+    if not (
+        current_user.has_role(Permissioning.free_account)
+        or current_user.has_role(Permissioning.invoice_billing)
+        or request.state.free_invocation
+    ):
+        neg_check_balance = (
+            current_user.current_balance.effective_balance if current_user.current_balance else 0.0
+        )
+        if neg_check_balance < 0:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "message": (
+                        f"Account balance is negative (${neg_check_balance:.2f}). "
+                        f"Please add funds to continue. Send tao to {current_user.payment_address}"
+                    ),
+                },
+            )
+
     # Check account quotas if not free/invoiced.
     quota_date = date.today()
     if not (
