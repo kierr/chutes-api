@@ -4,7 +4,6 @@ Invocations router.
 
 import re
 import pybase64 as base64
-import random
 import pickle
 import asyncio
 import gzip
@@ -908,14 +907,14 @@ async def hostname_invocation(
             payload["model"] = "XiaomiMiMo/MiMo-V2-Flash-TEE"
 
         # XXX in case needed again.
-        elif (
-            model in ("deepseek-ai/DeepSeek-V3.2-Exp", "deepseek-ai/DeepSeek-V3.2-Exp:THINKING")
-            and random.random() <= 0.6
-        ):
-            if model.endswith("THINKING"):
-                payload["model"] = "deepseek-ai/DeepSeek-V3.2-Exp-TEE:THINKING"
-            else:
-                payload["model"] = "deepseek-ai/DeepSeek-V3.2-Exp-TEE"
+        # elif (
+        #     model in ("deepseek-ai/DeepSeek-V3.2-Exp", "deepseek-ai/DeepSeek-V3.2-Exp:THINKING")
+        #     and random.random() <= 0.6
+        # ):
+        #     if model.endswith("THINKING"):
+        #         payload["model"] = "deepseek-ai/DeepSeek-V3.2-Exp-TEE:THINKING"
+        #     else:
+        #         payload["model"] = "deepseek-ai/DeepSeek-V3.2-Exp-TEE"
 
         # No file support currently.
         if isinstance(payload.get("messages"), list):
