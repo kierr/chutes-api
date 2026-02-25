@@ -96,6 +96,7 @@ from api.util import (
     notify_deleted,
     notify_verified,
     notify_activated,
+    notify_disabled,
     load_shared_object,
     has_legacy_private_billing,
     extract_ip,
@@ -2698,6 +2699,28 @@ async def stream_logs(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/{chute_id}/{instance_id}/disable")
+async def disable_instance_endpoint(
+    chute_id: str,
+    instance_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User = Depends(get_current_user(purpose="instances", registered_to=settings.netuid)),
+):
+    instance = await get_instance_by_chute_and_id(db, instance_id, chute_id, hotkey)
+    if not instance:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Instance with {chute_id=} {instance_id=} associated with {hotkey=} not found",
+        )
+    logger.info(f"INSTANCE DISABLE: {instance_id=} {hotkey=}")
+    instance.active = False
+    await db.commit()
+    await invalidate_instance_cache(chute_id, instance_id=instance_id)
+    asyncio.create_task(notify_disabled(instance))
+    return {"instance_id": instance_id, "disabled": True}
 
 
 @router.delete("/{chute_id}/{instance_id}")

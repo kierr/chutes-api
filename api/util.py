@@ -889,6 +889,27 @@ async def notify_activated(instance):
         logger.warning(f"Error broadcasting instance event: {exc}")
 
 
+async def notify_disabled(instance):
+    try:
+        message = f"Miner {instance.miner_hotkey} has disabled instance {instance.instance_id} chute {instance.chute_id}"
+        logger.warning(message)
+        event_data = {
+            "reason": "instance_disabled",
+            "message": message,
+            "data": {
+                "chute_id": instance.chute_id,
+                "miner_hotkey": instance.miner_hotkey,
+                "instance_id": instance.instance_id,
+                "config_id": instance.config_id,
+            },
+        }
+        await settings.redis_client.publish("events", json.dumps(event_data).decode())
+        event_data["filter_recipients"] = [instance.miner_hotkey]
+        await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
+    except Exception as exc:
+        logger.warning(f"Error broadcasting instance disabled event: {exc}")
+
+
 def get_current_hf_commit(model_name: str):
     """
     Helper to load the current main commit for a given repo.

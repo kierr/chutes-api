@@ -380,7 +380,12 @@ async def start_instance_invalidation_listener():
                     continue
                 try:
                     data = orjson.loads(message["data"])
-                    if data.get("reason") != "instance_deleted":
+                    reason = data.get("reason")
+                    if reason not in (
+                        "instance_deleted",
+                        "instance_activated",
+                        "instance_disabled",
+                    ):
                         continue
                     payload = data.get("data", {})
                     chute_id = payload.get("chute_id")
@@ -388,11 +393,12 @@ async def start_instance_invalidation_listener():
                     if not chute_id or not instance_id:
                         continue
                     logger.info(
-                        f"Pubsub: invalidating cache for deleted instance {instance_id} "
+                        f"Pubsub: invalidating cache for {reason} instance {instance_id} "
                         f"of chute {chute_id}"
                     )
                     await invalidate_instance_cache(chute_id, instance_id=instance_id)
-                    await remove_instance_from_manager(chute_id, instance_id)
+                    if reason in ("instance_deleted", "instance_disabled"):
+                        await remove_instance_from_manager(chute_id, instance_id)
                 except Exception as exc:
                     logger.warning(f"Error processing pubsub message: {exc}")
         except Exception as exc:
