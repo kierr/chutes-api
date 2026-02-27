@@ -541,6 +541,15 @@ async def _invoke(
 
                 if monthly_usage >= monthly_cap or four_hour_usage >= four_hour_cap:
                     # Cap exceeded — switch to paygo for remainder
+                    exceeded = []
+                    if monthly_usage >= monthly_cap:
+                        exceeded.append(f"monthly ({monthly_usage:.4f}/{monthly_cap:.4f})")
+                    if four_hour_usage >= four_hour_cap:
+                        exceeded.append(f"4h ({four_hour_usage:.4f}/{four_hour_cap:.4f})")
+                    logger.warning(
+                        f"Subscription cap exceeded for {current_user.user_id} "
+                        f"[{current_user.username}]: {', '.join(exceeded)}"
+                    )
                     if effective_balance <= 0:
                         raise HTTPException(
                             status_code=status.HTTP_402_PAYMENT_REQUIRED,
