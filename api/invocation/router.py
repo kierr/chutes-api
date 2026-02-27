@@ -910,7 +910,7 @@ async def hostname_invocation(
         # XXX in case needed again.
         elif (
             model in ("deepseek-ai/DeepSeek-V3.2-Exp", "deepseek-ai/DeepSeek-V3.2-Exp:THINKING")
-            and random.random() <= 0.6
+            and random.random() <= 0.5
         ):
             if model.endswith("THINKING"):
                 payload["model"] = "deepseek-ai/DeepSeek-V3.2-Exp-TEE:THINKING"
