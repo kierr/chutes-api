@@ -313,10 +313,12 @@ async def get_subscription_usage(
     async with get_session(readonly=True) as session:
         result = await session.execute(
             text(f"""
-                SELECT COALESCE(SUM(paygo_amount), 0) - COALESCE(SUM(amount), 0)
-                FROM usage_data
-                WHERE user_id = :user_id
-                AND bucket >= {since_expr}
+                SELECT COALESCE(SUM(GREATEST(COALESCE(ud.paygo_amount, 0) - COALESCE(ud.amount, 0), 0)), 0)
+                FROM usage_data ud
+                JOIN chutes c ON c.chute_id = ud.chute_id
+                WHERE ud.user_id = :user_id
+                AND ud.bucket >= {since_expr}
+                AND c.public IS TRUE
             """),
             {"user_id": user_id},
         )

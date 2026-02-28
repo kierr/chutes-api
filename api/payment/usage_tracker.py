@@ -205,11 +205,13 @@ async def _warm_sub_cap_cache(aggregated: dict) -> None:
         async with get_session(readonly=True) as session:
             month_result = await session.execute(
                 text("""
-                    SELECT user_id, GREATEST(COALESCE(SUM(paygo_amount), 0) - COALESCE(SUM(amount), 0), 0)
-                    FROM usage_data
-                    WHERE user_id = ANY(:user_ids)
-                    AND bucket >= date_trunc('month', now())
-                    GROUP BY user_id
+                    SELECT ud.user_id, COALESCE(SUM(GREATEST(COALESCE(ud.paygo_amount, 0) - COALESCE(ud.amount, 0), 0)), 0)
+                    FROM usage_data ud
+                    JOIN chutes c ON c.chute_id = ud.chute_id
+                    WHERE ud.user_id = ANY(:user_ids)
+                    AND ud.bucket >= date_trunc('month', now())
+                    AND c.public IS TRUE
+                    GROUP BY ud.user_id
                 """),
                 {"user_ids": sub_user_list},
             )
@@ -217,11 +219,13 @@ async def _warm_sub_cap_cache(aggregated: dict) -> None:
 
             four_hour_result = await session.execute(
                 text("""
-                    SELECT user_id, GREATEST(COALESCE(SUM(paygo_amount), 0) - COALESCE(SUM(amount), 0), 0)
-                    FROM usage_data
-                    WHERE user_id = ANY(:user_ids)
-                    AND bucket >= now() - interval '4 hours'
-                    GROUP BY user_id
+                    SELECT ud.user_id, COALESCE(SUM(GREATEST(COALESCE(ud.paygo_amount, 0) - COALESCE(ud.amount, 0), 0)), 0)
+                    FROM usage_data ud
+                    JOIN chutes c ON c.chute_id = ud.chute_id
+                    WHERE ud.user_id = ANY(:user_ids)
+                    AND ud.bucket >= now() - interval '4 hours'
+                    AND c.public IS TRUE
+                    GROUP BY ud.user_id
                 """),
                 {"user_ids": sub_user_list},
             )
